@@ -59,21 +59,23 @@ pointing the crawler at the wrong folder ID.
 
 ## Usage
 
-```sh
-go build -o drive-cleanup .
+In the devcontainer a `drive-cleanup` shell function (defined in
+`.devcontainer/.bash_googledrivecleanup_functions` and loaded by both
+interactive and login shells) wraps `go run`, so no build step is needed:
 
+```sh
 # Crawl (or resume a previous crawl) into drive.db
-./drive-cleanup crawl
-./drive-cleanup crawl -db drive.db -root-config root.json
+drive-cleanup crawl
+drive-cleanup crawl -db drive.db -root-config root.json
 
 # Force a full re-crawl of an already-completed database
-./drive-cleanup crawl -refresh
+drive-cleanup crawl -refresh
 
 # Who owns how many files (non-folders), most first — drives outreach priority
-./drive-cleanup owners
+drive-cleanup owners
 
 # Full folder path of a node (used later to restore original locations)
-./drive-cleanup path 1AbCdEfGh...
+drive-cleanup path 1AbCdEfGh...
 ```
 
 ## Interrupting and resuming
