@@ -1,0 +1,9 @@
+{
+    "name": "google-drive-cleanup",
+    "image": "mcr.microsoft.com/devcontainers/base:trixie",
+    "features": {
+        "ghcr.io/devcontainers/features/go:1": {
+            "version": "1.26.4"
+        }
+    }
+}
