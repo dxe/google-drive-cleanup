@@ -167,6 +167,6 @@ func saveToken(path string, tok *oauth2.Token) error {
 	if err := os.WriteFile(path, b, 0600); err != nil {
 		return fmt.Errorf("caching oauth token: %w", err)
 	}
-	fmt.Fprintf(os.Stderr, "Saved oauth token to %s\n", path)
+	fmt.Fprintf(os.Stderr, "\nSaved oauth token to %s\nAuthentication completed successfully.\n", path)
 	return nil
 }
