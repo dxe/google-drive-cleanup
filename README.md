@@ -23,11 +23,23 @@ build on the same database.
 3. **Scopes.** The crawler requests `https://www.googleapis.com/auth/drive.readonly`
    only. The later move/transfer tooling will need the full `drive` scope —
    when we widen it, delete `token.json` and re-consent.
-4. **First run auth.** On first run the tool prints a consent URL; open it in
-   a browser, authorize, and paste the auth code back on stdin. The token is
-   cached in `token.json` (0600) so subsequent runs are non-interactive.
-   If Google redirects to a `localhost` URL that fails to load, copy the
-   `code=` parameter out of that URL's query string — that's the auth code.
+4. **First run auth.** On first run the tool starts a small loopback server on
+   port `8765`, prints a consent URL, and waits. Open the URL in a browser,
+   authorize, and Google redirects back to the server, which captures the auth
+   code automatically — no copy/paste needed. The token is cached in
+   `token.json` (0600) so subsequent runs are non-interactive.
+
+   In a devcontainer this works because `.devcontainer/devcontainer.json`
+   forwards port `8765` from the container to the host, so the host browser's
+   redirect to `http://localhost:8765` reaches the server inside the container.
+   (Desktop-app OAuth clients accept `http://localhost` on any port, so this
+   port does not need to be registered in the Google console. If you change it,
+   update both `callbackPort` in `auth.go` and `forwardPorts` in the
+   devcontainer config.)
+
+   **Fallback:** if the browser still can't reach the callback, paste the auth
+   code — or the entire `http://localhost:8765/?...` redirect URL — on stdin
+   and press enter.
 
 `credentials.json`, `token.json`, and `*.db` are gitignored — never commit them.
 

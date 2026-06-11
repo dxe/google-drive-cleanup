@@ -5,5 +5,14 @@
         "ghcr.io/devcontainers/features/go:1": {
             "version": "1.26.4"
         }
+    },
+    "forwardPorts": [
+        8765
+    ],
+    "portsAttributes": {
+        "8765": {
+            "label": "oauth-callback",
+            "onAutoForward": "silent"
+        }
     }
 }
