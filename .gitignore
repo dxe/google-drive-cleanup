@@ -27,6 +27,19 @@ go.work.sum
 # env file
 .env
 
+# OAuth secrets — never commit
+credentials.json
+token.json
+
+# Compiled binary
+/google-drive-cleanup
+/drive-cleanup
+
+# Crawl databases
+*.db
+*.db-wal
+*.db-shm
+
 # Editor/IDE
 # .idea/
 # .vscode/
