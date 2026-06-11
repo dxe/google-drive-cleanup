@@ -31,6 +31,9 @@ go.work.sum
 credentials.json
 token.json
 
+# Runtime config
+root.json
+
 # Compiled binary
 /google-drive-cleanup
 /drive-cleanup
