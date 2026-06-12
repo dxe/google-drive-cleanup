@@ -9,12 +9,27 @@ import (
 	_ "modernc.org/sqlite" // pure-Go SQLite driver, no cgo
 )
 
-const schemaSQL = `
+// nodeTypes lists every valid nodes.type value. It is the single source of
+// truth for the column's CHECK constraint below.
+var nodeTypes = []string{typeFolder, typeShortcut, typeGoogleDoc, typeBinary}
+
+// sqlQuoteList renders values as a comma-separated list of single-quoted SQL
+// string literals, e.g. ['a','b'] -> "'a','b'". The values here are trusted
+// in-code constants, not user input.
+func sqlQuoteList(values []string) string {
+	quoted := make([]string, len(values))
+	for i, v := range values {
+		quoted[i] = "'" + v + "'"
+	}
+	return strings.Join(quoted, ",")
+}
+
+var schemaSQL = fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS nodes (
 	id                 INTEGER PRIMARY KEY AUTOINCREMENT,
 	drive_id           TEXT NOT NULL UNIQUE,
 	name               TEXT NOT NULL,
-	type               TEXT NOT NULL CHECK(type IN ('folder','shortcut','google_doc','binary')),
+	type               TEXT NOT NULL CHECK(type IN (%s)),
 	mime_type          TEXT NOT NULL,
 	owner_email        TEXT,
 	owner_id           TEXT,
@@ -40,7 +55,7 @@ CREATE TABLE IF NOT EXISTS extra_parents (
 	observed_at     TEXT NOT NULL,
 	PRIMARY KEY (node_drive_id, parent_drive_id)
 );
-`
+`, sqlQuoteList(nodeTypes))
 
 func openDB(path string) (*sql.DB, error) {
 	db, err := sql.Open("sqlite", path)
@@ -141,8 +156,8 @@ type folderRef struct {
 // pendingFolders returns every folder whose children have not been fully
 // listed yet — the resumable work queue.
 func pendingFolders(db *sql.DB) ([]folderRef, error) {
-	rows, err := db.Query(
-		`SELECT id, drive_id, name FROM nodes WHERE type = 'folder' AND children_done = 0 ORDER BY id`)
+	rows, err := db.Query(fmt.Sprintf(
+		`SELECT id, drive_id, name FROM nodes WHERE type = '%s' AND children_done = 0 ORDER BY id`, typeFolder))
 	if err != nil {
 		return nil, err
 	}
@@ -160,13 +175,13 @@ func pendingFolders(db *sql.DB) ([]folderRef, error) {
 
 func countPendingFolders(db *sql.DB) (int, error) {
 	var n int
-	err := db.QueryRow(
-		`SELECT COUNT(*) FROM nodes WHERE type = 'folder' AND children_done = 0`).Scan(&n)
+	err := db.QueryRow(fmt.Sprintf(
+		`SELECT COUNT(*) FROM nodes WHERE type = '%s' AND children_done = 0`, typeFolder)).Scan(&n)
 	return n, err
 }
 
 func resetChildrenDone(db *sql.DB) error {
-	_, err := db.Exec(`UPDATE nodes SET children_done = 0 WHERE type = 'folder'`)
+	_, err := db.Exec(fmt.Sprintf(`UPDATE nodes SET children_done = 0 WHERE type = '%s'`, typeFolder))
 	return err
 }
 
@@ -217,14 +232,14 @@ type ownerCount struct {
 // single "(unknown)" bucket when both are NULL. Rows are ordered by file count
 // descending.
 func ownersReport(db *sql.DB) ([]ownerCount, error) {
-	rows, err := db.Query(`
+	rows, err := db.Query(fmt.Sprintf(`
 		SELECT MAX(owner_email) AS email, MAX(owner_id) AS oid, MAX(owner_display_name),
-			SUM(type = 'folder') AS folders,
-			SUM(type <> 'folder') AS files,
+			SUM(type = '%[1]s') AS folders,
+			SUM(type <> '%[1]s') AS files,
 			COUNT(*) AS total
 		FROM nodes
 		GROUP BY COALESCE(owner_email, owner_id, '(unknown)')
-		ORDER BY files DESC, total DESC, (email IS NULL AND oid IS NULL), COALESCE(email, oid)`)
+		ORDER BY files DESC, total DESC, (email IS NULL AND oid IS NULL), COALESCE(email, oid)`, typeFolder))
 	if err != nil {
 		return nil, err
 	}

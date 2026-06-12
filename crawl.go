@@ -27,16 +27,25 @@ const (
 	listFields = "nextPageToken, files(id, name, mimeType, owners(emailAddress, displayName, permissionId), parents, shortcutDetails(targetId))"
 )
 
+// Node types stored in the nodes.type column. These are the only valid values
+// for that column (see the CHECK constraint in the schema).
+const (
+	typeFolder    = "folder"
+	typeShortcut  = "shortcut"
+	typeGoogleDoc = "google_doc"
+	typeBinary    = "binary"
+)
+
 func classify(mimeType string) string {
 	switch {
 	case mimeType == folderMimeType:
-		return "folder"
+		return typeFolder
 	case mimeType == shortcutMimeType:
-		return "shortcut"
+		return typeShortcut
 	case strings.HasPrefix(mimeType, googleAppsPrefix):
-		return "google_doc"
+		return typeGoogleDoc
 	default:
-		return "binary"
+		return typeBinary
 	}
 }
 
@@ -202,7 +211,7 @@ func (c *crawler) validateAndInsertRoot(ctx context.Context, cfg rootConfig) err
 	_, _, _, _, err = upsertNode(tx, node{
 		driveID:      f.Id,
 		name:         f.Name,
-		typ:          "folder",
+		typ:          typeFolder,
 		mimeType:     f.MimeType,
 		ownerEmail:   email,
 		ownerID:      ownerID,
@@ -320,7 +329,7 @@ func (c *crawler) commitPage(parent folderRef, files []*drive.File, last bool) (
 		// Recurse into folders only — shortcuts are recorded, never followed.
 		// Skip folders already fully listed (resume) or already visited this
 		// run (cycle / second parent).
-		if n.typ == "folder" && !prevDone && !c.visited[file.Id] {
+		if n.typ == typeFolder && !prevDone && !c.visited[file.Id] {
 			subfolders = append(subfolders, folderRef{rowID: rowID, driveID: file.Id, name: file.Name})
 		}
 	}

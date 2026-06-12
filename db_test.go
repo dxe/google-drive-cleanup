@@ -53,14 +53,14 @@ func TestUpsertIdempotentAndProgressPreserving(t *testing.T) {
 	db := testDB(t)
 
 	rootID, existed, _, _ := mustUpsert(t, db, node{
-		driveID: "root", name: "Root", typ: "folder", mimeType: folderMimeType,
+		driveID: "root", name: "Root", typ: typeFolder, mimeType: folderMimeType,
 	})
 	if existed {
 		t.Fatal("fresh insert reported existed=true")
 	}
 
 	childN := node{
-		driveID: "child", name: "Child", typ: "binary", mimeType: "application/pdf",
+		driveID: "child", name: "Child", typ: typeBinary, mimeType: "application/pdf",
 		ownerEmail: nullString("a@example.com"),
 		parentID:   sql.NullInt64{Int64: rootID, Valid: true},
 	}
@@ -73,10 +73,10 @@ func TestUpsertIdempotentAndProgressPreserving(t *testing.T) {
 	}
 	tx.Commit()
 
-	mustUpsert(t, db, node{driveID: "root", name: "Root renamed", typ: "folder", mimeType: folderMimeType})
+	mustUpsert(t, db, node{driveID: "root", name: "Root renamed", typ: typeFolder, mimeType: folderMimeType})
 
 	otherID, _, _, _ := mustUpsert(t, db, node{
-		driveID: "other", name: "Other", typ: "folder", mimeType: folderMimeType,
+		driveID: "other", name: "Other", typ: typeFolder, mimeType: folderMimeType,
 	})
 	reN := childN
 	reN.name = "Child renamed"
@@ -114,10 +114,10 @@ func TestUpsertIdempotentAndProgressPreserving(t *testing.T) {
 
 func TestPendingFolders(t *testing.T) {
 	db := testDB(t)
-	rootID, _, _, _ := mustUpsert(t, db, node{driveID: "root", name: "Root", typ: "folder", mimeType: folderMimeType})
-	mustUpsert(t, db, node{driveID: "sub", name: "Sub", typ: "folder", mimeType: folderMimeType,
+	rootID, _, _, _ := mustUpsert(t, db, node{driveID: "root", name: "Root", typ: typeFolder, mimeType: folderMimeType})
+	mustUpsert(t, db, node{driveID: "sub", name: "Sub", typ: typeFolder, mimeType: folderMimeType,
 		parentID: sql.NullInt64{Int64: rootID, Valid: true}})
-	mustUpsert(t, db, node{driveID: "f", name: "f.pdf", typ: "binary", mimeType: "application/pdf",
+	mustUpsert(t, db, node{driveID: "f", name: "f.pdf", typ: typeBinary, mimeType: "application/pdf",
 		parentID: sql.NullInt64{Int64: rootID, Valid: true}})
 
 	pending, err := pendingFolders(db)
@@ -144,7 +144,7 @@ func TestPendingFolders(t *testing.T) {
 
 func TestOwnersReport(t *testing.T) {
 	db := testDB(t)
-	rootID, _, _, _ := mustUpsert(t, db, node{driveID: "root", name: "Root", typ: "folder", mimeType: folderMimeType,
+	rootID, _, _, _ := mustUpsert(t, db, node{driveID: "root", name: "Root", typ: typeFolder, mimeType: folderMimeType,
 		ownerEmail: nullString("owner@example.com")}) // a folder-only owner
 	parent := sql.NullInt64{Int64: rootID, Valid: true}
 
@@ -156,7 +156,7 @@ func TestOwnersReport(t *testing.T) {
 	} {
 		n.driveID = string(rune('a' + i))
 		n.name = n.driveID
-		n.typ = "binary"
+		n.typ = typeBinary
 		n.mimeType = "application/pdf"
 		n.parentID = parent
 		mustUpsert(t, db, n)
@@ -185,10 +185,10 @@ func TestOwnersReport(t *testing.T) {
 
 func TestNodePath(t *testing.T) {
 	db := testDB(t)
-	rootID, _, _, _ := mustUpsert(t, db, node{driveID: "root", name: "DxE General", typ: "folder", mimeType: folderMimeType})
-	subID, _, _, _ := mustUpsert(t, db, node{driveID: "sub", name: "Finance", typ: "folder", mimeType: folderMimeType,
+	rootID, _, _, _ := mustUpsert(t, db, node{driveID: "root", name: "DxE General", typ: typeFolder, mimeType: folderMimeType})
+	subID, _, _, _ := mustUpsert(t, db, node{driveID: "sub", name: "Finance", typ: typeFolder, mimeType: folderMimeType,
 		parentID: sql.NullInt64{Int64: rootID, Valid: true}})
-	mustUpsert(t, db, node{driveID: "doc", name: "budget.xlsx", typ: "binary", mimeType: "application/x",
+	mustUpsert(t, db, node{driveID: "doc", name: "budget.xlsx", typ: typeBinary, mimeType: "application/x",
 		parentID: sql.NullInt64{Int64: subID, Valid: true}})
 
 	segments, err := nodePath(db, "doc")
