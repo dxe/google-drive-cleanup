@@ -399,6 +399,15 @@ func crawlRootDriveID(db *sql.DB) (string, error) {
 	return id, err
 }
 
+// updateNodeOwner overwrites the owner fields for the node with the given driveID.
+// Called after restore-locations moves a file back to the authenticated user's Drive.
+func updateNodeOwner(db *sql.DB, driveID, email, permissionID, displayName string) error {
+	_, err := db.Exec(
+		`UPDATE nodes SET owner_email = ?, owner_id = ?, owner_display_name = ? WHERE drive_id = ?`,
+		email, permissionID, displayName, driveID)
+	return err
+}
+
 // originalParentDriveID returns the Drive ID of the folder the given file was
 // crawled under. Returns sql.ErrNoRows if the file is not in the database or
 // has no recorded parent (i.e. it is the crawl root).

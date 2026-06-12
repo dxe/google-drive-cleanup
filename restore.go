@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -64,6 +66,20 @@ func runRestoreLocations(dbPath, cfgPath string) error {
 	svc, err := newDriveService(ctx, drive.DriveScope)
 	if err != nil {
 		return err
+	}
+
+	about, err := svc.About.Get().Fields("user").Context(ctx).Do()
+	if err != nil {
+		return fmt.Errorf("fetching current user info: %w", err)
+	}
+	me := about.User
+
+	fmt.Fprintf(os.Stderr, "Restored files will be owned by: %s. Continue? [y/N] ", me.EmailAddress)
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Scan()
+	if strings.ToLower(strings.TrimSpace(scanner.Text())) != "y" {
+		fmt.Fprintln(os.Stderr, "Aborted.")
+		return nil
 	}
 
 	// Verify the staging folder name matches config, guarding against a stale id.
@@ -143,6 +159,9 @@ func runRestoreLocations(dbPath, cfgPath string) error {
 				continue
 			}
 			log.Printf("OK %s (%s) -> parent %s", file.Name, file.Id, parentDriveID)
+			if err := updateNodeOwner(db, file.Id, me.EmailAddress, me.PermissionId, me.DisplayName); err != nil {
+				log.Printf("WARN could not update owner in DB for %s (%s): %v", file.Name, file.Id, err)
+			}
 			moved++
 		}
 
