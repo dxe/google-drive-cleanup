@@ -43,19 +43,24 @@ build on the same database.
 
 `credentials.json`, `token.json`, and `*.db` are gitignored — never commit them.
 
-## Root config
+## Config
 
-The crawl root comes from a JSON file (default `root.json`, override with
-`--root-config`):
+Configuration comes from a single JSON file (default `config.json`, override
+with `--config`). Each subcommand has its own top-level section so new commands
+can add settings without colliding:
 
 ```json
-{ "id": "0ABCdef...", "name": "DxE General" }
+{
+  "crawl": {
+    "root": { "id": "0ABCdef...", "name": "DxE General" }
+  }
+}
 ```
 
-Both fields are required. Before crawling, the tool fetches the folder from
-Drive and verifies it really is a folder **and** that its name exactly matches
-`name`. A mismatch aborts with both names printed — this guards against
-pointing the crawler at the wrong folder ID.
+`crawl.root.id` and `crawl.root.name` are both required. Before crawling, the
+tool fetches the folder from Drive and verifies it really is a folder **and**
+that its name exactly matches `name`. A mismatch aborts with both names
+printed — this guards against pointing the crawler at the wrong folder ID.
 
 ## Usage
 
@@ -66,7 +71,7 @@ interactive and login shells) wraps `go run`, so no build step is needed:
 ```sh
 # Crawl (or resume a previous crawl) into drive.db
 drive-cleanup crawl
-drive-cleanup crawl --db drive.db --root-config root.json
+drive-cleanup crawl --db drive.db --config config.json
 
 # Force a full re-crawl of an already-completed database
 drive-cleanup crawl --refresh

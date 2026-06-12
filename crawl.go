@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -41,26 +40,6 @@ func classify(mimeType string) string {
 	}
 }
 
-type rootConfig struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-}
-
-func loadRootConfig(path string) (rootConfig, error) {
-	var cfg rootConfig
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return cfg, fmt.Errorf("reading root config: %w", err)
-	}
-	if err := json.Unmarshal(b, &cfg); err != nil {
-		return cfg, fmt.Errorf("parsing %s: %w", path, err)
-	}
-	if cfg.ID == "" || cfg.Name == "" {
-		return cfg, fmt.Errorf(`%s must set both "id" and "name"`, path)
-	}
-	return cfg, nil
-}
-
 type crawler struct {
 	db        *sql.DB
 	srv       *drive.Service
@@ -77,20 +56,20 @@ database. Ctrl-C stops cleanly between writes; just re-run to resume.`,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dbPath, _ := cmd.Flags().GetString("db")
-		rootCfgPath, _ := cmd.Flags().GetString("root-config")
+		cfgPath, _ := cmd.Flags().GetString("config")
 		refresh, _ := cmd.Flags().GetBool("refresh")
-		return runCrawl(dbPath, rootCfgPath, refresh)
+		return runCrawl(dbPath, cfgPath, refresh)
 	},
 }
 
 func init() {
 	crawlCmd.Flags().String("db", "drive.db", "path to the SQLite database")
-	crawlCmd.Flags().String("root-config", "root.json", "path to the root folder config JSON")
+	crawlCmd.Flags().String("config", "config.json", "path to the config JSON")
 	crawlCmd.Flags().Bool("refresh", false, "reset children_done on all folders to force a full re-crawl")
 }
 
-func runCrawl(dbPath, rootCfgPath string, refresh bool) error {
-	cfg, err := loadRootConfig(rootCfgPath)
+func runCrawl(dbPath, cfgPath string, refresh bool) error {
+	cfg, err := loadConfig(cfgPath)
 	if err != nil {
 		return err
 	}
@@ -135,7 +114,7 @@ func runCrawl(dbPath, rootCfgPath string, refresh bool) error {
 		visited: make(map[string]bool),
 	}
 
-	if err := c.validateAndInsertRoot(ctx, cfg); err != nil {
+	if err := c.validateAndInsertRoot(ctx, cfg.Crawl.Root); err != nil {
 		return err
 	}
 

@@ -32,7 +32,7 @@ credentials.json
 token.json
 
 # Runtime config
-root.json
+config.json
 
 # Compiled binary
 /google-drive-cleanup
