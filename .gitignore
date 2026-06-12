@@ -35,7 +35,6 @@ token.json
 config.json
 
 # Compiled binary
-/google-drive-cleanup
 /drive-cleanup
 
 # Crawl databases

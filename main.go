@@ -1,4 +1,4 @@
-// Command google-drive-cleanup crawls a Google Drive folder tree into a
+// Command drive-cleanup crawls a Google Drive folder tree into a
 // SQLite database and reports on file ownership. It is the first half of an
 // ownership-migration project: we snapshot every file's location and owner
 // before moving files through shared drives for ownership transfer, so they
@@ -29,9 +29,9 @@ func main() {
 // error via log.Fatal, and a full usage wall on, say, a Drive API error is
 // just noise. Cobra still prints usage for flag/argument parsing errors.
 var rootCmd = &cobra.Command{
-	Use:   "google-drive-cleanup",
+	Use:   "drive-cleanup",
 	Short: "Crawl a Google Drive folder tree into SQLite and report on ownership",
-	Long: `google-drive-cleanup snapshots every file's location and owner under a
+	Long: `drive-cleanup snapshots every file's location and owner under a
 configured root folder into a SQLite database, so files can be moved through
 shared drives for ownership transfer and later restored to their original
 parents.`,
