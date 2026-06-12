@@ -391,6 +391,14 @@ func countOwned(n *exploreNode) (folders, files int) {
 	return folders, files
 }
 
+// crawlRootDriveID returns the Drive ID of the crawl root (the node with no
+// parent). Returns sql.ErrNoRows if the database is empty.
+func crawlRootDriveID(db *sql.DB) (string, error) {
+	var id string
+	err := db.QueryRow(`SELECT drive_id FROM nodes WHERE parent_id IS NULL LIMIT 1`).Scan(&id)
+	return id, err
+}
+
 // originalParentDriveID returns the Drive ID of the folder the given file was
 // crawled under. Returns sql.ErrNoRows if the file is not in the database or
 // has no recorded parent (i.e. it is the crawl root).

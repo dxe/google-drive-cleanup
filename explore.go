@@ -38,6 +38,10 @@ func runExploreOwnedFiles(dbPath, account, outDir string) error {
 	if err != nil {
 		return err
 	}
+	crawlRoot, err := crawlRootDriveID(db)
+	if err != nil {
+		return fmt.Errorf("fetching crawl root: %w", err)
+	}
 
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return fmt.Errorf("creating %s: %w", outDir, err)
@@ -67,6 +71,7 @@ func runExploreOwnedFiles(dbPath, account, outDir string) error {
 		DisplayName:  displayName,
 		TotalFolders: totalFolders,
 		TotalFiles:   totalFiles,
+		CrawlRoot:    crawlRoot,
 		Roots:        roots,
 	}); err != nil {
 		return fmt.Errorf("rendering HTML: %w", err)
@@ -101,6 +106,7 @@ type exploreData struct {
 	DisplayName  string
 	TotalFolders int
 	TotalFiles   int
+	CrawlRoot    string
 	Roots        []*exploreNode
 }
 
@@ -174,6 +180,7 @@ const exploreHTML = `<!DOCTYPE html>
   <h1>Files &amp; folders owned by {{.Account}}{{if .DisplayName}} ({{.DisplayName}}){{end}}</h1>
   <div class="sub">📁 {{.TotalFolders}} folders &nbsp; 📄 {{.TotalFiles}} files owned. Bold = owned by this account.</div>
   <div class="hint">Click a ▶ to expand. Keyboard: ↑/↓ move, →/← expand/collapse, Enter or Space toggles.</div>
+  <div class="hint"><a href="https://drive.google.com/drive/search?q=owner:me%20parent:{{.CrawlRoot}}%20-type:folders" target="_blank" rel="noopener">View my files in Drive</a></div>
 </header>
 
 <ul role="tree" aria-label="Owned files">
