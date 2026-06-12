@@ -6,63 +6,69 @@
 package main
 
 import (
-	"errors"
-	"flag"
 	"fmt"
 	"log"
 	"os"
 	"strings"
+
+	"github.com/spf13/cobra"
 )
 
 func main() {
 	log.SetOutput(os.Stderr)
 	log.SetFlags(log.LstdFlags)
 
-	if len(os.Args) < 2 {
-		usage()
-		os.Exit(2)
-	}
-
-	var err error
-	switch os.Args[1] {
-	case "crawl":
-		err = cmdCrawl(os.Args[2:])
-	case "owners":
-		err = cmdOwners(os.Args[2:])
-	case "path":
-		err = cmdPath(os.Args[2:])
-	case "help", "-h", "-help", "--help":
-		usage()
-	default:
-		fmt.Fprintf(os.Stderr, "unknown subcommand %q\n\n", os.Args[1])
-		usage()
-		os.Exit(2)
-	}
-	if err != nil {
+	if err := rootCmd.Execute(); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func usage() {
-	fmt.Fprint(os.Stderr, `usage: google-drive-cleanup <subcommand> [flags]
-
-Subcommands:
-  crawl   recursively crawl the configured root folder into the database
-          flags: -db drive.db  -root-config root.json  -refresh
-  owners  print each owner and how many files (non-folders) they own,
-          sorted descending by count
-          flags: -db drive.db
-  path    print the full folder path of a node by Drive ID
-          usage: path [-db drive.db] <drive_id>
-`)
+// rootCmd is the base command. SilenceErrors/SilenceUsage keep cobra from
+// printing the error and a usage dump on runtime failures — main() reports the
+// error via log.Fatal, and a full usage wall on, say, a Drive API error is
+// just noise. Cobra still prints usage for flag/argument parsing errors.
+var rootCmd = &cobra.Command{
+	Use:   "google-drive-cleanup",
+	Short: "Crawl a Google Drive folder tree into SQLite and report on ownership",
+	Long: `google-drive-cleanup snapshots every file's location and owner under a
+configured root folder into a SQLite database, so files can be moved through
+shared drives for ownership transfer and later restored to their original
+parents.`,
+	SilenceErrors: true,
+	SilenceUsage:  true,
 }
 
-func cmdOwners(args []string) error {
-	fs := flag.NewFlagSet("owners", flag.ExitOnError)
-	dbPath := fs.String("db", "drive.db", "path to the SQLite database")
-	fs.Parse(args)
+var ownersCmd = &cobra.Command{
+	Use:   "owners",
+	Short: "Print each owner and how many files (non-folders) they own",
+	Long: `Print each owner and how many files (non-folders) they own, sorted
+descending by count — this drives outreach priority.`,
+	Args: cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		dbPath, _ := cmd.Flags().GetString("db")
+		return runOwners(dbPath)
+	},
+}
 
-	db, err := openDB(*dbPath)
+var pathCmd = &cobra.Command{
+	Use:   "path <drive_id>",
+	Short: "Print the full folder path of a node by Drive ID",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		dbPath, _ := cmd.Flags().GetString("db")
+		return runPath(dbPath, args[0])
+	},
+}
+
+func init() {
+	ownersCmd.Flags().String("db", "drive.db", "path to the SQLite database")
+	pathCmd.Flags().String("db", "drive.db", "path to the SQLite database")
+
+	rootCmd.AddCommand(crawlCmd, ownersCmd, pathCmd)
+}
+
+func runOwners(dbPath string) error {
+	db, err := openDB(dbPath)
 	if err != nil {
 		return err
 	}
@@ -97,21 +103,14 @@ func ownerLabel(oc ownerCount) string {
 	}
 }
 
-func cmdPath(args []string) error {
-	fs := flag.NewFlagSet("path", flag.ExitOnError)
-	dbPath := fs.String("db", "drive.db", "path to the SQLite database")
-	fs.Parse(args)
-	if fs.NArg() != 1 {
-		return errors.New("usage: path [-db drive.db] <drive_id>")
-	}
-
-	db, err := openDB(*dbPath)
+func runPath(dbPath, driveID string) error {
+	db, err := openDB(dbPath)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	segments, err := nodePath(db, fs.Arg(0))
+	segments, err := nodePath(db, driveID)
 	if err != nil {
 		return err
 	}

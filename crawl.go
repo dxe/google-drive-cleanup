@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"log"
 	"math/rand/v2"
@@ -15,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/spf13/cobra"
 	"golang.org/x/time/rate"
 	"google.golang.org/api/drive/v3"
 	"google.golang.org/api/googleapi"
@@ -69,25 +69,39 @@ type crawler struct {
 	fileCount int64           // running count of child rows upserted this run
 }
 
-func cmdCrawl(args []string) error {
-	fs := flag.NewFlagSet("crawl", flag.ExitOnError)
-	dbPath := fs.String("db", "drive.db", "path to the SQLite database")
-	rootCfgPath := fs.String("root-config", "root.json", "path to the root folder config JSON")
-	refresh := fs.Bool("refresh", false, "reset children_done on all folders to force a full re-crawl")
-	fs.Parse(args)
+var crawlCmd = &cobra.Command{
+	Use:   "crawl",
+	Short: "Recursively crawl the configured root folder into the database",
+	Long: `Crawl (or resume a previous crawl of) the configured root folder into the
+database. Ctrl-C stops cleanly between writes; just re-run to resume.`,
+	Args: cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		dbPath, _ := cmd.Flags().GetString("db")
+		rootCfgPath, _ := cmd.Flags().GetString("root-config")
+		refresh, _ := cmd.Flags().GetBool("refresh")
+		return runCrawl(dbPath, rootCfgPath, refresh)
+	},
+}
 
-	cfg, err := loadRootConfig(*rootCfgPath)
+func init() {
+	crawlCmd.Flags().String("db", "drive.db", "path to the SQLite database")
+	crawlCmd.Flags().String("root-config", "root.json", "path to the root folder config JSON")
+	crawlCmd.Flags().Bool("refresh", false, "reset children_done on all folders to force a full re-crawl")
+}
+
+func runCrawl(dbPath, rootCfgPath string, refresh bool) error {
+	cfg, err := loadRootConfig(rootCfgPath)
 	if err != nil {
 		return err
 	}
 
-	db, err := openDB(*dbPath)
+	db, err := openDB(dbPath)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	if *refresh {
+	if refresh {
 		if err := resetChildrenDone(db); err != nil {
 			return err
 		}

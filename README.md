@@ -46,7 +46,7 @@ build on the same database.
 ## Root config
 
 The crawl root comes from a JSON file (default `root.json`, override with
-`-root-config`):
+`--root-config`):
 
 ```json
 { "id": "0ABCdef...", "name": "DxE General" }
@@ -66,10 +66,10 @@ interactive and login shells) wraps `go run`, so no build step is needed:
 ```sh
 # Crawl (or resume a previous crawl) into drive.db
 drive-cleanup crawl
-drive-cleanup crawl -db drive.db -root-config root.json
+drive-cleanup crawl --db drive.db --root-config root.json
 
 # Force a full re-crawl of an already-completed database
-drive-cleanup crawl -refresh
+drive-cleanup crawl --refresh
 
 # Who owns how many files (non-folders), most first — drives outreach priority
 drive-cleanup owners
@@ -77,6 +77,10 @@ drive-cleanup owners
 # Full folder path of a node (used later to restore original locations)
 drive-cleanup path 1AbCdEfGh...
 ```
+
+The CLI is built with [Cobra](https://github.com/spf13/cobra): run
+`drive-cleanup help` (or `drive-cleanup <command> --help`) for full usage, and
+`drive-cleanup completion <shell>` to generate shell completions.
 
 ## Interrupting and resuming
 
