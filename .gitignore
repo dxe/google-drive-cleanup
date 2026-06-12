@@ -34,9 +34,6 @@ token.json
 # Runtime config
 config.json
 
-# Compiled binary
-/drive-cleanup
-
 # Crawl databases
 *.db
 *.db-wal
