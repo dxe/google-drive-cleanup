@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
@@ -124,17 +125,10 @@ func tokenFromWeb(ctx context.Context, config *oauth2.Config) (*oauth2.Token, er
 	fmt.Fprintf(os.Stderr,
 		"Open this URL in a browser and authorize:\n\n%s\n\n"+
 			"Waiting for the redirect to be captured automatically...\n"+
-			"(If your browser can't reach the callback, paste the auth code — or the\n"+
-			"full localhost redirect URL — here and press enter): ", authURL)
+			"(If the browser can't reach the callback within %v, you will be\n"+
+			"prompted to paste the auth code or full redirect URL here.)\n", authURL, browserWaitTimeout)
 
-	// stdin fallback: runs concurrently with the callback server.
-	go func() {
-		var in string
-		if _, err := fmt.Scan(&in); err == nil {
-			codeCh <- extractCode(in)
-		}
-	}()
-
+	// Phase 1: wait for the browser redirect — no stdin reading, no goroutine leak.
 	var code string
 	select {
 	case code = <-codeCh:
@@ -142,6 +136,30 @@ func tokenFromWeb(ctx context.Context, config *oauth2.Config) (*oauth2.Token, er
 		return nil, err
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	case <-time.After(browserWaitTimeout):
+		// fall through to stdin fallback
+	}
+
+	if code == "" {
+		// Phase 2: browser redirect didn't arrive; ask the user to paste.
+		// The goroutine below exits as soon as the user provides input, so it
+		// does not outlive this call and cannot race with later stdin reads.
+		fmt.Fprintf(os.Stderr, "No redirect received. Paste the auth code or the full redirect URL and press Enter: ")
+		stdinCh := make(chan string, 1)
+		go func() {
+			var in string
+			if _, err := fmt.Scan(&in); err == nil {
+				stdinCh <- extractCode(in)
+			}
+		}()
+		select {
+		case code = <-codeCh: // late browser redirect
+		case code = <-stdinCh:
+		case err := <-errCh:
+			return nil, err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 
 	tok, err := config.Exchange(ctx, code)
@@ -150,6 +168,12 @@ func tokenFromWeb(ctx context.Context, config *oauth2.Config) (*oauth2.Token, er
 	}
 	return tok, nil
 }
+
+// browserWaitTimeout is how long tokenFromWeb waits for the OAuth browser
+// redirect before falling back to a manual paste prompt. The redirect normally
+// arrives within seconds; this timeout only fires when port forwarding is
+// broken or the browser never completes the flow.
+const browserWaitTimeout = 2 * time.Minute
 
 // extractCode accepts either a bare auth code or a full redirect URL pasted on
 // stdin and returns the code.
