@@ -6,6 +6,7 @@
 package main
 
 import (
+	"database/sql"
 	"fmt"
 	"log"
 	"os"
@@ -46,7 +47,8 @@ descending by count — this drives outreach priority.`,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dbPath, _ := cmd.Flags().GetString("db")
-		return runOwners(dbPath)
+		cfgPath, _ := cmd.Flags().GetString("config")
+		return runOwners(dbPath, cfgPath)
 	},
 }
 
@@ -62,12 +64,18 @@ var pathCmd = &cobra.Command{
 
 func init() {
 	ownersCmd.Flags().String("db", "drive.db", "path to the SQLite database")
+	ownersCmd.Flags().String("config", "config.json", "path to the config JSON")
 	pathCmd.Flags().String("db", "drive.db", "path to the SQLite database")
 
 	rootCmd.AddCommand(crawlCmd, ownersCmd, pathCmd)
 }
 
-func runOwners(dbPath string) error {
+func runOwners(dbPath, cfgPath string) error {
+	cfg, err := loadConfig(cfgPath)
+	if err != nil {
+		return err
+	}
+
 	db, err := openDB(dbPath)
 	if err != nil {
 		return err
@@ -79,9 +87,31 @@ func runOwners(dbPath string) error {
 		return err
 	}
 	for _, oc := range counts {
+		if cfg.Owners.IgnoreInternalDomains && isInternalEmail(oc.email, cfg.InternalDomains) {
+			continue
+		}
 		fmt.Printf("%8d  %s\n", oc.count, ownerLabel(oc))
 	}
 	return nil
+}
+
+// isInternalEmail reports whether email is non-null and ends with "@" followed
+// by one of the internal domains (case-insensitive).
+func isInternalEmail(email sql.NullString, internalDomains []string) bool {
+	if !email.Valid {
+		return false
+	}
+	at := strings.LastIndex(email.String, "@")
+	if at < 0 {
+		return false
+	}
+	domain := strings.ToLower(email.String[at+1:])
+	for _, d := range internalDomains {
+		if domain == strings.ToLower(d) {
+			return true
+		}
+	}
+	return false
 }
 
 func ownerLabel(oc ownerCount) string {
