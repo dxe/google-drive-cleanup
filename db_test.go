@@ -145,7 +145,7 @@ func TestPendingFolders(t *testing.T) {
 func TestOwnersReport(t *testing.T) {
 	db := testDB(t)
 	rootID, _, _, _ := mustUpsert(t, db, node{driveID: "root", name: "Root", typ: "folder", mimeType: folderMimeType,
-		ownerEmail: nullString("owner@example.com")}) // folders must be excluded
+		ownerEmail: nullString("owner@example.com")}) // a folder-only owner
 	parent := sql.NullInt64{Int64: rootID, Valid: true}
 
 	for i, n := range []node{
@@ -170,12 +170,16 @@ func TestOwnersReport(t *testing.T) {
 	for _, oc := range counts {
 		got = append(got, ownerLabel(oc))
 	}
-	want := []string{"alice@example.com (Alice)", "id:222 (Bob)", "(unknown)"}
+	want := []string{"alice@example.com (Alice)", "id:222 (Bob)", "(unknown)", "owner@example.com"}
 	if strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Errorf("owners = %v, want %v", got, want)
 	}
-	if counts[0].count != 2 || counts[1].count != 1 || counts[2].count != 1 {
-		t.Errorf("counts = %d,%d,%d, want 2,1,1", counts[0].count, counts[1].count, counts[2].count)
+	if counts[0].fileCount != 2 || counts[1].fileCount != 1 || counts[2].fileCount != 1 || counts[3].fileCount != 0 {
+		t.Errorf("file counts = %d,%d,%d,%d, want 2,1,1,0",
+			counts[0].fileCount, counts[1].fileCount, counts[2].fileCount, counts[3].fileCount)
+	}
+	if counts[3].folderCount != 1 || counts[3].total != 1 {
+		t.Errorf("owner@example.com = %d folders, %d total, want 1,1", counts[3].folderCount, counts[3].total)
 	}
 }
 

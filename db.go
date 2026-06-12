@@ -207,19 +207,24 @@ type ownerCount struct {
 	email       sql.NullString
 	ownerID     sql.NullString
 	displayName sql.NullString
-	count       int64
+	folderCount int64
+	fileCount   int64
+	total       int64
 }
 
-// ownersReport counts non-folder nodes per owner, grouped by owner_email,
-// falling back to owner_id when the email is missing, and to a single
-// "(unknown)" bucket when both are NULL.
+// ownersReport counts nodes per owner, split into folders and files, grouped by
+// owner_email, falling back to owner_id when the email is missing, and to a
+// single "(unknown)" bucket when both are NULL. Rows are ordered by file count
+// descending.
 func ownersReport(db *sql.DB) ([]ownerCount, error) {
 	rows, err := db.Query(`
-		SELECT MAX(owner_email) AS email, MAX(owner_id) AS oid, MAX(owner_display_name), COUNT(*) AS c
+		SELECT MAX(owner_email) AS email, MAX(owner_id) AS oid, MAX(owner_display_name),
+			SUM(type = 'folder') AS folders,
+			SUM(type <> 'folder') AS files,
+			COUNT(*) AS total
 		FROM nodes
-		WHERE type <> 'folder'
 		GROUP BY COALESCE(owner_email, owner_id, '(unknown)')
-		ORDER BY c DESC, (email IS NULL AND oid IS NULL), COALESCE(email, oid)`)
+		ORDER BY files DESC, total DESC, (email IS NULL AND oid IS NULL), COALESCE(email, oid)`)
 	if err != nil {
 		return nil, err
 	}
@@ -227,7 +232,7 @@ func ownersReport(db *sql.DB) ([]ownerCount, error) {
 	var counts []ownerCount
 	for rows.Next() {
 		var oc ownerCount
-		if err := rows.Scan(&oc.email, &oc.ownerID, &oc.displayName, &oc.count); err != nil {
+		if err := rows.Scan(&oc.email, &oc.ownerID, &oc.displayName, &oc.folderCount, &oc.fileCount, &oc.total); err != nil {
 			return nil, err
 		}
 		counts = append(counts, oc)

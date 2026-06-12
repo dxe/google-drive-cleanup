@@ -86,11 +86,12 @@ func runOwners(dbPath, cfgPath string) error {
 	if err != nil {
 		return err
 	}
+	fmt.Printf("%10s %10s %10s  %s\n", "FOLDERS", "FILES", "TOTAL", "OWNER")
 	for _, oc := range counts {
 		if cfg.Owners.IgnoreInternalDomains && isInternalEmail(oc.email, cfg.InternalDomains) {
 			continue
 		}
-		fmt.Printf("%8d  %s\n", oc.count, ownerLabel(oc))
+		fmt.Printf("%10d %10d %10d  %s\n", oc.folderCount, oc.fileCount, oc.total, ownerLabel(oc))
 	}
 	return nil
 }
