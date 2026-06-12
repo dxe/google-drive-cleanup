@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -253,6 +254,141 @@ func ownersReport(db *sql.DB) ([]ownerCount, error) {
 		counts = append(counts, oc)
 	}
 	return counts, rows.Err()
+}
+
+// exploreNode is one node in the ownership tree built by ownedAndAncestors:
+// every item the target account owns, plus the ancestor folders that hold them.
+type exploreNode struct {
+	rowID    int64
+	driveID  string
+	name     string
+	typ      string
+	parentID sql.NullInt64
+	owned    bool // owned by the target account
+	children []*exploreNode
+	// ownedFolders/ownedFiles count owned descendants in this node's subtree
+	// (excluding the node itself), split by type. Only meaningful for folders.
+	ownedFolders int
+	ownedFiles   int
+}
+
+// ownedAndAncestors builds the forest of every node owned by account (matched
+// against owner_email OR owner_id) together with all of its ancestor folders,
+// so each owned item is shown in the context of where it lives. It loads the
+// whole nodes table into memory once — the dataset is a single Drive — and
+// returns the root nodes (those with no included parent), the owner's display
+// name, and per-folder owned-descendant counts. It errors if the account owns
+// nothing.
+func ownedAndAncestors(db *sql.DB, account string) (roots []*exploreNode, displayName string, err error) {
+	rows, err := db.Query(`SELECT id, drive_id, name, type, parent_id, owner_email, owner_id, owner_display_name FROM nodes`)
+	if err != nil {
+		return nil, "", err
+	}
+	defer rows.Close()
+
+	all := make(map[int64]*exploreNode)
+	for rows.Next() {
+		var (
+			n                   exploreNode
+			email, oid, display sql.NullString
+		)
+		if err := rows.Scan(&n.rowID, &n.driveID, &n.name, &n.typ, &n.parentID, &email, &oid, &display); err != nil {
+			return nil, "", err
+		}
+		n.owned = (email.Valid && email.String == account) || (oid.Valid && oid.String == account)
+		if n.owned && displayName == "" && display.Valid {
+			displayName = display.String
+		}
+		all[n.rowID] = &n
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", err
+	}
+
+	// Collect the included set: every owned node plus all of its ancestors.
+	included := make(map[int64]bool)
+	anyOwned := false
+	for _, n := range all {
+		if !n.owned {
+			continue
+		}
+		anyOwned = true
+		seen := make(map[int64]bool)
+		for cur := n; cur != nil; {
+			if included[cur.rowID] {
+				break // ancestors already added by an earlier owned node
+			}
+			included[cur.rowID] = true
+			if !cur.parentID.Valid || seen[cur.rowID] {
+				break // reached a root, or guarded against a parent cycle
+			}
+			seen[cur.rowID] = true
+			cur = all[cur.parentID.Int64]
+		}
+	}
+	if !anyOwned {
+		return nil, "", fmt.Errorf("no files or folders owned by %q in the database", account)
+	}
+
+	// Wire children among included nodes and collect roots (included nodes
+	// whose parent is missing or not itself included).
+	for id := range included {
+		n := all[id]
+		if n.parentID.Valid && included[n.parentID.Int64] {
+			parent := all[n.parentID.Int64]
+			parent.children = append(parent.children, n)
+		} else {
+			roots = append(roots, n)
+		}
+	}
+
+	for _, r := range roots {
+		sortChildren(r)
+		countOwned(r)
+	}
+	sortNodes(roots)
+	return roots, displayName, nil
+}
+
+// sortNodes orders a sibling slice folders-first, then case-insensitively by
+// name, matching a typical file browser.
+func sortNodes(nodes []*exploreNode) {
+	sort.SliceStable(nodes, func(i, j int) bool {
+		a, b := nodes[i], nodes[j]
+		if (a.typ == typeFolder) != (b.typ == typeFolder) {
+			return a.typ == typeFolder
+		}
+		return strings.ToLower(a.name) < strings.ToLower(b.name)
+	})
+}
+
+// sortChildren recursively orders every node's children.
+func sortChildren(n *exploreNode) {
+	sortNodes(n.children)
+	for _, c := range n.children {
+		sortChildren(c)
+	}
+}
+
+// countOwned fills in ownedFolders/ownedFiles for n as the number of owned
+// descendants in its subtree, split by type, and returns those two counts so
+// parents can accumulate them.
+func countOwned(n *exploreNode) (folders, files int) {
+	for _, c := range n.children {
+		cf, cFiles := countOwned(c)
+		folders += cf
+		files += cFiles
+		if c.owned {
+			if c.typ == typeFolder {
+				folders++
+			} else {
+				files++
+			}
+		}
+	}
+	n.ownedFolders = folders
+	n.ownedFiles = files
+	return folders, files
 }
 
 // nodePath returns the names from the crawl root down to the node with the

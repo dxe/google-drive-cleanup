@@ -81,7 +81,16 @@ drive-cleanup owners
 
 # Full folder path of a node (used later to restore original locations)
 drive-cleanup path 1AbCdEfGh...
+
+# Build a self-contained, emailable HTML tree of everything an account owns
+# (email or owner id), written to out/explore-owned-files/<account>.html
+drive-cleanup explore-owned-files someone@gmail.com
 ```
+
+`explore-owned-files` produces a single offline HTML file: an interactive,
+collapsible tree of every file and folder the account owns plus their ancestor
+folders, per-folder counts of owned descendants, Drive links, and keyboard
+navigation — handy to attach when reaching out to an owner.
 
 The CLI is built with [Cobra](https://github.com/spf13/cobra): run
 `drive-cleanup help` (or `drive-cleanup <command> --help`) for full usage, and
