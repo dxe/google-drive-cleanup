@@ -111,7 +111,7 @@ func runCrawl(dbPath, cfgPath string, refresh bool) error {
 		cancel()
 	}()
 
-	srv, err := newDriveService(ctx)
+	srv, err := newDriveService(ctx, drive.DriveReadonlyScope)
 	if err != nil {
 		return err
 	}

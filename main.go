@@ -69,7 +69,7 @@ func init() {
 	exploreCmd.Flags().String("db", "drive.db", "path to the SQLite database")
 	exploreCmd.Flags().String("out", "out/explore-owned-files", "output directory for the generated HTML")
 
-	rootCmd.AddCommand(crawlCmd, ownersCmd, pathCmd, exploreCmd)
+	rootCmd.AddCommand(crawlCmd, ownersCmd, pathCmd, exploreCmd, restoreCmd)
 }
 
 func runOwners(dbPath, cfgPath string) error {

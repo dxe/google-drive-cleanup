@@ -20,9 +20,10 @@ build on the same database.
    Download the JSON and save it as `credentials.json` in the directory you
    run the tool from. (You may need to configure the OAuth consent screen
    first; add your account as a test user if the app is in testing mode.)
-3. **Scopes.** The crawler requests `https://www.googleapis.com/auth/drive.readonly`
-   only. The later move/transfer tooling will need the full `drive` scope —
-   when we widen it, delete `token.json` and re-consent.
+3. **Scopes.** The `crawl`, `owners`, `path`, and `explore-owned-files` commands
+   request `https://www.googleapis.com/auth/drive.readonly` only. The
+   `restore-locations` command needs the full `drive` scope — when switching to
+   it, delete `token.json` and re-consent so the new token covers write access.
 4. **First run auth.** On first run the tool starts a small loopback server on
    port `8765`, prints a consent URL, and waits. Open the URL in a browser,
    authorize, and Google redirects back to the server, which captures the auth
@@ -85,12 +86,32 @@ drive-cleanup path 1AbCdEfGh...
 # Build a self-contained, emailable HTML tree of everything an account owns
 # (email or owner id), written to out/explore-owned-files/<account>.html
 drive-cleanup explore-owned-files someone@gmail.com
+
+# Move files from the staging folder back to their original locations
+drive-cleanup restore-locations
 ```
 
 `explore-owned-files` produces a single offline HTML file: an interactive,
 collapsible tree of every file and folder the account owns plus their ancestor
 folders, per-folder counts of owned descendants, Drive links, and keyboard
 navigation — handy to attach when reaching out to an owner.
+
+`restore-locations` is the second half of the ownership-migration flow. Once
+an owner has dragged their files into the shared-drive staging folder (which
+transfers ownership to the org account), run this command to move each file
+back to the folder it lived in before the transfer. It scans the staging folder
+one level deep, looks up each file's original parent in the database, and calls
+the Drive `files.update` API to reparent it. Files not found in the database
+are skipped with a warning; the final line reports a count of moved, skipped,
+and failed items. Configure the staging folder in `config.json`:
+
+```json
+{
+  "restore-locations": {
+    "staging-folder": { "id": "1AbCdEfGh...", "name": "Staging" }
+  }
+}
+```
 
 The CLI is built with [Cobra](https://github.com/spf13/cobra): run
 `drive-cleanup help` (or `drive-cleanup <command> --help`) for full usage, and

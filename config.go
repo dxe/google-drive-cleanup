@@ -13,8 +13,9 @@ type config struct {
 	// InternalDomains lists the org's own email domains (no leading "@"), e.g.
 	// "example.com". Commands can use these to distinguish internal from
 	// external owners.
-	InternalDomains []string     `json:"internal-domains"`
-	Owners          ownersConfig `json:"owners"`
+	InternalDomains  []string              `json:"internal-domains"`
+	Owners           ownersConfig          `json:"owners"`
+	RestoreLocations restoreLocationsConfig `json:"restore-locations"`
 }
 
 type crawlConfig struct {
@@ -28,12 +29,19 @@ type ownersConfig struct {
 	IgnoreInternalDomains bool `json:"ignore-internal-domains"`
 }
 
-// rootConfig is the crawl root spec. id and name are kept together so the
-// crawler can guard against a stale/wrong id by checking the live folder name
-// against name (see crawler.validateAndInsertRoot).
+// rootConfig is a folder spec: id and name kept together so the tool can
+// guard against a stale/wrong id by verifying the live folder name matches.
 type rootConfig struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
+}
+
+// restoreLocationsConfig holds settings for the restore-locations command.
+type restoreLocationsConfig struct {
+	// StagingFolder is the shared-drive folder owners drag their files into
+	// before running restore-locations. The tool scans it (one level deep),
+	// looks up each file's original parent in the database, and moves it back.
+	StagingFolder rootConfig `json:"staging-folder"`
 }
 
 func loadConfig(path string) (config, error) {

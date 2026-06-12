@@ -30,15 +30,17 @@ const (
 	oauthState = "state-token"
 )
 
-// newDriveService builds an authenticated Drive client. The crawler only
-// needs drive.readonly; the later move/transfer tooling will need the full
-// drive scope (delete token.json and re-consent after widening it).
-func newDriveService(ctx context.Context) (*drive.Service, error) {
+// newDriveService builds an authenticated Drive client for the given scopes.
+// Read-only commands pass drive.DriveReadonlyScope; restore-locations passes
+// drive.DriveScope (full). If you widen the scope, delete token.json and
+// re-run to re-consent — the cached refresh token only covers the scope it was
+// issued for.
+func newDriveService(ctx context.Context, scopes ...string) (*drive.Service, error) {
 	b, err := os.ReadFile(credentialsFile)
 	if err != nil {
 		return nil, fmt.Errorf("reading %s (see README for how to create an OAuth client): %w", credentialsFile, err)
 	}
-	config, err := google.ConfigFromJSON(b, drive.DriveReadonlyScope)
+	config, err := google.ConfigFromJSON(b, scopes...)
 	if err != nil {
 		return nil, fmt.Errorf("parsing %s: %w", credentialsFile, err)
 	}

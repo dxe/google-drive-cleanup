@@ -391,6 +391,19 @@ func countOwned(n *exploreNode) (folders, files int) {
 	return folders, files
 }
 
+// originalParentDriveID returns the Drive ID of the folder the given file was
+// crawled under. Returns sql.ErrNoRows if the file is not in the database or
+// has no recorded parent (i.e. it is the crawl root).
+func originalParentDriveID(db *sql.DB, driveID string) (string, error) {
+	var parentDriveID string
+	err := db.QueryRow(`
+		SELECT p.drive_id
+		FROM nodes n
+		JOIN nodes p ON p.id = n.parent_id
+		WHERE n.drive_id = ?`, driveID).Scan(&parentDriveID)
+	return parentDriveID, err
+}
+
 // nodePath returns the names from the crawl root down to the node with the
 // given Drive ID, walking parent_id upwards. For a shortcut this is where the
 // shortcut row lives in our crawled tree, not where its target lives.
