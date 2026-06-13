@@ -10,6 +10,38 @@ takes a durable snapshot of every file's location and owner so original
 parents can be reconstructed. The move/transfer tooling will come later and
 build on the same database.
 
+## The migration flow at a glance
+
+One-time, for the whole tree:
+
+```
+  crawl   ──▶  drive.db        snapshot every file's owner + original parent
+  owners  ──▶  who owns what   sorted by file count, to prioritize outreach
+```
+
+Then, per user being migrated, the contents of a folder make this round trip:
+
+```
+                         (3) user drags the empty folder + their own
+                             loose files in; ownership flips to the org
+     original folder  ───────────────────────────────────────────────▶  staging folder
+        │      ▲                                                          (shared drive)
+        │      │                                                              │
+   (2) stash   │ (5) stash pop                                      (4) restore-locations
+       push    │ refills third-party-                              looks up each file's
+   empties the │ owned files after the                            original parent in
+   folder so   │ folder is back in the                            drive.db and moves it
+   it can      │ regular tree                                      back there
+   transit     │                                                              │
+        ▼      │                                                              ▼
+        stash folder (My-Drive, inside the crawl root) ◀──────────  back to original parent
+```
+
+`stash push`/`stash pop` exist only because a shared drive cannot hold files
+owned by third parties; loose files the user owns round-trip without the stash.
+The numbered steps map to the per-user order of operations near the end of this
+README. Run any of the moving steps with `--dry-run` first to preview them.
+
 ## Setup
 
 1. **Enable the Drive API.** In the [Google Cloud console](https://console.cloud.google.com/),
