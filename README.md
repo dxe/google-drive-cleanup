@@ -328,3 +328,13 @@ A token-bucket limiter caps API calls at ~3/sec, and every call retries with
 exponential backoff plus jitter on `403 rateLimitExceeded`, `429`, and 5xx
 responses (retries pass back through the limiter). The crawl is intentionally
 single-threaded — durability over speed.
+
+## TODO
+
+- **`status` command.** The migration is a stateful, multi-step sequence per
+  user but nothing tells you where you are. Add a `drive-cleanup status` that
+  reads the DB + config and reports in one place: whether the crawl is complete
+  or how many folders are still pending, the owner count, how many items lack
+  edit access, and whether each config section is present and its configured
+  folders resolve in Drive. This would be the easiest on-ramp for "I forgot
+  where I left off."
