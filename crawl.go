@@ -76,8 +76,6 @@ database. Ctrl-C stops cleanly between writes; just re-run to resume.`,
 }
 
 func init() {
-	crawlCmd.Flags().String("db", "drive.db", "path to the SQLite database")
-	crawlCmd.Flags().String("config", "config.json", "path to the config JSON")
 	crawlCmd.Flags().Bool("refresh", false, "reset children_done on all folders to force a full re-crawl")
 }
 

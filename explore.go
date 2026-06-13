@@ -27,6 +27,10 @@ keyboard-navigable. All CSS/JS is inlined so the file can be emailed as-is.`,
 	},
 }
 
+func init() {
+	exploreCmd.Flags().String("out", "out/explore-owned-files", "output directory for the generated HTML")
+}
+
 func runExploreOwnedFiles(dbPath, account, outDir string) error {
 	db, err := openDB(dbPath)
 	if err != nil {

@@ -79,12 +79,12 @@ This reads only the database; re-run crawl first if it is stale.`,
 }
 
 func init() {
-	ownersCmd.Flags().String("db", "drive.db", "path to the SQLite database")
-	ownersCmd.Flags().String("config", "config.json", "path to the config JSON")
-	pathCmd.Flags().String("db", "drive.db", "path to the SQLite database")
-	checkEditAccessCmd.Flags().String("db", "drive.db", "path to the SQLite database")
-	exploreCmd.Flags().String("db", "drive.db", "path to the SQLite database")
-	exploreCmd.Flags().String("out", "out/explore-owned-files", "output directory for the generated HTML")
+	// --db and --config apply to every subcommand, so they live on the root as
+	// persistent flags: defined once here, readable from any command's RunE via
+	// cmd.Flags().GetString(...). Command-specific flags (e.g. crawl's --refresh,
+	// explore's --out) are registered in each command's own file.
+	rootCmd.PersistentFlags().String("db", "drive.db", "path to the SQLite database")
+	rootCmd.PersistentFlags().String("config", "config.json", "path to the config JSON")
 
 	rootCmd.AddCommand(crawlCmd, ownersCmd, pathCmd, checkEditAccessCmd, exploreCmd, restoreCmd, stashCmd)
 }

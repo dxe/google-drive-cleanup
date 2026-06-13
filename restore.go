@@ -38,11 +38,6 @@ re-consent with the broader permissions.`,
 	},
 }
 
-func init() {
-	restoreCmd.Flags().String("db", "drive.db", "path to the SQLite database")
-	restoreCmd.Flags().String("config", "config.json", "path to the config JSON")
-}
-
 func runRestoreLocations(dbPath, cfgPath string) error {
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {

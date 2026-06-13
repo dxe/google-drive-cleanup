@@ -94,9 +94,6 @@ This command requires the full Drive scope.`,
 }
 
 func init() {
-	stashPushCmd.Flags().String("db", "drive.db", "path to the SQLite database")
-	stashPushCmd.Flags().String("config", "config.json", "path to the config JSON")
-	stashPopCmd.Flags().String("config", "config.json", "path to the config JSON")
 	stashCmd.AddCommand(stashPushCmd, stashPopCmd)
 }
 
