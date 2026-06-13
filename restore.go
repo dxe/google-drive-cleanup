@@ -49,8 +49,8 @@ func runRestoreLocations(dbPath, cfgPath string, dryRun bool) error {
 		return err
 	}
 	staging := cfg.RestoreLocations.StagingFolder
-	if staging.ID == "" || staging.Name == "" {
-		return fmt.Errorf("%s must set restore-locations.staging-folder.id and restore-locations.staging-folder.name", cfgPath)
+	if err := staging.validate("restore-locations.staging-folder"); err != nil {
+		return fmt.Errorf("%s: %w", cfgPath, err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

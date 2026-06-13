@@ -129,8 +129,8 @@ func runStashPush(dbPath, cfgPath, account string, dryRun bool) error {
 		return err
 	}
 	stash := cfg.Stash.Folder
-	if stash.ID == "" || stash.Name == "" {
-		return fmt.Errorf("%s must set stash.folder.id and stash.folder.name", cfgPath)
+	if err := stash.validate("stash.folder"); err != nil {
+		return fmt.Errorf("%s: %w", cfgPath, err)
 	}
 
 	db, err := openDB(dbPath)
@@ -322,8 +322,8 @@ func runStashPop(cfgPath string, dryRun bool) error {
 		return err
 	}
 	stash := cfg.Stash.Folder
-	if stash.ID == "" || stash.Name == "" {
-		return fmt.Errorf("%s must set stash.folder.id and stash.folder.name", cfgPath)
+	if err := stash.validate("stash.folder"); err != nil {
+		return fmt.Errorf("%s: %w", cfgPath, err)
 	}
 
 	ctx, cancel := cancelOnSignal()

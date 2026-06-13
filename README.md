@@ -48,6 +48,11 @@ build on the same database.
 
 ## Config
 
+Run `drive-cleanup init` to scaffold a `config.json` with every section and
+`REPLACE_WITH_…` placeholders to fill in (it refuses to clobber an existing file
+without `--force`). Any command run against an un-edited placeholder fails with
+a message naming the field to fix.
+
 Configuration comes from a single JSON file (default `config.json`, override
 with `--config`). Each subcommand has its own top-level section so new commands
 can add settings without colliding:
