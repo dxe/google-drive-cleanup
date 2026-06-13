@@ -83,6 +83,9 @@ drive-cleanup owners
 # Full folder path of a node (used later to restore original locations)
 drive-cleanup path 1AbCdEfGh...
 
+# List files/folders the crawling account can't edit (run before moving files)
+drive-cleanup check-edit-access
+
 # Build a self-contained, emailable HTML tree of everything an account owns
 # (email or owner id), written to out/explore-owned-files/<account>.html
 drive-cleanup explore-owned-files someone@gmail.com
@@ -95,6 +98,12 @@ drive-cleanup restore-locations
 collapsible tree of every file and folder the account owns plus their ancestor
 folders, per-folder counts of owned descendants, Drive links, and keyboard
 navigation — handy to attach when reaching out to an owner.
+
+`check-edit-access` reads only the database and prints every node whose
+`can_edit` flag (Drive's `capabilities.canEdit`, captured during the crawl for
+the account that ran it) is false — the items you would be unable to move.
+Folders are listed first, each with its full path and owner. Nodes whose edit
+capability could not be determined (`can_edit = NULL`) are not reported.
 
 `restore-locations` is the second half of the ownership-migration flow. Once
 an owner has dragged their files into the shared-drive staging folder (which
@@ -150,11 +159,24 @@ Single `nodes` table (SQLite, pure-Go `modernc.org/sqlite` driver):
 | `parent_id` | row id of the folder this node was **discovered through** (NULL for the root) |
 | `shortcut_target_id` | for shortcuts, the Drive ID they point to (shortcuts are recorded, never followed) |
 | `children_done` | 1 once all children are fully listed — the resume unit |
+| `can_edit` | Drive `capabilities.canEdit` for the crawling account: 1 editable, 0 not, NULL unknown — drives `check-edit-access` |
 | `crawled_at` | RFC3339 timestamp |
 
 `parent_id` is deliberately the traversal parent, not `files.parents[0]`, so
 it always references a row we actually crawled — `path` walks this chain to
 reconstruct original locations.
+
+**Folder permissions:** for every folder, the crawl snapshots its full sharing
+into a `folder_permissions` table (one row per grant: `type`, `role`,
+`email_address`/`domain`, `display_name`, `allow_file_discovery`, `deleted`), so
+the sharing can be recreated on a clone of the folder later. The whole set for a
+folder is rewritten on each re-crawl, so it always reflects the folder's current
+sharing. Only folders are tracked — files inherit their clone folder's sharing.
+Grants are only as complete as the crawling account can read.
+
+```sql
+SELECT type, role, email_address FROM folder_permissions WHERE node_drive_id = '1AbCdEfGh...';
+```
 
 **Multi-parenting / re-discovery:** Drive items can (legacy) live under
 multiple parents. A node keeps its first-discovered `parent_id`; any later

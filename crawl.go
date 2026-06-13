@@ -24,7 +24,11 @@ const (
 	shortcutMimeType = "application/vnd.google-apps.shortcut"
 	googleAppsPrefix = "application/vnd.google-apps."
 
-	listFields = "nextPageToken, files(id, name, mimeType, owners(emailAddress, displayName, permissionId), parents, shortcutDetails(targetId))"
+	// permissionFields are the Permission sub-fields we persist for folders so a
+	// clone's sharing can be recreated later. Reused by the root fetch and list.
+	permissionFields = "permissions(id, type, role, emailAddress, domain, displayName, allowFileDiscovery, deleted)"
+
+	listFields = "nextPageToken, files(id, name, mimeType, owners(emailAddress, displayName, permissionId), parents, shortcutDetails(targetId), capabilities(canEdit), " + permissionFields + ")"
 )
 
 // Node types stored in the nodes.type column. These are the only valid values
@@ -186,7 +190,7 @@ func (c *crawler) validateAndInsertRoot(ctx context.Context, cfg rootConfig) err
 	err := c.withRetry(ctx, "files.get "+cfg.ID, func() error {
 		var err error
 		f, err = c.srv.Files.Get(cfg.ID).
-			Fields("id, name, mimeType, owners(emailAddress, displayName, permissionId)").
+			Fields("id, name, mimeType, owners(emailAddress, displayName, permissionId), capabilities(canEdit), " + permissionFields).
 			SupportsAllDrives(true).
 			Context(ctx).Do()
 		return err
@@ -216,10 +220,14 @@ func (c *crawler) validateAndInsertRoot(ctx context.Context, cfg rootConfig) err
 		ownerEmail:   email,
 		ownerID:      ownerID,
 		ownerDisplay: display,
+		canEdit:      canEditOf(f),
 		// parentID stays NULL: this is the crawl root
 	})
 	if err != nil {
 		return fmt.Errorf("inserting root: %w", err)
+	}
+	if err := replacePermissions(tx, f.Id, permissionsOf(f)); err != nil {
+		return fmt.Errorf("recording root permissions: %w", err)
 	}
 	return tx.Commit()
 }
@@ -288,6 +296,7 @@ func (c *crawler) commitPage(parent folderRef, files []*drive.File, last bool) (
 			ownerEmail:   email,
 			ownerID:      ownerID,
 			ownerDisplay: display,
+			canEdit:      canEditOf(file),
 			// Record the folder we discovered it through, not files.parents[0]:
 			// parent_id must always point at a row we actually crawled.
 			parentID: sql.NullInt64{Int64: parent.rowID, Valid: true},
@@ -298,6 +307,14 @@ func (c *crawler) commitPage(parent folderRef, files []*drive.File, last bool) (
 		rowID, existed, prevParent, prevDone, err := upsertNode(tx, n)
 		if err != nil {
 			return nil, fmt.Errorf("upserting %s (%q): %w", file.Id, file.Name, err)
+		}
+
+		// Record folder sharing so it can be recreated on a clone later. Only
+		// folders are tracked; files inherit their clone folder's permissions.
+		if n.typ == typeFolder {
+			if err := replacePermissions(tx, file.Id, permissionsOf(file)); err != nil {
+				return nil, fmt.Errorf("recording permissions for %s (%q): %w", file.Id, file.Name, err)
+			}
 		}
 
 		// Multi-parent / re-discovery: parent_id keeps the first-discovered
@@ -351,6 +368,39 @@ func ownerOf(f *drive.File) (email, ownerID, display sql.NullString) {
 	}
 	o := f.Owners[0]
 	return nullString(o.EmailAddress), nullString(o.PermissionId), nullString(o.DisplayName)
+}
+
+// canEditOf reports the crawling account's canEdit capability on f. When the
+// capabilities object is absent (e.g. the API omitted it) it returns an invalid
+// NullBool so the upsert records "unknown" rather than a misleading false.
+func canEditOf(f *drive.File) sql.NullBool {
+	if f.Capabilities == nil {
+		return sql.NullBool{}
+	}
+	return sql.NullBool{Bool: f.Capabilities.CanEdit, Valid: true}
+}
+
+// permissionsOf maps the drive.Permission entries on f to our permission model.
+// The list is empty for items whose permissions the crawling account cannot
+// read; we store what Drive returns.
+func permissionsOf(f *drive.File) []permission {
+	perms := make([]permission, 0, len(f.Permissions))
+	for _, p := range f.Permissions {
+		if p == nil {
+			continue
+		}
+		perms = append(perms, permission{
+			permissionID:       p.Id,
+			typ:                p.Type,
+			role:               p.Role,
+			emailAddress:       nullString(p.EmailAddress),
+			domain:             nullString(p.Domain),
+			displayName:        nullString(p.DisplayName),
+			allowFileDiscovery: sql.NullBool{Bool: p.AllowFileDiscovery, Valid: p.Type == "domain" || p.Type == "anyone"},
+			deleted:            p.Deleted,
+		})
+	}
+	return perms
 }
 
 func nullString(s string) sql.NullString {

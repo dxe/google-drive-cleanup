@@ -183,6 +183,87 @@ func TestOwnersReport(t *testing.T) {
 	}
 }
 
+func TestReplacePermissionsSnapshots(t *testing.T) {
+	db := testDB(t)
+	mustUpsert(t, db, node{driveID: "folder", name: "Folder", typ: typeFolder, mimeType: folderMimeType})
+
+	write := func(perms []permission) {
+		t.Helper()
+		tx, _ := db.Begin()
+		if err := replacePermissions(tx, "folder", perms); err != nil {
+			t.Fatal(err)
+		}
+		tx.Commit()
+	}
+
+	write([]permission{
+		{permissionID: "p1", typ: "user", role: "writer", emailAddress: nullString("a@example.com")},
+		{permissionID: "p2", typ: "anyone", role: "reader", allowFileDiscovery: sql.NullBool{Bool: true, Valid: true}},
+	})
+
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM folder_permissions WHERE node_drive_id='folder'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("after first write: %d permissions, want 2", n)
+	}
+
+	// A re-crawl with a smaller set must replace, not accumulate.
+	write([]permission{{permissionID: "p1", typ: "user", role: "reader", emailAddress: nullString("a@example.com")}})
+
+	var role string
+	if err := db.QueryRow(`SELECT role FROM folder_permissions WHERE node_drive_id='folder' AND permission_id='p1'`).Scan(&role); err != nil {
+		t.Fatal(err)
+	}
+	if role != "reader" {
+		t.Errorf("role = %q, want reader (refreshed)", role)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM folder_permissions WHERE node_drive_id='folder'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("after second write: %d permissions, want 1 (stale p2 dropped)", n)
+	}
+}
+
+func TestNodesLackingEditAccess(t *testing.T) {
+	db := testDB(t)
+	rootID, _, _, _ := mustUpsert(t, db, node{driveID: "root", name: "Root", typ: typeFolder, mimeType: folderMimeType,
+		canEdit: sql.NullBool{Bool: true, Valid: true}})
+	parent := sql.NullInt64{Int64: rootID, Valid: true}
+
+	// Editable file — excluded.
+	mustUpsert(t, db, node{driveID: "ok", name: "ok.pdf", typ: typeBinary, mimeType: "application/pdf",
+		parentID: parent, canEdit: sql.NullBool{Bool: true, Valid: true}})
+	// Unknown capability (e.g. legacy crawl) — excluded.
+	mustUpsert(t, db, node{driveID: "unknown", name: "unknown.pdf", typ: typeBinary, mimeType: "application/pdf",
+		parentID: parent})
+	// Not editable — reported, with owner label and full path.
+	mustUpsert(t, db, node{driveID: "locked", name: "locked.pdf", typ: typeBinary, mimeType: "application/pdf",
+		parentID: parent, ownerEmail: nullString("ext@other.com"), canEdit: sql.NullBool{Bool: false, Valid: true}})
+	// Not editable folder — reported, and sorts before the file.
+	mustUpsert(t, db, node{driveID: "lockedfolder", name: "Shared", typ: typeFolder, mimeType: folderMimeType,
+		parentID: parent, canEdit: sql.NullBool{Bool: false, Valid: true}})
+
+	rows, err := nodesLackingEditAccess(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2 (locked folder + locked file)", len(rows))
+	}
+	if rows[0].typ != typeFolder || rows[0].path != "Root / Shared" {
+		t.Errorf("row[0] = %+v, want folder at Root / Shared", rows[0])
+	}
+	if rows[1].driveID != "locked" || rows[1].path != "Root / locked.pdf" {
+		t.Errorf("row[1] path = %q, want Root / locked.pdf", rows[1].path)
+	}
+	if rows[1].owner != "ext@other.com" {
+		t.Errorf("row[1] owner = %q, want ext@other.com", rows[1].owner)
+	}
+}
+
 func TestNodePath(t *testing.T) {
 	db := testDB(t)
 	rootID, _, _, _ := mustUpsert(t, db, node{driveID: "root", name: "DxE General", typ: typeFolder, mimeType: folderMimeType})

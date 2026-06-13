@@ -38,6 +38,10 @@ CREATE TABLE IF NOT EXISTS nodes (
 	parent_id          INTEGER REFERENCES nodes(id),
 	shortcut_target_id TEXT,
 	children_done      INTEGER NOT NULL DEFAULT 0,
+	-- can_edit mirrors the Drive capabilities.canEdit flag for the account that
+	-- ran the crawl: 1 = editable, 0 = not, NULL = unknown (not captured). It
+	-- drives the check-edit-access command.
+	can_edit           INTEGER,
 	crawled_at         TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_nodes_owner_email   ON nodes(owner_email);
@@ -45,6 +49,7 @@ CREATE INDEX IF NOT EXISTS idx_nodes_owner_id      ON nodes(owner_id);
 CREATE INDEX IF NOT EXISTS idx_nodes_parent_id     ON nodes(parent_id);
 CREATE INDEX IF NOT EXISTS idx_nodes_drive_id      ON nodes(drive_id);
 CREATE INDEX IF NOT EXISTS idx_nodes_children_done ON nodes(children_done);
+CREATE INDEX IF NOT EXISTS idx_nodes_can_edit      ON nodes(can_edit);
 
 -- Extra sightings of a node under additional parents (legacy Drive
 -- multi-parenting, or rediscovery through a second crawled folder).
@@ -56,6 +61,23 @@ CREATE TABLE IF NOT EXISTS extra_parents (
 	observed_at     TEXT NOT NULL,
 	PRIMARY KEY (node_drive_id, parent_drive_id)
 );
+
+-- Folder access-control entries captured during the crawl.
+-- Only folder permissions are recorded -- files are excluded.
+CREATE TABLE IF NOT EXISTS folder_permissions (
+	node_drive_id        TEXT NOT NULL,
+	permission_id        TEXT NOT NULL,
+	type                 TEXT NOT NULL, -- user, group, domain, anyone
+	role                 TEXT NOT NULL, -- owner, organizer, fileOrganizer, writer, commenter, reader
+	email_address        TEXT,
+	domain               TEXT,
+	display_name         TEXT,
+	allow_file_discovery INTEGER,       -- only meaningful for domain/anyone grants
+	deleted              INTEGER NOT NULL DEFAULT 0,
+	crawled_at           TEXT NOT NULL,
+	PRIMARY KEY (node_drive_id, permission_id)
+);
+CREATE INDEX IF NOT EXISTS idx_folder_permissions_node ON folder_permissions(node_drive_id);
 `, sqlQuoteList(nodeTypes))
 
 func openDB(path string) (*sql.DB, error) {
@@ -97,6 +119,7 @@ type node struct {
 	ownerDisplay   sql.NullString
 	parentID       sql.NullInt64 // internal row id of the folder we found it under; NULL for the root
 	shortcutTarget sql.NullString
+	canEdit        sql.NullBool // Drive capabilities.canEdit for the crawling account; invalid = unknown
 }
 
 // upsertNode inserts n or refreshes the existing row with the same drive_id.
@@ -123,8 +146,8 @@ func upsertNode(tx *sql.Tx, n node) (rowID int64, existed bool, prevParent sql.N
 
 	err = tx.QueryRow(`
 		INSERT INTO nodes (drive_id, name, type, mime_type, owner_email, owner_id,
-			owner_display_name, parent_id, shortcut_target_id, children_done, crawled_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+			owner_display_name, parent_id, shortcut_target_id, children_done, can_edit, crawled_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
 		ON CONFLICT(drive_id) DO UPDATE SET
 			name               = excluded.name,
 			type               = excluded.type,
@@ -135,10 +158,12 @@ func upsertNode(tx *sql.Tx, n node) (rowID int64, existed bool, prevParent sql.N
 			parent_id          = COALESCE(nodes.parent_id, excluded.parent_id),
 			shortcut_target_id = excluded.shortcut_target_id,
 			children_done      = MAX(nodes.children_done, excluded.children_done),
+			-- Keep a previously observed value if this sighting could not read it.
+			can_edit           = COALESCE(excluded.can_edit, nodes.can_edit),
 			crawled_at         = excluded.crawled_at
 		RETURNING id`,
 		n.driveID, n.name, n.typ, n.mimeType, n.ownerEmail, n.ownerID,
-		n.ownerDisplay, n.parentID, n.shortcutTarget, now(),
+		n.ownerDisplay, n.parentID, n.shortcutTarget, n.canEdit, now(),
 	).Scan(&rowID)
 	return rowID, existed, prevParent, prevDone, err
 }
@@ -191,6 +216,144 @@ func recordExtraParent(tx *sql.Tx, nodeDriveID, parentDriveID string) error {
 		`INSERT OR IGNORE INTO extra_parents (node_drive_id, parent_drive_id, observed_at) VALUES (?, ?, ?)`,
 		nodeDriveID, parentDriveID, now())
 	return err
+}
+
+// permission is one access-control entry on a folder, captured for later
+// recreation on a clone. It mirrors the fields of a drive.Permission we care
+// about.
+type permission struct {
+	permissionID       string
+	typ                string // user, group, domain, anyone
+	role               string // owner, organizer, fileOrganizer, writer, commenter, reader
+	emailAddress       sql.NullString
+	domain             sql.NullString
+	displayName        sql.NullString
+	allowFileDiscovery sql.NullBool
+	deleted            bool
+}
+
+// replacePermissions rewrites the full permission set recorded for a folder.
+// It deletes any existing rows for the folder and inserts the supplied ones, so
+// a re-crawl always leaves an exact snapshot of the folder's current sharing
+// rather than accumulating stale grants.
+func replacePermissions(tx *sql.Tx, nodeDriveID string, perms []permission) error {
+	if _, err := tx.Exec(`DELETE FROM folder_permissions WHERE node_drive_id = ?`, nodeDriveID); err != nil {
+		return err
+	}
+	ts := now()
+	for _, p := range perms {
+		if _, err := tx.Exec(`
+			INSERT INTO folder_permissions (node_drive_id, permission_id, type, role,
+				email_address, domain, display_name, allow_file_discovery, deleted, crawled_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			nodeDriveID, p.permissionID, p.typ, p.role,
+			p.emailAddress, p.domain, p.displayName, p.allowFileDiscovery, p.deleted, ts,
+		); err != nil {
+			return fmt.Errorf("inserting permission %s on %s: %w", p.permissionID, nodeDriveID, err)
+		}
+	}
+	return nil
+}
+
+// accessRow is one node the crawling account cannot edit, reported by
+// check-edit-access with its full path for context.
+type accessRow struct {
+	driveID string
+	name    string
+	typ     string
+	path    string
+	owner   string
+}
+
+// nodesLackingEditAccess returns every node whose recorded can_edit flag is an
+// explicit 0 (the crawling account cannot edit it), ordered folders-first then
+// by path. Nodes with can_edit = NULL (capability never captured, e.g. rows
+// from a crawl that predates this feature) are excluded so the report only
+// flags confirmed gaps. The full path is resolved from the in-memory node tree.
+func nodesLackingEditAccess(db *sql.DB) ([]accessRow, error) {
+	names, parents, err := loadNodeTree(db)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := db.Query(fmt.Sprintf(`
+		SELECT id, drive_id, name, type, owner_email, owner_id, owner_display_name
+		FROM nodes
+		WHERE can_edit = 0
+		ORDER BY (type <> '%s'), name COLLATE NOCASE`, typeFolder))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []accessRow
+	for rows.Next() {
+		var (
+			id int64
+			oc ownerCount
+			r  accessRow
+		)
+		if err := rows.Scan(&id, &r.driveID, &r.name, &r.typ, &oc.email, &oc.ownerID, &oc.displayName); err != nil {
+			return nil, err
+		}
+		r.path = strings.Join(buildPath(id, names, parents), " / ")
+		r.owner = ownerLabel(oc)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// loadNodeTree loads the id -> name and id -> parent_id maps for the whole
+// nodes table, used to resolve paths without a query per node.
+func loadNodeTree(db *sql.DB) (names map[int64]string, parents map[int64]sql.NullInt64, err error) {
+	rows, err := db.Query(`SELECT id, name, parent_id FROM nodes`)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	names = make(map[int64]string)
+	parents = make(map[int64]sql.NullInt64)
+	for rows.Next() {
+		var (
+			id     int64
+			name   string
+			parent sql.NullInt64
+		)
+		if err := rows.Scan(&id, &name, &parent); err != nil {
+			return nil, nil, err
+		}
+		names[id] = name
+		parents[id] = parent
+	}
+	return names, parents, rows.Err()
+}
+
+// buildPath walks parent_id upwards from id, returning the names from the crawl
+// root down to the node. It is cycle-guarded so a corrupt parent chain yields a
+// truncated path instead of looping forever.
+func buildPath(id int64, names map[int64]string, parents map[int64]sql.NullInt64) []string {
+	var segments []string
+	seen := make(map[int64]bool)
+	for cur := id; ; {
+		if seen[cur] {
+			break
+		}
+		seen[cur] = true
+		name, ok := names[cur]
+		if !ok {
+			break
+		}
+		segments = append(segments, name)
+		p := parents[cur]
+		if !p.Valid {
+			break
+		}
+		cur = p.Int64
+	}
+	for i, j := 0, len(segments)-1; i < j; i, j = i+1, j-1 {
+		segments[i], segments[j] = segments[j], segments[i]
+	}
+	return segments
 }
 
 // knownDriveIDs reports which of ids already have a row in nodes.

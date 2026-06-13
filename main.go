@@ -62,14 +62,32 @@ var pathCmd = &cobra.Command{
 	},
 }
 
+var checkEditAccessCmd = &cobra.Command{
+	Use:   "check-edit-access",
+	Short: "List files and folders the crawling account cannot edit",
+	Long: `Print every node whose recorded edit capability (Drive's
+capabilities.canEdit, captured during crawl) is false — i.e. the account that
+ran the crawl lacks edit access. Use this before moving files to confirm you
+can actually move them.
+
+This reads only the database; re-run crawl first if it is stale. Nodes whose
+edit capability could not be determined (can_edit unknown) are not reported.`,
+	Args: cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		dbPath, _ := cmd.Flags().GetString("db")
+		return runCheckEditAccess(dbPath)
+	},
+}
+
 func init() {
 	ownersCmd.Flags().String("db", "drive.db", "path to the SQLite database")
 	ownersCmd.Flags().String("config", "config.json", "path to the config JSON")
 	pathCmd.Flags().String("db", "drive.db", "path to the SQLite database")
+	checkEditAccessCmd.Flags().String("db", "drive.db", "path to the SQLite database")
 	exploreCmd.Flags().String("db", "drive.db", "path to the SQLite database")
 	exploreCmd.Flags().String("out", "out/explore-owned-files", "output directory for the generated HTML")
 
-	rootCmd.AddCommand(crawlCmd, ownersCmd, pathCmd, exploreCmd, restoreCmd)
+	rootCmd.AddCommand(crawlCmd, ownersCmd, pathCmd, checkEditAccessCmd, exploreCmd, restoreCmd)
 }
 
 func runOwners(dbPath, cfgPath string) error {
@@ -148,5 +166,33 @@ func runPath(dbPath, driveID string) error {
 		return err
 	}
 	fmt.Println(strings.Join(segments, " / "))
+	return nil
+}
+
+func runCheckEditAccess(dbPath string) error {
+	db, err := openDB(dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	rows, err := nodesLackingEditAccess(db)
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		fmt.Fprintln(os.Stderr, "No files or folders lacking edit access.")
+		return nil
+	}
+	var folders, files int
+	for _, r := range rows {
+		if r.typ == typeFolder {
+			folders++
+		} else {
+			files++
+		}
+		fmt.Printf("%-8s %s  [owner: %s]\n", r.typ, r.path, r.owner)
+	}
+	fmt.Fprintf(os.Stderr, "\n%d item(s) without edit access: %d folder(s), %d file(s).\n", len(rows), folders, files)
 	return nil
 }
