@@ -85,6 +85,7 @@ func init() {
 	// explore's --out) are registered in each command's own file.
 	rootCmd.PersistentFlags().String("db", "drive.db", "path to the SQLite database")
 	rootCmd.PersistentFlags().String("config", "config.json", "path to the config JSON")
+	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "log every item touched, not just progress summaries and errors")
 
 	rootCmd.AddCommand(crawlCmd, ownersCmd, pathCmd, checkEditAccessCmd, exploreCmd, restoreCmd, stashCmd)
 }

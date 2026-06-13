@@ -140,7 +140,7 @@ func runCrawl(dbPath, cfgPath string, refresh bool) error {
 	}
 	log.Printf("starting crawl: %d folders pending", len(queue))
 
-	var failed int
+	var failed, processed int
 	for len(queue) > 0 {
 		if ctx.Err() != nil {
 			break
@@ -151,10 +151,16 @@ func runCrawl(dbPath, cfgPath string, refresh bool) error {
 			continue
 		}
 		c.visited[f.driveID] = true
-		log.Printf("folder %q (%s): listing children [%d folders queued, %d files so far]",
+		detailf("folder %q (%s): listing children [%d folders queued, %d files so far]",
 			f.name, f.driveID, len(queue), c.fileCount)
 		subs, err := c.listFolder(ctx, f)
 		queue = append(queue, subs...)
+		processed++
+		// Without --verbose the per-folder line above is suppressed; emit a
+		// periodic heartbeat so a long crawl still shows it is making progress.
+		if !verbose && processed%3 == 0 {
+			log.Printf("progress: %d folders listed, %d queued, %d files so far", processed, len(queue), c.fileCount)
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				break

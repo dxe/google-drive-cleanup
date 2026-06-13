@@ -274,7 +274,7 @@ func runStashPush(dbPath, cfgPath, account string) error {
 		if err := ensureMovedShortcut(ctx, svc, limiter, f.driveID, sub.Id); err != nil {
 			log.Printf("WARN folder %q (%s): creating placeholder shortcut: %v", f.name, f.driveID, err)
 		}
-		log.Printf("OK folder %q (%s): %d file(s) -> stash %s", f.name, f.driveID, len(movable), sub.Id)
+		detailf("OK folder %q (%s): %d file(s) -> stash %s", f.name, f.driveID, len(movable), sub.Id)
 		processed++
 	}
 
@@ -391,7 +391,7 @@ func runStashPop(cfgPath string) error {
 			failed++
 			continue
 		}
-		log.Printf("OK stash subfolder %s -> %s: %d file(s) restored, subfolder deleted", sub.Id, origID, len(contents))
+		detailf("OK stash subfolder %s -> %s: %d file(s) restored, subfolder deleted", sub.Id, origID, len(contents))
 		restored++
 	}
 

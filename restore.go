@@ -129,7 +129,7 @@ func runRestoreLocations(dbPath, cfgPath string) error {
 
 			parentDriveID, err := originalParentDriveID(db, file.Id)
 			if err == sql.ErrNoRows {
-				log.Printf("SKIP %s (%s): not found in database", file.Name, file.Id)
+				detailf("SKIP %s (%s): not found in database", file.Name, file.Id)
 				skipped++
 				continue
 			}
@@ -153,7 +153,7 @@ func runRestoreLocations(dbPath, cfgPath string) error {
 				failed++
 				continue
 			}
-			log.Printf("OK %s (%s) -> parent %s", file.Name, file.Id, parentDriveID)
+			detailf("OK %s (%s) -> parent %s", file.Name, file.Id, parentDriveID)
 			if err := updateNodeOwner(db, file.Id, me.EmailAddress, me.PermissionId, me.DisplayName); err != nil {
 				log.Printf("WARN could not update owner in DB for %s (%s): %v", file.Name, file.Id, err)
 			}
