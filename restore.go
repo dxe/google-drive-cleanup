@@ -27,9 +27,9 @@ Owners drag their files into the staging folder (a shared drive) to transfer
 ownership to the org account. Once that transfer is done, run this command to
 move each file back to the folder it lived in before the transfer.
 
-This command requires the full Drive scope. If you previously authenticated
-with drive.readonly (for crawl/owners), delete token.json and re-run to
-re-consent with the broader permissions.`,
+This command requires the full Drive scope. If the cached token.json only has
+read-only access (e.g. from crawl/owners), the tool re-runs consent
+automatically to obtain it.`,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dbPath, _ := cmd.Flags().GetString("db")

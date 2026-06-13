@@ -23,8 +23,9 @@ build on the same database.
 3. **Scopes.** The `crawl`, `owners`, `path`, and `explore-owned-files` commands
    request `https://www.googleapis.com/auth/drive.readonly` only. The
    `restore-locations`, `stash push`, and `stash pop` commands need the full
-   `drive` scope — when switching to one of them, delete `token.json` and
-   re-consent so the new token covers write access.
+   `drive` scope. The scopes a token was granted are recorded in `token.json`,
+   so when you run a command that needs broader access than the cached token
+   has, the tool re-runs consent automatically — no manual `rm token.json`.
 4. **First run auth.** On first run the tool starts a small loopback server on
    port `8765`, prints a consent URL, and waits. Open the URL in a browser,
    authorize, and Google redirects back to the server, which captures the auth

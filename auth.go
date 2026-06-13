@@ -32,10 +32,14 @@ const (
 )
 
 // newDriveService builds an authenticated Drive client for the given scopes.
-// Read-only commands pass drive.DriveReadonlyScope; restore-locations passes
-// drive.DriveScope (full). If you widen the scope, delete token.json and
-// re-run to re-consent — the cached refresh token only covers the scope it was
-// issued for.
+// Read-only commands pass drive.DriveReadonlyScope; the write commands pass
+// drive.DriveScope (full).
+//
+// The scopes a cached token was granted are recorded next to it in token.json.
+// If the cached token does not cover the scopes this command needs (e.g. you
+// ran a read-only command first and now run a write command, or token.json
+// predates scope tracking), consent re-runs automatically and the new token
+// replaces the old one — no manual `rm token.json` required.
 func newDriveService(ctx context.Context, scopes ...string) (*drive.Service, error) {
 	b, err := os.ReadFile(credentialsFile)
 	if err != nil {
@@ -46,35 +50,80 @@ func newDriveService(ctx context.Context, scopes ...string) (*drive.Service, err
 		return nil, fmt.Errorf("parsing %s: %w", credentialsFile, err)
 	}
 
-	tok, err := tokenFromFile(tokenFile)
-	if err != nil {
+	tok, granted, err := tokenFromFile(tokenFile)
+	if err != nil || !scopesCover(granted, scopes) {
+		if err == nil {
+			fmt.Fprintf(os.Stderr,
+				"Cached token does not cover the scope this command needs (have %v, need %v); re-authorizing.\n",
+				granted, scopes)
+		}
 		tok, err = tokenFromWeb(ctx, config)
 		if err != nil {
 			return nil, err
 		}
-		if err := saveToken(tokenFile, tok); err != nil {
+		if err := saveToken(tokenFile, tok, grantedScopes(tok, scopes)); err != nil {
 			return nil, err
 		}
 	}
 	return drive.NewService(ctx, option.WithHTTPClient(config.Client(ctx, tok)))
 }
 
-func tokenFromFile(path string) (*oauth2.Token, error) {
+// storedToken is the on-disk shape of token.json: the OAuth token plus the
+// scopes it was granted, so a later run can tell whether the cached token is
+// broad enough for the command being run. The embedded *oauth2.Token keeps the
+// token's own JSON fields at the top level, so a legacy token.json written
+// before scope tracking still unmarshals cleanly (with an empty Scopes).
+type storedToken struct {
+	*oauth2.Token
+	Scopes []string `json:"scopes,omitempty"`
+}
+
+// scopesCover reports whether the granted scopes are sufficient for every
+// required scope. The full Drive scope implies the read-only scope, so a token
+// granted full access satisfies a read-only command without re-consent.
+func scopesCover(granted, required []string) bool {
+	have := make(map[string]bool, len(granted))
+	for _, s := range granted {
+		have[s] = true
+	}
+	for _, r := range required {
+		if have[r] {
+			continue
+		}
+		if r == drive.DriveReadonlyScope && have[drive.DriveScope] {
+			continue // full Drive access covers read-only operations
+		}
+		return false
+	}
+	return true
+}
+
+// grantedScopes returns the scopes the exchanged token was actually granted.
+// Google echoes them back in the token response's "scope" field (space-
+// separated); when that is absent we fall back to the scopes we requested.
+func grantedScopes(tok *oauth2.Token, requested []string) []string {
+	if s, ok := tok.Extra("scope").(string); ok && strings.TrimSpace(s) != "" {
+		return strings.Fields(s)
+	}
+	return requested
+}
+
+func tokenFromFile(path string) (*oauth2.Token, []string, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	tok := &oauth2.Token{}
-	if err := json.Unmarshal(b, tok); err != nil {
-		return nil, fmt.Errorf("parsing %s: %w", path, err)
+	st := storedToken{Token: &oauth2.Token{}}
+	if err := json.Unmarshal(b, &st); err != nil {
+		return nil, nil, fmt.Errorf("parsing %s: %w", path, err)
 	}
 	// An incomplete token (e.g. a leftover empty file from an aborted consent)
 	// parses fine but is useless — treat it as a cache miss so consent re-runs
 	// instead of silently failing later at API-call time.
-	if tok.AccessToken == "" && tok.RefreshToken == "" {
-		return nil, fmt.Errorf("%s has no access or refresh token", path)
+	if st.AccessToken == "" && st.RefreshToken == "" {
+		return nil, nil, fmt.Errorf("%s has no access or refresh token", path)
 	}
-	return tok, nil
+	return st.Token, st.Scopes, nil
 }
 
 // tokenFromWeb runs the first-time consent flow. It starts a loopback HTTP
@@ -185,8 +234,8 @@ func extractCode(in string) string {
 	return in
 }
 
-func saveToken(path string, tok *oauth2.Token) error {
-	b, err := json.Marshal(tok)
+func saveToken(path string, tok *oauth2.Token, scopes []string) error {
+	b, err := json.Marshal(storedToken{Token: tok, Scopes: scopes})
 	if err != nil {
 		return err
 	}

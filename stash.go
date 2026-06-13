@@ -59,8 +59,8 @@ Because the stash folder is inside the crawl root, the user's own parked files
 still appear in their "owner:me" Drive search, so the user moves them to staging
 along with their (now-empty) folders like any other loose file.
 
-This command requires the full Drive scope. If you previously authenticated with
-drive.readonly, delete token.json and re-run to re-consent.`,
+This command requires the full Drive scope. If the cached token.json only has
+read-only access, the tool re-runs consent automatically to obtain it.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dbPath, _ := cmd.Flags().GetString("db")
