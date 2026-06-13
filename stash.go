@@ -65,7 +65,8 @@ read-only access, the tool re-runs consent automatically to obtain it.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dbPath, _ := cmd.Flags().GetString("db")
 		cfgPath, _ := cmd.Flags().GetString("config")
-		return runStashPush(dbPath, cfgPath, args[0])
+		dryRun, _ := cmd.Flags().GetBool("dry-run")
+		return runStashPush(dbPath, cfgPath, args[0], dryRun)
 	},
 }
 
@@ -89,11 +90,14 @@ This command requires the full Drive scope.`,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cfgPath, _ := cmd.Flags().GetString("config")
-		return runStashPop(cfgPath)
+		dryRun, _ := cmd.Flags().GetBool("dry-run")
+		return runStashPop(cfgPath, dryRun)
 	},
 }
 
 func init() {
+	stashPushCmd.Flags().Bool("dry-run", false, "report what would move without changing anything (read-only scope)")
+	stashPopCmd.Flags().Bool("dry-run", false, "report what would move without changing anything (read-only scope)")
 	stashCmd.AddCommand(stashPushCmd, stashPopCmd)
 }
 
@@ -119,7 +123,7 @@ func promptYesNo(prompt string) bool {
 	return strings.ToLower(strings.TrimSpace(scanner.Text())) == "y"
 }
 
-func runStashPush(dbPath, cfgPath, account string) error {
+func runStashPush(dbPath, cfgPath, account string, dryRun bool) error {
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
 		return err
@@ -163,7 +167,7 @@ func runStashPush(dbPath, cfgPath, account string) error {
 		fmt.Fprintf(os.Stderr, "WARNING: %d crawled item(s) are not editable by the crawling account: %d folder(s), %d file(s).\n",
 			len(uneditable), folderCount, fileCount)
 		fmt.Fprintln(os.Stderr, "Moving those items will fail. Run check-edit-access for the full list.")
-		if !promptYesNo("Continue with stash push anyway? [y/N] ") {
+		if !dryRun && !promptYesNo("Continue with stash push anyway? [y/N] ") {
 			fmt.Fprintln(os.Stderr, "Aborted.")
 			return nil
 		}
@@ -172,7 +176,13 @@ func runStashPush(dbPath, cfgPath, account string) error {
 	ctx, cancel := cancelOnSignal()
 	defer cancel()
 
-	svc, err := newDriveService(ctx, drive.DriveScope)
+	// A dry run only reads, so request the narrower scope — previewing never
+	// forces a write-scope re-consent.
+	scope := drive.DriveScope
+	if dryRun {
+		scope = drive.DriveReadonlyScope
+	}
+	svc, err := newDriveService(ctx, scope)
 	if err != nil {
 		return err
 	}
@@ -193,11 +203,15 @@ func runStashPush(dbPath, cfgPath, account string) error {
 		return err
 	}
 
-	fmt.Fprintf(os.Stderr, "About to stash the contents of %d folder(s) owned by %q into %q.\n", len(folders), account, stash.Name)
-	fmt.Fprintf(os.Stderr, "Stash subfolders and shortcuts will be created by: %s.\n", me.EmailAddress)
-	if !promptYesNo("Continue? [y/N] ") {
-		fmt.Fprintln(os.Stderr, "Aborted.")
-		return nil
+	if dryRun {
+		fmt.Fprintf(os.Stderr, "DRY RUN: no changes will be made. Would stash the contents of %d folder(s) owned by %q into %q.\n", len(folders), account, stash.Name)
+	} else {
+		fmt.Fprintf(os.Stderr, "About to stash the contents of %d folder(s) owned by %q into %q.\n", len(folders), account, stash.Name)
+		fmt.Fprintf(os.Stderr, "Stash subfolders and shortcuts will be created by: %s.\n", me.EmailAddress)
+		if !promptYesNo("Continue? [y/N] ") {
+			fmt.Fprintln(os.Stderr, "Aborted.")
+			return nil
+		}
 	}
 
 	limiter := rate.NewLimiter(rate.Limit(3), 3)
@@ -243,6 +257,19 @@ func runStashPush(dbPath, cfgPath, account string) error {
 			continue
 		}
 
+		if dryRun {
+			if sub == nil {
+				log.Printf("WOULD create stash subfolder named %s under %q and recreate the folder's sharing on it", f.driveID, stash.Name)
+			}
+			for _, c := range movable {
+				log.Printf("WOULD move %s (%s) into the stash subfolder for %s", c.Name, c.Id, f.driveID)
+			}
+			log.Printf("WOULD leave a %q shortcut in folder %q (%s)", stashShortcutName, f.name, f.driveID)
+			filesMoved += len(movable)
+			processed++
+			continue
+		}
+
 		if sub == nil {
 			sub, err = createFolder(ctx, svc, limiter, stash.ID, f.driveID)
 			if err != nil {
@@ -278,14 +305,18 @@ func runStashPush(dbPath, cfgPath, account string) error {
 		processed++
 	}
 
-	log.Printf("done: %d folder(s) processed, %d file(s) moved, %d failed", processed, filesMoved, failed)
+	verb := "moved"
+	if dryRun {
+		verb = "would move"
+	}
+	log.Printf("done: %d folder(s) processed, %d file(s) %s, %d failed", processed, filesMoved, verb, failed)
 	if failed > 0 {
 		return fmt.Errorf("%d item(s) failed; re-run stash push to retry", failed)
 	}
 	return nil
 }
 
-func runStashPop(cfgPath string) error {
+func runStashPop(cfgPath string, dryRun bool) error {
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
 		return err
@@ -298,7 +329,13 @@ func runStashPop(cfgPath string) error {
 	ctx, cancel := cancelOnSignal()
 	defer cancel()
 
-	svc, err := newDriveService(ctx, drive.DriveScope)
+	// A dry run only reads, so request the narrower scope — previewing never
+	// forces a write-scope re-consent.
+	scope := drive.DriveScope
+	if dryRun {
+		scope = drive.DriveReadonlyScope
+	}
+	svc, err := newDriveService(ctx, scope)
 	if err != nil {
 		return err
 	}
@@ -335,10 +372,14 @@ func runStashPop(cfgPath string) error {
 		return nil
 	}
 
-	fmt.Fprintf(os.Stderr, "About to move the contents of %d stash subfolder(s) back to their original folders and delete the subfolders.\n", len(stashSubs))
-	if !promptYesNo("Continue? [y/N] ") {
-		fmt.Fprintln(os.Stderr, "Aborted.")
-		return nil
+	if dryRun {
+		fmt.Fprintf(os.Stderr, "DRY RUN: no changes will be made. Would move the contents of %d stash subfolder(s) back to their original folders and delete the subfolders.\n", len(stashSubs))
+	} else {
+		fmt.Fprintf(os.Stderr, "About to move the contents of %d stash subfolder(s) back to their original folders and delete the subfolders.\n", len(stashSubs))
+		if !promptYesNo("Continue? [y/N] ") {
+			fmt.Fprintln(os.Stderr, "Aborted.")
+			return nil
+		}
 	}
 
 	var restored, filesMoved, failed int
@@ -355,6 +396,17 @@ func runStashPop(cfgPath string) error {
 			failed++
 			continue
 		}
+
+		if dryRun {
+			for _, c := range contents {
+				log.Printf("WOULD move %s (%s) back to %s", c.Name, c.Id, origID)
+			}
+			log.Printf("WOULD remove the %q shortcut from %s and delete the empty stash subfolder %s", stashShortcutName, origID, sub.Id)
+			filesMoved += len(contents)
+			restored++
+			continue
+		}
+
 		var moveFailed bool
 		for _, c := range contents {
 			if err := ctx.Err(); err != nil {
@@ -395,7 +447,11 @@ func runStashPop(cfgPath string) error {
 		restored++
 	}
 
-	log.Printf("done: %d subfolder(s) restored, %d file(s) moved, %d failed", restored, filesMoved, failed)
+	verb := "moved"
+	if dryRun {
+		verb = "would move"
+	}
+	log.Printf("done: %d subfolder(s) restored, %d file(s) %s, %d failed", restored, filesMoved, verb, failed)
 	if failed > 0 {
 		return fmt.Errorf("%d item(s) failed; re-run stash pop to retry", failed)
 	}

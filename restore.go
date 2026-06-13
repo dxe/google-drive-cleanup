@@ -34,11 +34,16 @@ automatically to obtain it.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dbPath, _ := cmd.Flags().GetString("db")
 		cfgPath, _ := cmd.Flags().GetString("config")
-		return runRestoreLocations(dbPath, cfgPath)
+		dryRun, _ := cmd.Flags().GetBool("dry-run")
+		return runRestoreLocations(dbPath, cfgPath, dryRun)
 	},
 }
 
-func runRestoreLocations(dbPath, cfgPath string) error {
+func init() {
+	restoreCmd.Flags().Bool("dry-run", false, "report what would move without changing anything (read-only scope)")
+}
+
+func runRestoreLocations(dbPath, cfgPath string, dryRun bool) error {
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
 		return err
@@ -58,7 +63,13 @@ func runRestoreLocations(dbPath, cfgPath string) error {
 		cancel()
 	}()
 
-	svc, err := newDriveService(ctx, drive.DriveScope)
+	// A dry run only reads, so request the narrower scope — previewing never
+	// forces a write-scope re-consent.
+	scope := drive.DriveScope
+	if dryRun {
+		scope = drive.DriveReadonlyScope
+	}
+	svc, err := newDriveService(ctx, scope)
 	if err != nil {
 		return err
 	}
@@ -69,12 +80,16 @@ func runRestoreLocations(dbPath, cfgPath string) error {
 	}
 	me := about.User
 
-	fmt.Fprintf(os.Stderr, "Restored files will be owned by: %s. Continue? [y/N] ", me.EmailAddress)
-	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Scan()
-	if strings.ToLower(strings.TrimSpace(scanner.Text())) != "y" {
-		fmt.Fprintln(os.Stderr, "Aborted.")
-		return nil
+	if dryRun {
+		fmt.Fprintf(os.Stderr, "DRY RUN: no files will be moved. Restored files would be owned by: %s.\n", me.EmailAddress)
+	} else {
+		fmt.Fprintf(os.Stderr, "Restored files will be owned by: %s. Continue? [y/N] ", me.EmailAddress)
+		scanner := bufio.NewScanner(os.Stdin)
+		scanner.Scan()
+		if strings.ToLower(strings.TrimSpace(scanner.Text())) != "y" {
+			fmt.Fprintln(os.Stderr, "Aborted.")
+			return nil
+		}
 	}
 
 	// Verify the staging folder name matches config, guarding against a stale id.
@@ -139,6 +154,12 @@ func runRestoreLocations(dbPath, cfgPath string) error {
 				continue
 			}
 
+			if dryRun {
+				log.Printf("WOULD move %s (%s) -> parent %s", file.Name, file.Id, parentDriveID)
+				moved++
+				continue
+			}
+
 			if err := limiter.Wait(ctx); err != nil {
 				return err
 			}
@@ -166,7 +187,11 @@ func runRestoreLocations(dbPath, cfgPath string) error {
 		}
 	}
 
-	log.Printf("done: %d moved, %d skipped (not in DB), %d failed", moved, skipped, failed)
+	verb := "moved"
+	if dryRun {
+		verb = "would move"
+	}
+	log.Printf("done: %d %s, %d skipped (not in DB), %d failed", moved, verb, skipped, failed)
 	if failed > 0 {
 		return fmt.Errorf("%d file(s) failed to move", failed)
 	}

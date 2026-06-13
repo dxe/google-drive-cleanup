@@ -110,6 +110,13 @@ drive-cleanup stash push someone@gmail.com
 drive-cleanup stash pop
 ```
 
+The three commands that move files — `restore-locations`, `stash push`, and
+`stash pop` — accept `--dry-run`, which reports every `WOULD move/create/delete`
+action without changing anything. A dry run authenticates with the read-only
+scope (so it never triggers a write-scope consent) and skips the confirmation
+prompt. Run one first to preview a migration step. Pass `--verbose`/`-v` to any
+command to log every item it touches instead of just progress and errors.
+
 `explore-owned-files` produces a single offline HTML file: an interactive,
 collapsible tree of every file and folder the account owns plus their ancestor
 folders, per-folder counts of owned descendants, Drive links, and keyboard
