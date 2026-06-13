@@ -219,7 +219,7 @@ that it is **not in a shared drive**.
 
 **Why the stash lives inside the crawl root.** The user's *own* files get parked
 in the stash too. Because the stash folder is under the crawl root, those files
-still surface when the user searches their Drive for `in:<crawl-root-id>
+still surface when the user searches their Drive for `parent:<crawl-root-id>
 owner:me`, so the user drags them into the staging folder along with their
 (now-empty) folders, exactly like any other loose file they own —
 `restore-locations` then returns them to their original parents. Files owned by
@@ -245,7 +245,7 @@ Run these in order for each user being migrated:
    folders in the stash.
 3. **User moves files and (empty) folders they own to the staging folder** —
    manually, in the Drive web/desktop app. This includes their own files now
-   sitting in the stash, which they find via the `in:<crawl-root-id> owner:me`
+   sitting in the stash, which they find via the `parent:<crawl-root-id> owner:me`
    search. The drag flips ownership of those items to the org.
 4. **`drive-cleanup restore-locations`** — move everything just dragged into the
    staging folder back to its original parent in the regular tree.
