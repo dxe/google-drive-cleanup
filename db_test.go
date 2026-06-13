@@ -230,21 +230,18 @@ func TestReplacePermissionsSnapshots(t *testing.T) {
 func TestNodesLackingEditAccess(t *testing.T) {
 	db := testDB(t)
 	rootID, _, _, _ := mustUpsert(t, db, node{driveID: "root", name: "Root", typ: typeFolder, mimeType: folderMimeType,
-		canEdit: sql.NullBool{Bool: true, Valid: true}})
+		canEdit: true})
 	parent := sql.NullInt64{Int64: rootID, Valid: true}
 
 	// Editable file — excluded.
 	mustUpsert(t, db, node{driveID: "ok", name: "ok.pdf", typ: typeBinary, mimeType: "application/pdf",
-		parentID: parent, canEdit: sql.NullBool{Bool: true, Valid: true}})
-	// Unknown capability (e.g. legacy crawl) — excluded.
-	mustUpsert(t, db, node{driveID: "unknown", name: "unknown.pdf", typ: typeBinary, mimeType: "application/pdf",
-		parentID: parent})
+		parentID: parent, canEdit: true})
 	// Not editable — reported, with owner label and full path.
 	mustUpsert(t, db, node{driveID: "locked", name: "locked.pdf", typ: typeBinary, mimeType: "application/pdf",
-		parentID: parent, ownerEmail: nullString("ext@other.com"), canEdit: sql.NullBool{Bool: false, Valid: true}})
+		parentID: parent, ownerEmail: nullString("ext@other.com"), canEdit: false})
 	// Not editable folder — reported, and sorts before the file.
 	mustUpsert(t, db, node{driveID: "lockedfolder", name: "Shared", typ: typeFolder, mimeType: folderMimeType,
-		parentID: parent, canEdit: sql.NullBool{Bool: false, Valid: true}})
+		parentID: parent, canEdit: false})
 
 	rows, err := nodesLackingEditAccess(db)
 	if err != nil {

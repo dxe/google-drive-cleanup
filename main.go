@@ -70,8 +70,7 @@ capabilities.canEdit, captured during crawl) is false — i.e. the account that
 ran the crawl lacks edit access. Use this before moving files to confirm you
 can actually move them.
 
-This reads only the database; re-run crawl first if it is stale. Nodes whose
-edit capability could not be determined (can_edit unknown) are not reported.`,
+This reads only the database; re-run crawl first if it is stale.`,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dbPath, _ := cmd.Flags().GetString("db")

@@ -28,7 +28,7 @@ const (
 	// clone's sharing can be recreated later. Reused by the root fetch and list.
 	permissionFields = "permissions(id, type, role, emailAddress, domain, displayName, allowFileDiscovery, deleted)"
 
-	listFields = "nextPageToken, files(id, name, mimeType, owners(emailAddress, displayName, permissionId), parents, shortcutDetails(targetId), capabilities(canEdit), " + permissionFields + ")"
+	listFields = "nextPageToken, files(id, name, mimeType, owners(emailAddress, displayName, permissionId), parents, shortcutDetails(targetId), capabilities(canEdit, canListChildren), " + permissionFields + ")"
 )
 
 // Node types stored in the nodes.type column. These are the only valid values
@@ -190,7 +190,7 @@ func (c *crawler) validateAndInsertRoot(ctx context.Context, cfg rootConfig) err
 	err := c.withRetry(ctx, "files.get "+cfg.ID, func() error {
 		var err error
 		f, err = c.srv.Files.Get(cfg.ID).
-			Fields("id, name, mimeType, owners(emailAddress, displayName, permissionId), capabilities(canEdit), " + permissionFields).
+			Fields("id, name, mimeType, owners(emailAddress, displayName, permissionId), capabilities(canEdit, canListChildren), " + permissionFields).
 			SupportsAllDrives(true).
 			Context(ctx).Do()
 		return err
@@ -370,14 +370,20 @@ func ownerOf(f *drive.File) (email, ownerID, display sql.NullString) {
 	return nullString(o.EmailAddress), nullString(o.PermissionId), nullString(o.DisplayName)
 }
 
-// canEditOf reports the crawling account's canEdit capability on f. When the
-// capabilities object is absent (e.g. the API omitted it) it returns an invalid
-// NullBool so the upsert records "unknown" rather than a misleading false.
-func canEditOf(f *drive.File) sql.NullBool {
+// canEditOf reports whether the crawling account can edit f. When the
+// capabilities object is absent the account has no usable access, so this
+// returns false. Edit access on a folder implies the ability to list its
+// children, so an editable folder whose children cannot be listed is an
+// impossible state we refuse to record and panic on instead.
+func canEditOf(f *drive.File) bool {
 	if f.Capabilities == nil {
-		return sql.NullBool{}
+		return false
 	}
-	return sql.NullBool{Bool: f.Capabilities.CanEdit, Valid: true}
+	canEdit := f.Capabilities.CanEdit
+	if canEdit && f.MimeType == folderMimeType && !f.Capabilities.CanListChildren {
+		panic(fmt.Sprintf("folder %q (%s) is editable but its children cannot be listed", f.Name, f.Id))
+	}
+	return canEdit
 }
 
 // permissionsOf maps the drive.Permission entries on f to our permission model.

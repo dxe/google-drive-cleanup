@@ -38,10 +38,9 @@ CREATE TABLE IF NOT EXISTS nodes (
 	parent_id          INTEGER REFERENCES nodes(id),
 	shortcut_target_id TEXT,
 	children_done      INTEGER NOT NULL DEFAULT 0,
-	-- can_edit mirrors the Drive capabilities.canEdit flag for the account that
-	-- ran the crawl: 1 = editable, 0 = not, NULL = unknown (not captured). It
-	-- drives the check-edit-access command.
-	can_edit           INTEGER,
+	-- can_edit records whether the account that ran the crawl can edit the node:
+	-- 1 = editable, 0 = not. It drives the check-edit-access command.
+	can_edit           INTEGER NOT NULL,
 	crawled_at         TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_nodes_owner_email   ON nodes(owner_email);
@@ -119,7 +118,7 @@ type node struct {
 	ownerDisplay   sql.NullString
 	parentID       sql.NullInt64 // internal row id of the folder we found it under; NULL for the root
 	shortcutTarget sql.NullString
-	canEdit        sql.NullBool // Drive capabilities.canEdit for the crawling account; invalid = unknown
+	canEdit        bool // whether the crawling account can edit the node
 }
 
 // upsertNode inserts n or refreshes the existing row with the same drive_id.
@@ -158,8 +157,7 @@ func upsertNode(tx *sql.Tx, n node) (rowID int64, existed bool, prevParent sql.N
 			parent_id          = COALESCE(nodes.parent_id, excluded.parent_id),
 			shortcut_target_id = excluded.shortcut_target_id,
 			children_done      = MAX(nodes.children_done, excluded.children_done),
-			-- Keep a previously observed value if this sighting could not read it.
-			can_edit           = COALESCE(excluded.can_edit, nodes.can_edit),
+			can_edit           = excluded.can_edit,
 			crawled_at         = excluded.crawled_at
 		RETURNING id`,
 		n.driveID, n.name, n.typ, n.mimeType, n.ownerEmail, n.ownerID,
@@ -265,11 +263,9 @@ type accessRow struct {
 	owner   string
 }
 
-// nodesLackingEditAccess returns every node whose recorded can_edit flag is an
-// explicit 0 (the crawling account cannot edit it), ordered folders-first then
-// by path. Nodes with can_edit = NULL (capability never captured, e.g. rows
-// from a crawl that predates this feature) are excluded so the report only
-// flags confirmed gaps. The full path is resolved from the in-memory node tree.
+// nodesLackingEditAccess returns every node whose recorded can_edit flag is 0
+// (the crawling account cannot edit it), ordered folders-first then by path.
+// The full path is resolved from the in-memory node tree.
 func nodesLackingEditAccess(db *sql.DB) ([]accessRow, error) {
 	names, parents, err := loadNodeTree(db)
 	if err != nil {
