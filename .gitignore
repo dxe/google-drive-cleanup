@@ -34,6 +34,9 @@ token.json
 # Runtime config
 config.json
 
+# Compiled binary
+/google-drive-cleanup
+
 # Crawl databases
 *.db
 *.db-wal
