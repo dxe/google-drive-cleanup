@@ -378,6 +378,59 @@ func knownDriveIDs(tx *sql.Tx, ids []string) (map[string]bool, error) {
 	return known, rows.Err()
 }
 
+// foldersOwnedBy returns every folder owned by account (matched against
+// owner_email OR owner_id), ordered by row id.
+func foldersOwnedBy(db *sql.DB, account string) ([]folderRef, error) {
+	rows, err := db.Query(fmt.Sprintf(
+		`SELECT id, drive_id, name FROM nodes
+		 WHERE type = '%s' AND (owner_email = ? OR owner_id = ?)
+		 ORDER BY id`, typeFolder), account, account)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var refs []folderRef
+	for rows.Next() {
+		var f folderRef
+		if err := rows.Scan(&f.rowID, &f.driveID, &f.name); err != nil {
+			return nil, err
+		}
+		refs = append(refs, f)
+	}
+	return refs, rows.Err()
+}
+
+// folderPermissionsFor returns the crawled permission set for the folder with
+// the given Drive ID.
+func folderPermissionsFor(db *sql.DB, folderDriveID string) ([]permission, error) {
+	rows, err := db.Query(`
+		SELECT permission_id, type, role, email_address, domain, display_name,
+			allow_file_discovery, deleted
+		FROM folder_permissions WHERE node_drive_id = ?`, folderDriveID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var perms []permission
+	for rows.Next() {
+		var (
+			p          permission
+			afd        sql.NullInt64
+			deletedInt int
+		)
+		if err := rows.Scan(&p.permissionID, &p.typ, &p.role, &p.emailAddress,
+			&p.domain, &p.displayName, &afd, &deletedInt); err != nil {
+			return nil, err
+		}
+		if afd.Valid {
+			p.allowFileDiscovery = sql.NullBool{Bool: afd.Int64 != 0, Valid: true}
+		}
+		p.deleted = deletedInt != 0
+		perms = append(perms, p)
+	}
+	return perms, rows.Err()
+}
+
 type ownerCount struct {
 	email       sql.NullString
 	ownerID     sql.NullString

@@ -13,9 +13,10 @@ type config struct {
 	// InternalDomains lists the org's own email domains (no leading "@"), e.g.
 	// "example.com". Commands can use these to distinguish internal from
 	// external owners.
-	InternalDomains  []string              `json:"internal-domains"`
-	Owners           ownersConfig          `json:"owners"`
+	InternalDomains  []string               `json:"internal-domains"`
+	Owners           ownersConfig           `json:"owners"`
 	RestoreLocations restoreLocationsConfig `json:"restore-locations"`
+	Stash            stashConfig            `json:"stash"`
 }
 
 type crawlConfig struct {
@@ -34,6 +35,17 @@ type ownersConfig struct {
 type rootConfig struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
+}
+
+// stashConfig holds settings for the stash push/pop commands.
+type stashConfig struct {
+	// Folder is the My-Drive parking area that stash push moves folder contents
+	// into and stash pop drains. It MUST be a regular My-Drive folder inside the
+	// crawl root, never a shared drive: the files parked here are owned by third
+	// parties, which cannot be moved to a shared drive. Keeping it under the crawl root
+	// also means a user's own parked files still surface in their
+	// "owner:me" Drive search so they get migrated like any other loose file.
+	Folder rootConfig `json:"folder"`
 }
 
 // restoreLocationsConfig holds settings for the restore-locations command.

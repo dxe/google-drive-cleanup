@@ -22,8 +22,9 @@ build on the same database.
    first; add your account as a test user if the app is in testing mode.)
 3. **Scopes.** The `crawl`, `owners`, `path`, and `explore-owned-files` commands
    request `https://www.googleapis.com/auth/drive.readonly` only. The
-   `restore-locations` command needs the full `drive` scope — when switching to
-   it, delete `token.json` and re-consent so the new token covers write access.
+   `restore-locations`, `stash push`, and `stash pop` commands need the full
+   `drive` scope — when switching to one of them, delete `token.json` and
+   re-consent so the new token covers write access.
 4. **First run auth.** On first run the tool starts a small loopback server on
    port `8765`, prints a consent URL, and waits. Open the URL in a browser,
    authorize, and Google redirects back to the server, which captures the auth
@@ -54,6 +55,12 @@ can add settings without colliding:
 {
   "crawl": {
     "root": { "id": "0ABCdef...", "name": "DxE General" }
+  },
+  "restore-locations": {
+    "staging-folder": { "id": "1AbCdEfGh...", "name": "Staging" }
+  },
+  "stash": {
+    "folder": { "id": "1StAsHfOlDeR...", "name": "Stash" }
   }
 }
 ```
@@ -92,6 +99,14 @@ drive-cleanup explore-owned-files someone@gmail.com
 
 # Move files from the staging folder back to their original locations
 drive-cleanup restore-locations
+
+# Park the contents of every folder a user owns into the stash folder
+# (run before the user drags their folders into the staging folder)
+drive-cleanup stash push someone@gmail.com
+
+# Move stashed files back into their original folders and clean up
+# (run after restore-locations)
+drive-cleanup stash pop
 ```
 
 `explore-owned-files` produces a single offline HTML file: an interactive,
@@ -121,6 +136,80 @@ and failed items. Configure the staging folder in `config.json`:
   }
 }
 ```
+
+## Stashing folder contents (`stash push` / `stash pop`)
+
+Loose files round-trip through the staging shared drive cleanly: the owner drags
+the file in (ownership flips to the org), then `restore-locations` moves it back.
+**Folders** are the hard case. A folder a user owns usually contains files owned
+by *other* accounts, and a shared drive cannot hold items the dragging user does
+not own — so when the user drags the folder in, Drive blocks the move or orphans
+those files.
+
+`stash push <user>` clears the way. For every folder owned by `<user>` in the
+database, it:
+
+1. creates a subfolder of the configured **stash folder**, named after the
+   original folder's Drive ID;
+2. recreates the original folder's sharing on that subfolder so everyone keeps
+   the access they had;
+3. moves **all** of the original folder's files into the subfolder; and
+4. leaves a shortcut named **"Contents temporarily moved"** in the now-empty
+   original folder, pointing at the stash subfolder.
+
+The emptied folder can then transit the staging shared drive. `stash pop` (no
+argument — it drains the whole stash) reverses step 3 for every subfolder,
+moving each subfolder's files back into the original folder whose ID names it,
+then removes the shortcut and deletes the empty subfolder.
+
+Before moving anything, `stash push` runs the same scan as `check-edit-access`
+and, if any crawled item is not editable by the running account, prints the
+count and asks you to confirm (those items would fail to move). It also verifies
+the stash folder's name matches config, that it is **inside the crawl root**, and
+that it is **not in a shared drive**.
+
+> **The stash folder must be a regular My-Drive folder, never a shared drive.**
+> The files it parks are owned by third parties, which a shared drive cannot
+> hold — that is the whole reason the stash exists.
+
+**Why the stash lives inside the crawl root.** The user's *own* files get parked
+in the stash too. Because the stash folder is under the crawl root, those files
+still surface when the user searches their Drive for `in:<crawl-root-id>
+owner:me`, so the user drags them into the staging folder along with their
+(now-empty) folders, exactly like any other loose file they own —
+`restore-locations` then returns them to their original parents. Files owned by
+other third parties stay in the stash until `stash pop` puts them back (they are
+migrated later, on that owner's own pass). Configure the stash folder in
+`config.json`:
+
+```json
+{
+  "stash": {
+    "folder": { "id": "1StAsHfOlDeR...", "name": "Stash" }
+  }
+}
+```
+
+### Order of operations (per user)
+
+Run these in order for each user being migrated:
+
+1. **`drive-cleanup check-edit-access`** — confirm the running account can edit
+   everything that will move.
+2. **`drive-cleanup stash push <user>`** — park the contents of the user's
+   folders in the stash.
+3. **User moves files and (empty) folders they own to the staging folder** —
+   manually, in the Drive web/desktop app. This includes their own files now
+   sitting in the stash, which they find via the `in:<crawl-root-id> owner:me`
+   search. The drag flips ownership of those items to the org.
+4. **`drive-cleanup restore-locations`** — move everything just dragged into the
+   staging folder back to its original parent in the regular tree.
+5. **`drive-cleanup stash pop`** — refill the folders with the remaining stashed
+   (third-party-owned) files and clean up the stash subfolders and shortcuts.
+
+`stash pop` must run **after** `restore-locations`: the folders have to be back
+out of the shared drive and in the regular tree before externally-owned files
+can be returned to them.
 
 The CLI is built with [Cobra](https://github.com/spf13/cobra): run
 `drive-cleanup help` (or `drive-cleanup <command> --help`) for full usage, and

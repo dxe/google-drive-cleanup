@@ -261,6 +261,72 @@ func TestNodesLackingEditAccess(t *testing.T) {
 	}
 }
 
+func TestFoldersOwnedBy(t *testing.T) {
+	db := testDB(t)
+	rootID, _, _, _ := mustUpsert(t, db, node{driveID: "root", name: "Root", typ: typeFolder, mimeType: folderMimeType})
+	parent := sql.NullInt64{Int64: rootID, Valid: true}
+
+	// Two folders owned by the target (one by email, one by id), a folder owned
+	// by someone else, and a file owned by the target — none of the latter two
+	// should be returned.
+	mustUpsert(t, db, node{driveID: "fa", name: "A", typ: typeFolder, mimeType: folderMimeType,
+		parentID: parent, ownerEmail: nullString("u@gmail.com")})
+	mustUpsert(t, db, node{driveID: "fb", name: "B", typ: typeFolder, mimeType: folderMimeType,
+		parentID: parent, ownerID: nullString("u@gmail.com")})
+	mustUpsert(t, db, node{driveID: "fc", name: "C", typ: typeFolder, mimeType: folderMimeType,
+		parentID: parent, ownerEmail: nullString("other@gmail.com")})
+	mustUpsert(t, db, node{driveID: "file", name: "f.pdf", typ: typeBinary, mimeType: "application/pdf",
+		parentID: parent, ownerEmail: nullString("u@gmail.com")})
+
+	folders, err := foldersOwnedBy(db, "u@gmail.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, f := range folders {
+		got = append(got, f.driveID)
+	}
+	if strings.Join(got, ",") != "fa,fb" {
+		t.Errorf("foldersOwnedBy = %v, want [fa fb]", got)
+	}
+}
+
+func TestFolderPermissionsFor(t *testing.T) {
+	db := testDB(t)
+	mustUpsert(t, db, node{driveID: "folder", name: "Folder", typ: typeFolder, mimeType: folderMimeType})
+
+	tx, _ := db.Begin()
+	if err := replacePermissions(tx, "folder", []permission{
+		{permissionID: "p1", typ: "user", role: "writer", emailAddress: nullString("a@example.com")},
+		{permissionID: "p2", typ: "anyone", role: "reader", allowFileDiscovery: sql.NullBool{Bool: false, Valid: true}},
+		{permissionID: "p3", typ: "user", role: "owner", emailAddress: nullString("owner@gmail.com"), deleted: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tx.Commit()
+
+	perms, err := folderPermissionsFor(db, "folder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(perms) != 3 {
+		t.Fatalf("got %d permissions, want 3", len(perms))
+	}
+	byID := map[string]permission{}
+	for _, p := range perms {
+		byID[p.permissionID] = p
+	}
+	if p := byID["p1"]; p.typ != "user" || p.role != "writer" || p.emailAddress.String != "a@example.com" {
+		t.Errorf("p1 = %+v", p)
+	}
+	if p := byID["p2"]; !p.allowFileDiscovery.Valid || p.allowFileDiscovery.Bool {
+		t.Errorf("p2 allowFileDiscovery = %+v, want valid false", p.allowFileDiscovery)
+	}
+	if p := byID["p3"]; !p.deleted {
+		t.Errorf("p3 deleted = %v, want true", p.deleted)
+	}
+}
+
 func TestNodePath(t *testing.T) {
 	db := testDB(t)
 	rootID, _, _, _ := mustUpsert(t, db, node{driveID: "root", name: "DxE General", typ: typeFolder, mimeType: folderMimeType})
