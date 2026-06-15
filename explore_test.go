@@ -171,6 +171,35 @@ func TestRunExploreOwnedFiles(t *testing.T) {
 	}
 }
 
+func TestRunExploreOwnedFilesAllOwners(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "drive.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buildExploreTree(t, db)
+	db.Close() // runExploreOwnedFiles reopens by path
+
+	outDir := filepath.Join(t.TempDir(), "out")
+	// Empty account => one file per owner (alice and bob own things here).
+	if err := runExploreOwnedFiles(dbPath, "", outDir); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, owner := range []string{"alice@example.com", "bob@example.com"} {
+		if _, err := os.Stat(filepath.Join(outDir, owner+".html")); err != nil {
+			t.Errorf("expected an HTML file for %s: %v", owner, err)
+		}
+	}
+	entries, err := os.ReadDir(outDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Errorf("wrote %d files, want 2 (alice, bob)", len(entries))
+	}
+}
+
 func TestSanitizeFilename(t *testing.T) {
 	cases := map[string]string{
 		"alice@example.com": "alice@example.com",

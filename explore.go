@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"fmt"
 	"html/template"
 	"os"
@@ -11,19 +12,26 @@ import (
 )
 
 var exploreCmd = &cobra.Command{
-	Use:   "explore-owned-files <account>",
+	Use:   "explore-owned-files [account]",
 	Short: "Write a self-contained, interactive HTML tree of everything an account owns",
 	Long: `Write a single self-contained HTML file showing every file and folder
 owned by <account> (a Google email or owner id) in the context of the folder
 hierarchy that holds them. Ancestor folders are included so each owned item has
 a path; folders owned by the account are bold and every folder shows a count of
 the owned items beneath it. The tree is collapsible (collapsed by default) and
-keyboard-navigable. All CSS/JS is inlined so the file can be emailed as-is.`,
-	Args: cobra.ExactArgs(1),
+keyboard-navigable. All CSS/JS is inlined so the file can be emailed as-is.
+
+With no account argument, one HTML file is written per owner found in the
+database (skipping owners with neither an email nor an owner id).`,
+	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dbPath, _ := cmd.Flags().GetString("db")
 		outDir, _ := cmd.Flags().GetString("out")
-		return runExploreOwnedFiles(dbPath, args[0], outDir)
+		var account string
+		if len(args) == 1 {
+			account = args[0]
+		}
+		return runExploreOwnedFiles(dbPath, account, outDir)
 	},
 }
 
@@ -38,22 +46,66 @@ func runExploreOwnedFiles(dbPath, account, outDir string) error {
 	}
 	defer db.Close()
 
-	roots, displayName, err := ownedAndAncestors(db, account)
-	if err != nil {
-		return err
-	}
 	crawlRoot, err := crawlRootDriveID(db)
 	if err != nil {
 		return fmt.Errorf("fetching crawl root: %w", err)
 	}
-
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return fmt.Errorf("creating %s: %w", outDir, err)
 	}
+
+	// A specific account: write its single file and we're done.
+	if account != "" {
+		outPath, err := writeOwnedFilesHTML(db, account, outDir, crawlRoot)
+		if err != nil {
+			return err
+		}
+		fmt.Println(outPath)
+		return nil
+	}
+
+	// No account: one file per owner. Reuse the owners report for the list of
+	// owner identifiers, skipping the "(unknown)" bucket (neither email nor id),
+	// which ownedAndAncestors cannot match.
+	owners, err := ownersReport(db, "")
+	if err != nil {
+		return err
+	}
+	var written int
+	for _, oc := range owners {
+		var acct string
+		switch {
+		case oc.email.Valid:
+			acct = oc.email.String
+		case oc.ownerID.Valid:
+			acct = oc.ownerID.String
+		default:
+			continue
+		}
+		outPath, err := writeOwnedFilesHTML(db, acct, outDir, crawlRoot)
+		if err != nil {
+			return err
+		}
+		fmt.Println(outPath)
+		written++
+	}
+	fmt.Fprintf(os.Stderr, "\nWrote %d file(s) to %s\n", written, outDir)
+	return nil
+}
+
+// writeOwnedFilesHTML renders the owned-files HTML for a single account into
+// outDir and returns the path written. crawlRoot is passed in so callers
+// rendering many accounts look it up only once.
+func writeOwnedFilesHTML(db *sql.DB, account, outDir, crawlRoot string) (string, error) {
+	roots, displayName, err := ownedAndAncestors(db, account)
+	if err != nil {
+		return "", err
+	}
+
 	outPath := filepath.Join(outDir, sanitizeFilename(account)+".html")
 	f, err := os.Create(outPath)
 	if err != nil {
-		return fmt.Errorf("creating %s: %w", outPath, err)
+		return "", fmt.Errorf("creating %s: %w", outPath, err)
 	}
 	defer f.Close()
 
@@ -78,13 +130,12 @@ func runExploreOwnedFiles(dbPath, account, outDir string) error {
 		CrawlRoot:    crawlRoot,
 		Roots:        roots,
 	}); err != nil {
-		return fmt.Errorf("rendering HTML: %w", err)
+		return "", fmt.Errorf("rendering HTML: %w", err)
 	}
 	if err := f.Close(); err != nil {
-		return err
+		return "", err
 	}
-	fmt.Println(outPath)
-	return nil
+	return outPath, nil
 }
 
 // sanitizeFilename makes account safe as a single path component, keeping the

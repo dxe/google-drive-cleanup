@@ -138,6 +138,9 @@ drive-cleanup check-edit-access
 # (email or owner id), written to out/explore-owned-files/<account>.html
 drive-cleanup explore-owned-files someone@gmail.com
 
+# Omit the account to generate one HTML file per owner in the database
+drive-cleanup explore-owned-files
+
 # Move files from the staging folder back to their original locations
 drive-cleanup restore-locations
 
@@ -160,7 +163,9 @@ command to log every item it touches instead of just progress and errors.
 `explore-owned-files` produces a single offline HTML file: an interactive,
 collapsible tree of every file and folder the account owns plus their ancestor
 folders, per-folder counts of owned descendants, Drive links, and keyboard
-navigation — handy to attach when reaching out to an owner.
+navigation — handy to attach when reaching out to an owner. Run it without an
+account argument to generate one such file per owner in the database (owners
+with neither an email nor an owner id are skipped).
 
 `check-edit-access` reads only the database and prints every node whose
 `can_edit` flag (Drive's `capabilities.canEdit`, captured during the crawl for
