@@ -162,7 +162,7 @@ func TestOwnersReport(t *testing.T) {
 		mustUpsert(t, db, n)
 	}
 
-	counts, err := ownersReport(db)
+	counts, err := ownersReport(db, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,6 +180,33 @@ func TestOwnersReport(t *testing.T) {
 	}
 	if counts[3].folderCount != 1 || counts[3].total != 1 {
 		t.Errorf("owner@example.com = %d folders, %d total, want 1,1", counts[3].folderCount, counts[3].total)
+	}
+}
+
+func TestOwnersReportScopedToParent(t *testing.T) {
+	db := testDB(t)
+	// Root (bob) ─┬─ Finance (alice) ── budget.xlsx (alice), notes.txt (bob)
+	//             └─ Shared  (bob)   ── plan.doc    (alice)
+	buildExploreTree(t, db)
+
+	// Scope to Finance: only Finance itself (folder, alice) plus its two files
+	// (budget→alice, notes→bob) count. Shared and plan.doc are excluded.
+	counts, err := ownersReport(db, "fin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]ownerCount{}
+	for _, oc := range counts {
+		got[oc.email.String] = oc
+	}
+	if len(counts) != 2 {
+		t.Fatalf("got %d owners under Finance, want 2 (alice, bob): %v", len(counts), counts)
+	}
+	if a := got["alice@example.com"]; a.folderCount != 1 || a.fileCount != 1 {
+		t.Errorf("alice under Finance = %d folders, %d files, want 1, 1", a.folderCount, a.fileCount)
+	}
+	if b := got["bob@example.com"]; b.folderCount != 0 || b.fileCount != 1 {
+		t.Errorf("bob under Finance = %d folders, %d files, want 0, 1", b.folderCount, b.fileCount)
 	}
 }
 

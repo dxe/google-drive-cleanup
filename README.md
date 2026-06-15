@@ -125,6 +125,9 @@ drive-cleanup crawl --refresh
 # Who owns how many files (non-folders), most first — drives outreach priority
 drive-cleanup owners
 
+# Same, but limited to a folder and its descendants (must be in the database)
+drive-cleanup owners 1AbCdEfGh...
+
 # Full folder path of a node (used later to restore original locations)
 drive-cleanup path 1AbCdEfGh...
 

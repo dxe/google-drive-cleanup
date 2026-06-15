@@ -40,15 +40,23 @@ parents.`,
 }
 
 var ownersCmd = &cobra.Command{
-	Use:   "owners",
+	Use:   "owners [parent_folder_id]",
 	Short: "Print each owner and how many files (non-folders) they own",
 	Long: `Print each owner and how many files (non-folders) they own, sorted
-descending by count — this drives outreach priority.`,
-	Args: cobra.NoArgs,
+descending by count — this drives outreach priority.
+
+With an optional parent_folder_id, counts are limited to that folder and its
+descendants (the folder must be one crawled into the database); without it, the
+whole database is counted.`,
+	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dbPath, _ := cmd.Flags().GetString("db")
 		cfgPath, _ := cmd.Flags().GetString("config")
-		return runOwners(dbPath, cfgPath)
+		var parentID string
+		if len(args) == 1 {
+			parentID = args[0]
+		}
+		return runOwners(dbPath, cfgPath, parentID)
 	},
 }
 
@@ -90,7 +98,7 @@ func init() {
 	rootCmd.AddCommand(initCmd, crawlCmd, ownersCmd, pathCmd, checkEditAccessCmd, exploreCmd, restoreCmd, stashCmd)
 }
 
-func runOwners(dbPath, cfgPath string) error {
+func runOwners(dbPath, cfgPath, parentID string) error {
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
 		return err
@@ -102,7 +110,20 @@ func runOwners(dbPath, cfgPath string) error {
 	}
 	defer db.Close()
 
-	counts, err := ownersReport(db)
+	if parentID != "" {
+		typ, err := nodeTypeByDriveID(db, parentID)
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("parent folder %s not found in the database; crawl it first", parentID)
+		}
+		if err != nil {
+			return err
+		}
+		if typ != typeFolder {
+			return fmt.Errorf("%s is a %s, not a folder", parentID, typ)
+		}
+	}
+
+	counts, err := ownersReport(db, parentID)
 	if err != nil {
 		return err
 	}
