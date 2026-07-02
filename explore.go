@@ -221,9 +221,13 @@ const exploreHTML = `<!DOCTYPE html>
             cursor: pointer; user-select: none; flex: none; }
   .twisty.leaf { visibility: hidden; }
   .icon { flex: none; }
-  .name { text-decoration: none; color: inherit; }
+  .name { text-decoration: none; color: inherit; cursor: pointer; }
   .name:hover { text-decoration: underline; }
   .owned > .row .name { font-weight: 700; }
+  .ext-link { color: #888; display: inline-flex; align-items: center; margin-left: .2rem;
+              opacity: .55; flex: none; text-decoration: none; }
+  .ext-link:hover { opacity: 1; }
+  .row:focus .ext-link, .row:focus-within .ext-link { color: #d6e4ff; opacity: .75; }
   .counts { color: #777; font-size: .8rem; margin-left: .4rem; white-space: nowrap; }
   /* collapsed by default: hide child lists unless the li is expanded */
   li > ul { display: none; }
@@ -234,7 +238,7 @@ const exploreHTML = `<!DOCTYPE html>
 <header>
   <h1>Files &amp; folders owned by {{.Account}}{{if .DisplayName}} ({{.DisplayName}}){{end}}</h1>
   <div class="sub">📁 {{.TotalFolders}} folders &nbsp; 📄 {{.TotalFiles}} files owned. Bold = owned by this account.</div>
-  <div class="hint">Click a ▶ to expand. Keyboard: ↑/↓ move, →/← expand/collapse, Enter or Space toggles.</div>
+  <div class="hint">Click a ▶ or folder name to expand. Keyboard: ↑/↓ move, →/← expand/collapse, Enter or Space toggles.</div>
   <div class="hint"><a href="https://drive.google.com/drive/search?q=owner:me%20parent:{{.CrawlRoot}}%20-type:folders" target="_blank" rel="noopener">View my files in Drive</a></div>
 </header>
 
@@ -247,7 +251,7 @@ const exploreHTML = `<!DOCTYPE html>
   <div class="row" tabindex="-1">
     {{if .Children}}<span class="twisty" aria-hidden="true">▶</span>{{else}}<span class="twisty leaf" aria-hidden="true">▶</span>{{end}}
     <span class="icon">{{if isFolder .}}📁{{else}}📄{{end}}</span>
-    <a class="name" href="{{driveURL .}}" target="_blank" rel="noopener">{{.Name}}</a>
+    {{if isFolder .}}<span class="name">{{.Name}}</span><a class="ext-link" href="{{driveURL .}}" target="_blank" rel="noopener" title="Open in Google Drive" tabindex="-1"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg></a>{{else}}<a class="name" href="{{driveURL .}}" target="_blank" rel="noopener">{{.Name}}</a>{{end}}
     {{if isFolder .}}<span class="counts">📁 {{.OwnedFolders}} &nbsp; 📄 {{.OwnedFiles}}</span>{{end}}
   </div>
   {{if .Children}}
@@ -301,8 +305,8 @@ const exploreHTML = `<!DOCTYPE html>
   tree.addEventListener('click', function (e) {
     var row = e.target.closest('.row');
     if (!row) return;
-    var twisty = e.target.closest('.twisty');
-    if (twisty && !twisty.classList.contains('leaf')) {
+    if (e.target.closest('.ext-link')) { focusRow(row); return; }
+    if (isExpandable(row)) {
       setOpen(row, !isOpen(row));
       e.preventDefault();
     }
@@ -332,7 +336,7 @@ const exploreHTML = `<!DOCTYPE html>
       case 'Enter':
       case ' ':
         if (isExpandable(row)) setOpen(row, !isOpen(row));
-        else window.open(row.querySelector('.name').href, '_blank');
+        else { var link = row.querySelector('a.name') || row.querySelector('.ext-link'); if (link) window.open(link.href, '_blank'); }
         break;
       case 'Home':
         focusRow(visible[0]);
