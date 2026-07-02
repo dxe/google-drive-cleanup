@@ -288,33 +288,186 @@ func TestNodesLackingEditAccess(t *testing.T) {
 	}
 }
 
-func TestFoldersOwnedBy(t *testing.T) {
+// buildPackTree builds the migration fixture used by the pack query tests:
+//
+//	Root (bob) ─┬─ A (alice) ─┬─ a1.pdf (alice)        nested owned: rides along
+//	            │             ├─ B (alice) ── b1 (bob) owned folder + unowned child
+//	            │             ├─ E (carol) ── e1 (alice, via owner_id)
+//	            │             └─ x1.pdf (no owner)     unowned child of owned
+//	            ├─ loose.pdf (alice)
+//	            └─ C (bob) ── c1.pdf (alice)
+func buildPackTree(t *testing.T, db *sql.DB) {
+	t.Helper()
+	alice := nullString("alice@example.com")
+	rootID, _, _, _ := mustUpsert(t, db, node{driveID: "root", name: "Root", typ: typeFolder, mimeType: folderMimeType,
+		ownerEmail: nullString("bob@example.com")})
+	aID, _, _, _ := mustUpsert(t, db, node{driveID: "A", name: "A", typ: typeFolder, mimeType: folderMimeType,
+		parentID: sql.NullInt64{Int64: rootID, Valid: true}, ownerEmail: alice})
+	mustUpsert(t, db, node{driveID: "a1", name: "a1.pdf", typ: typeBinary, mimeType: "application/pdf",
+		parentID: sql.NullInt64{Int64: aID, Valid: true}, ownerEmail: alice})
+	bID, _, _, _ := mustUpsert(t, db, node{driveID: "B", name: "B", typ: typeFolder, mimeType: folderMimeType,
+		parentID: sql.NullInt64{Int64: aID, Valid: true}, ownerEmail: alice})
+	mustUpsert(t, db, node{driveID: "b1", name: "b1.pdf", typ: typeBinary, mimeType: "application/pdf",
+		parentID: sql.NullInt64{Int64: bID, Valid: true}, ownerEmail: nullString("bob@example.com")})
+	eID, _, _, _ := mustUpsert(t, db, node{driveID: "E", name: "E", typ: typeFolder, mimeType: folderMimeType,
+		parentID: sql.NullInt64{Int64: aID, Valid: true}, ownerEmail: nullString("carol@example.com")})
+	// Owned via owner_id rather than email, inside an unowned folder.
+	mustUpsert(t, db, node{driveID: "e1", name: "e1.pdf", typ: typeBinary, mimeType: "application/pdf",
+		parentID: sql.NullInt64{Int64: eID, Valid: true}, ownerID: nullString("alice@example.com")})
+	// No owner at all: must count as not-owned (IS NOT handles the NULLs).
+	mustUpsert(t, db, node{driveID: "x1", name: "x1.pdf", typ: typeBinary, mimeType: "application/pdf",
+		parentID: sql.NullInt64{Int64: aID, Valid: true}})
+	mustUpsert(t, db, node{driveID: "loose", name: "loose.pdf", typ: typeBinary, mimeType: "application/pdf",
+		parentID: sql.NullInt64{Int64: rootID, Valid: true}, ownerEmail: alice})
+	cID, _, _, _ := mustUpsert(t, db, node{driveID: "C", name: "C", typ: typeFolder, mimeType: folderMimeType,
+		parentID: sql.NullInt64{Int64: rootID, Valid: true}, ownerEmail: nullString("bob@example.com")})
+	mustUpsert(t, db, node{driveID: "c1", name: "c1.pdf", typ: typeBinary, mimeType: "application/pdf",
+		parentID: sql.NullInt64{Int64: cID, Valid: true}, ownerEmail: alice})
+}
+
+func TestNodesOwnedBy(t *testing.T) {
 	db := testDB(t)
-	rootID, _, _, _ := mustUpsert(t, db, node{driveID: "root", name: "Root", typ: typeFolder, mimeType: folderMimeType})
-	parent := sql.NullInt64{Int64: rootID, Valid: true}
+	buildPackTree(t, db)
 
-	// Two folders owned by the target (one by email, one by id), a folder owned
-	// by someone else, and a file owned by the target — none of the latter two
-	// should be returned.
-	mustUpsert(t, db, node{driveID: "fa", name: "A", typ: typeFolder, mimeType: folderMimeType,
-		parentID: parent, ownerEmail: nullString("u@gmail.com")})
-	mustUpsert(t, db, node{driveID: "fb", name: "B", typ: typeFolder, mimeType: folderMimeType,
-		parentID: parent, ownerID: nullString("u@gmail.com")})
-	mustUpsert(t, db, node{driveID: "fc", name: "C", typ: typeFolder, mimeType: folderMimeType,
-		parentID: parent, ownerEmail: nullString("other@gmail.com")})
-	mustUpsert(t, db, node{driveID: "file", name: "f.pdf", typ: typeBinary, mimeType: "application/pdf",
-		parentID: parent, ownerEmail: nullString("u@gmail.com")})
-
-	folders, err := foldersOwnedBy(db, "u@gmail.com")
+	nodes, err := nodesOwnedBy(db, "alice@example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
 	var got []string
-	for _, f := range folders {
-		got = append(got, f.driveID)
+	for _, n := range nodes {
+		got = append(got, n.driveID)
 	}
-	if strings.Join(got, ",") != "fa,fb" {
-		t.Errorf("foldersOwnedBy = %v, want [fa fb]", got)
+	if strings.Join(got, ",") != "A,a1,B,e1,loose,c1" {
+		t.Errorf("nodesOwnedBy = %v, want [A a1 B e1 loose c1]", got)
+	}
+}
+
+func TestOwnedRoots(t *testing.T) {
+	db := testDB(t)
+	buildPackTree(t, db)
+
+	roots, err := ownedRoots(db, "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, r := range roots {
+		got[r.driveID] = r.parentDriveID
+	}
+	// A, loose, c1 hang off unowned parents; e1's parent E is carol's; a1 and B
+	// live inside owned A and ride along.
+	want := map[string]string{"A": "root", "e1": "E", "loose": "root", "c1": "C"}
+	if len(got) != len(want) {
+		t.Fatalf("ownedRoots = %v, want %v", got, want)
+	}
+	for id, parent := range want {
+		if got[id] != parent {
+			t.Errorf("ownedRoots[%s] parent = %q, want %q", id, got[id], parent)
+		}
+	}
+}
+
+func TestOwnedRootsExcludesCrawlRoot(t *testing.T) {
+	db := testDB(t)
+	// The crawl root itself owned by the migrating user must never be a root.
+	rootID, _, _, _ := mustUpsert(t, db, node{driveID: "root", name: "Root", typ: typeFolder, mimeType: folderMimeType,
+		ownerEmail: nullString("alice@example.com")})
+	mustUpsert(t, db, node{driveID: "f", name: "f.pdf", typ: typeBinary, mimeType: "application/pdf",
+		parentID: sql.NullInt64{Int64: rootID, Valid: true}, ownerEmail: nullString("alice@example.com")})
+
+	roots, err := ownedRoots(db, "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roots) != 0 {
+		t.Errorf("ownedRoots = %v, want none (root has no parent, f's parent is owned)", roots)
+	}
+}
+
+func TestUnownedChildrenOfOwned(t *testing.T) {
+	db := testDB(t)
+	buildPackTree(t, db)
+
+	items, err := unownedChildrenOfOwned(db, "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, s := range items {
+		got[s.driveID] = s.parentDriveID
+	}
+	// b1 (bob's, in alice's B), E (carol's, in alice's A), and ownerless x1.
+	want := map[string]string{"b1": "B", "E": "A", "x1": "A"}
+	if len(got) != len(want) {
+		t.Fatalf("unownedChildrenOfOwned = %v, want %v", got, want)
+	}
+	for id, parent := range want {
+		if got[id] != parent {
+			t.Errorf("unownedChildrenOfOwned[%s] parent = %q, want %q", id, got[id], parent)
+		}
+	}
+}
+
+func TestUserMigrationLifecycle(t *testing.T) {
+	db := testDB(t)
+
+	if m, err := getUserMigration(db, "alice@example.com"); err != nil || m != nil {
+		t.Fatalf("before pack: migration = %v, err = %v; want nil, nil", m, err)
+	}
+
+	if err := upsertUserMigration(db, "alice@example.com", "uf", "cont", "stash"); err != nil {
+		t.Fatal(err)
+	}
+	if err := markPacked(db, "alice@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	m, err := getUserMigration(db, "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.containerID != "cont" || m.stashID != "stash" || m.userFolderID != "uf" {
+		t.Errorf("migration ids = %+v", m)
+	}
+	if !m.packedAt.Valid || m.unpackedAt.Valid {
+		t.Errorf("after markPacked: packedAt=%v unpackedAt=%v, want set/unset", m.packedAt, m.unpackedAt)
+	}
+
+	if err := markUnpacked(db, "alice@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if m, _ = getUserMigration(db, "alice@example.com"); !m.unpackedAt.Valid {
+		t.Error("after markUnpacked: unpackedAt not set")
+	}
+
+	// Re-running pack re-records the scaffolding and restarts the cycle.
+	if err := upsertUserMigration(db, "alice@example.com", "uf2", "cont2", "stash2"); err != nil {
+		t.Fatal(err)
+	}
+	m, _ = getUserMigration(db, "alice@example.com")
+	if m.containerID != "cont2" || m.packedAt.Valid || m.unpackedAt.Valid {
+		t.Errorf("after re-upsert: %+v, want new ids and cleared timestamps", m)
+	}
+}
+
+func TestPackOrphans(t *testing.T) {
+	db := testDB(t)
+
+	if _, err := packOrphanParent(db, "alice@example.com", "x"); err != sql.ErrNoRows {
+		t.Errorf("missing orphan: err = %v, want sql.ErrNoRows", err)
+	}
+	if err := recordPackOrphan(db, "alice@example.com", "x", "parent1"); err != nil {
+		t.Fatal(err)
+	}
+	// Re-sweeping the same item from a different live parent must overwrite.
+	if err := recordPackOrphan(db, "alice@example.com", "x", "parent2"); err != nil {
+		t.Fatal(err)
+	}
+	parent, err := packOrphanParent(db, "alice@example.com", "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parent != "parent2" {
+		t.Errorf("orphan parent = %q, want parent2", parent)
 	}
 }
 

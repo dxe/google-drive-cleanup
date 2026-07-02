@@ -94,7 +94,7 @@ func init() {
 
 	ownersCmd.Flags().String("folder", "", "Google Drive folder ID to scope the report to (must be crawled into the database)")
 
-	rootCmd.AddCommand(initCmd, crawlCmd, ownersCmd, pathCmd, checkEditAccessCmd, exploreCmd, restoreCmd, stashCmd)
+	rootCmd.AddCommand(initCmd, crawlCmd, ownersCmd, pathCmd, checkEditAccessCmd, exploreCmd, packCmd, unpackCmd)
 }
 
 func runOwners(dbPath, cfgPath, parentID string) error {

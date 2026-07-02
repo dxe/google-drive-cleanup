@@ -1,14 +1,16 @@
 # google-drive-cleanup
 
-Crawls a Google Drive folder tree into a SQLite database and reports on file
-ownership.
+Crawls a Google Drive folder tree into a SQLite database, reports on file
+ownership, and migrates each user's files to org ownership through a shared
+drive — then puts everything back where it was.
 
-This is step one of an ownership-migration project: many files inside our org
-folders are owned by external/personal accounts. Before we move files into
-shared drives (to transfer ownership) and later move them back, this tool
-takes a durable snapshot of every file's location and owner so original
-parents can be reconstructed. The move/transfer tooling will come later and
-build on the same database.
+The problem: many files inside our org folders are owned by external/personal
+accounts. Moving an item into a shared drive transfers its ownership to the
+org, but only its *owner* can move it there. So per user, this tool gathers
+everything they own into one **Container** folder, the user drags that single
+folder into a shared drive (one drag — ownership of the whole tree flips), and
+the tool moves everything back to the original parents recorded in the crawl
+snapshot.
 
 ## The migration flow at a glance
 
@@ -19,28 +21,28 @@ One-time, for the whole tree:
   owners  ──▶  who owns what   sorted by file count, to prioritize outreach
 ```
 
-Then, per user being migrated, the contents of a folder make this round trip:
+Then, per user being migrated:
 
 ```
-                         (3) user drags the empty folder + their own
-                             loose files in; ownership flips to the org
-     original folder  ───────────────────────────────────────────────▶  staging folder
-        │      ▲                                                          (shared drive)
-        │      │                                                              │
-   (2) stash   │ (5) stash pop                                      (4) restore-locations
-       push    │ refills third-party-                              looks up each file's
-   empties the │ owned files after the                            original parent in
-   folder so   │ folder is back in the                            drive.db and moves it
-   it can      │ regular tree                                      back there
-   transit     │                                                              │
-        ▼      │                                                              ▼
-        stash folder (My-Drive, inside the crawl root) ◀──────────  back to original parent
+               (1) pack                            (3) user drags Container
+  original  ─────────────▶  Packing/<user>/  ───────────────────────────▶  Dropoff folder
+  locations                  ├─ Container         (2) admin transfers       (shared drive:
+      ▲                      │   owned subtrees,      Container ownership    ownership of
+      │                      │   moved intact         to the user first      everything inside
+      │                      └─ Stash                 (Drive UI)             flips to the org)
+      │                          third-party items,                               │
+      │                          flat                                             │
+      │                             │                                             │
+      └───────────── (4) unpack ◀───┴─────────────────────────────────────────────┘
+                     every item returns to its original parent from drive.db
+                     (Container contents first, then the Stash), then the
+                     emptied scaffolding is deleted
 ```
 
-`stash push`/`stash pop` exist only because a shared drive cannot hold files
-owned by third parties; loose files the user owns round-trip without the stash.
-The numbered steps map to the per-user order of operations near the end of this
-README. Run any of the moving steps with `--dry-run` first to preview them.
+The Stash exists because a shared drive cannot hold items owned by third
+parties: anything inside the user's folders that the user does *not* own is
+parked flat in the Stash for the duration of the round trip, so it cannot
+block the drag. Run either moving step with `--dry-run` first to preview it.
 
 ## Setup
 
@@ -53,9 +55,8 @@ README. Run any of the moving steps with `--dry-run` first to preview them.
    run the tool from. (You may need to configure the OAuth consent screen
    first; add your account as a test user if the app is in testing mode.)
 3. **Scopes.** The `crawl`, `owners`, `path`, and `explore-owned-files` commands
-   request `https://www.googleapis.com/auth/drive.readonly` only. The
-   `restore-locations`, `stash push`, and `stash pop` commands need the full
-   `drive` scope. The scopes a token was granted are recorded in `token.json`,
+   request `https://www.googleapis.com/auth/drive.readonly` only. The `pack`
+   and `unpack` commands need the full `drive` scope. The scopes a token was granted are recorded in `token.json`,
    so when you run a command that needs broader access than the cached token
    has, the tool re-runs consent automatically — no manual `rm token.json`.
 4. **First run auth.** On first run the tool starts a small loopback server on
@@ -94,11 +95,9 @@ can add settings without colliding:
   "crawl": {
     "root": { "id": "0ABCdef...", "name": "DxE General" }
   },
-  "restore-locations": {
-    "staging-folder": { "id": "1AbCdEfGh...", "name": "Staging" }
-  },
-  "stash": {
-    "folder": { "id": "1StAsHfOlDeR...", "name": "Stash" }
+  "migration": {
+    "packing-folder": { "id": "1PaCkInG...", "name": "Packing" },
+    "dropoff-folder": { "id": "1DrOpOfF...", "name": "Dropoff" }
   }
 }
 ```
@@ -141,24 +140,24 @@ drive-cleanup explore-owned-files someone@gmail.com
 # Omit the account to generate one HTML file per owner in the database
 drive-cleanup explore-owned-files
 
-# Move files from the staging folder back to their original locations
-drive-cleanup restore-locations
+# Gather everything a user owns into their Container (and every third-party
+# item inside their folders into their Stash), ready for a single drag
+drive-cleanup pack someone@gmail.com
 
-# Park the contents of every folder a user owns into the stash folder
-# (run before the user drags their folders into the staging folder)
-drive-cleanup stash push someone@gmail.com
-
-# Move stashed files back into their original folders and clean up
-# (run after restore-locations)
-drive-cleanup stash pop
+# After the user drags their Container into the Dropoff folder: move
+# everything back to its original location and clean up
+drive-cleanup unpack someone@gmail.com
 ```
 
-The three commands that move files — `restore-locations`, `stash push`, and
-`stash pop` — accept `--dry-run`, which reports every `WOULD move/create/delete`
-action without changing anything. A dry run authenticates with the read-only
-scope (so it never triggers a write-scope consent) and skips the confirmation
-prompt. Run one first to preview a migration step. Pass `--verbose`/`-v` to any
-command to log every item it touches instead of just progress and errors.
+The two commands that move files — `pack` and `unpack` — accept `--dry-run`,
+which reports every `WOULD move/create/delete` action without changing
+anything. A dry run authenticates with the read-only scope (so it never
+triggers a write-scope consent) and skips the confirmation prompt. Run one
+first to preview a migration step. They also accept `--max-errors` (default 5):
+once more than that many items fail to move, the run aborts — an error burst
+means something systemic (wrong account, wrong config, revoked access), not
+per-item drift. Pass `--verbose`/`-v` to any command to log every item it
+touches instead of just progress and errors.
 
 `explore-owned-files` produces a single offline HTML file: an interactive,
 collapsible tree of every file and folder the account owns plus their ancestor
@@ -173,96 +172,112 @@ the account that ran it) is false — the items you would be unable to move.
 Folders are listed first, each with its full path and owner. Nodes whose edit
 capability could not be determined (`can_edit = NULL`) are not reported.
 
-`restore-locations` is the second half of the ownership-migration flow. Once
-an owner has dragged their files into the shared-drive staging folder (which
-transfers ownership to the org account), run this command to move each file
-back to the folder it lived in before the transfer. It scans the staging folder
-one level deep, looks up each file's original parent in the database, and calls
-the Drive `files.update` API to reparent it. Files not found in the database
-are skipped with a warning; the final line reports a count of moved, skipped,
-and failed items. Configure the staging folder in `config.json`:
+## Migrating a user (`pack` / `unpack`)
 
-```json
-{
-  "restore-locations": {
-    "staging-folder": { "id": "1AbCdEfGh...", "name": "Staging" }
-  }
-}
+The two folders in the `migration` config section frame the round trip:
+
+- **Packing** (`migration.packing-folder`) — a regular My-Drive folder holding
+  one folder per user being migrated. It must **not** be in a shared drive
+  (each user's Stash parks third-party-owned files, which a shared drive
+  cannot hold) and must **not** be inside the crawl root (a re-crawl would
+  ingest mid-migration scaffolding). Share it, as editor, with the admin's
+  personal Gmail account — see below.
+- **Dropoff** (`migration.dropoff-folder`) — the shared-drive folder the user
+  drags their Container into. The drag is what transfers ownership to the org.
+
+Inside the packing folder, each user gets:
+
+```
+Packing/
+  someone@gmail.com/     created by pack, org-owned
+    Container/           created MANUALLY by the admin's personal Gmail
+    Stash/               created by pack, org-owned
 ```
 
-## Stashing folder contents (`stash push` / `stash pop`)
+**Why the Container is created manually:** the user must *own* the Container
+to drag it into the shared drive, and Google only allows ownership transfers
+between two personal accounts (or two accounts of the same Workspace). So the
+admin creates the Container with a personal Gmail account and transfers its
+ownership to the user's personal account via the Drive UI (an invite the user
+must accept). On a first run, `pack` creates the per-user folder and Stash,
+then stops with instructions to create the Container.
 
-Loose files round-trip through the staging shared drive cleanly: the owner drags
-the file in (ownership flips to the org), then `restore-locations` moves it back.
-**Folders** are the hard case. A folder a user owns usually contains files owned
-by *other* accounts, and a shared drive cannot hold items the dragging user does
-not own — so when the user drags the folder in, Drive blocks the move or orphans
-those files.
+### `pack <user>`
 
-`stash push <user>` clears the way. For every folder owned by `<user>` in the
-database, it:
+`pack` gathers everything `<user>` (email or owner id) owns:
 
-1. creates a subfolder of the configured **stash folder**, named after the
-   original folder's Drive ID;
-2. recreates the original folder's sharing on that subfolder so everyone keeps
-   the access they had;
-3. moves **all** of the original folder's files into the subfolder; and
-4. leaves a shortcut named **"Contents temporarily moved"** in the now-empty
-   original folder, pointing at the stash subfolder.
+1. **Owned subtrees move intact.** Only *owned roots* — items the user owns
+   whose parent they do not own — are moved into the Container; owned items
+   nested below them ride along, so a deep owned tree costs one move, not
+   thousands.
+2. **A live sweep clears the drag blockers.** The Container tree is then walked
+   via live Drive listings, and every item inside it the user does *not* own is
+   moved into the flat Stash. Working from live state (not the database) also
+   catches items created or re-owned after the crawl, so the sweep doubles as
+   the pre-drag verification that nothing can block the move. Swept items with
+   no database row are logged and recorded (the `pack_orphans` table) together
+   with the folder they came from, so they can still be put back later.
+3. **A straggler check catches drift.** Anything the database says the user
+   owns that never showed up inside the Container tree (it moved since the
+   crawl, so no owned ancestor carried it in) is fetched individually and moved
+   flat into the Container.
 
-The emptied folder can then transit the staging shared drive. `stash pop` (no
-argument — it drains the whole stash) reverses step 3 for every subfolder,
-moving each subfolder's files back into the original folder whose ID names it,
-then removes the shortcut and deletes the empty subfolder.
+Moves are optimistic — one `files.update` per item, no per-item pre-reads — and
+a failed move triggers a single live lookup to diagnose (deleted, trashed,
+already packed, ownership changed, or moved: retried from its live parent).
+Like the old stash flow, `pack` first runs the `check-edit-access` scan and
+asks for confirmation if any crawled item is not editable. It refuses to run
+as the account being migrated, and warns when moving an item that has extra
+parents recorded (`extra_parents`): the round trip collapses multi-parent
+items to the single traversal parent.
 
-Before moving anything, `stash push` runs the same scan as `check-edit-access`
-and, if any crawled item is not editable by the running account, prints the
-count and asks you to confirm (those items would fail to move). It also verifies
-the stash folder's name matches config, that it is **inside the crawl root**, and
-that it is **not in a shared drive**.
+`pack` ends by printing the manual steps: transfer Container ownership to the
+user (invite + accept), then have them drag the Container into the Dropoff
+folder — one drag, and the org owns everything inside.
 
-> **The stash folder must be a regular My-Drive folder, never a shared drive.**
-> The files it parks are owned by third parties, which a shared drive cannot
-> hold — that is the whole reason the stash exists.
+### `unpack <user>`
 
-**Why the stash lives inside the crawl root.** The user's *own* files get parked
-in the stash too. Because the stash folder is under the crawl root, those files
-still surface when the user searches their Drive for `parent:<crawl-root-id>
-owner:me`, so the user drags them into the staging folder along with their
-(now-empty) folders, exactly like any other loose file they own —
-`restore-locations` then returns them to their original parents. Files owned by
-other third parties stay in the stash until `stash pop` puts them back (they are
-migrated later, on that owner's own pass). Configure the stash folder in
-`config.json`:
+`unpack` finishes the migration after the drag. It verifies the Container now
+lives in the Dropoff folder's shared drive (and that the running account can
+move items back *out* of it — that needs **manager** access on the shared
+drive), then:
 
-```json
-{
-  "stash": {
-    "folder": { "id": "1StAsHfOlDeR...", "name": "Stash" }
-  }
-}
-```
+1. **Restores the Container's contents.** Each direct child moves back to the
+   original parent recorded in `drive.db`; owned items nested deeper ride
+   along with their folders. The database's owner columns are updated to the
+   running account as items return.
+2. **Restores the Stash.** Same mechanism. The Container must come first:
+   Stash items are owned by third parties, and a shared drive cannot hold
+   those, so their destination folders have to be back in the regular tree
+   before they can follow. If a Stash move fails because its destination is
+   still in the shared drive, re-running `unpack` converges.
+3. **Quarantines what it cannot place.** An item with no database row, or
+   whose original parent no longer exists, is moved to
+   `Packing/<user>/Errors/<original-parent-id>/` (the subfolder name records
+   where it belongs — from `pack_orphans` for never-crawled items, `unknown`
+   when even that is missing) instead of blocking cleanup.
+4. **Cleans up.** Once live listings confirm they are empty, the Stash, the
+   Container, and the per-user folder are deleted. Anything left over — a
+   non-empty Errors folder, or items that failed to move — is reported and
+   left in place.
 
 ### Order of operations (per user)
 
-Run these in order for each user being migrated:
-
-1. **`drive-cleanup check-edit-access`** — confirm the running account can edit
+1. **`drive-cleanup crawl`** — fresh snapshot (re-run just before migrating;
+   `pack` warns if the crawl is incomplete).
+2. **`drive-cleanup check-edit-access`** — confirm the running account can edit
    everything that will move.
-2. **`drive-cleanup stash push <user>`** — park the contents of the user's
-   folders in the stash.
-3. **User moves files and (empty) folders they own to the staging folder** —
-   manually, in the Drive web/desktop app. This includes their own files now
-   sitting in the stash, which they find via the `parent:<crawl-root-id> owner:me`
-   search. The drag flips ownership of those items to the org.
-4. **`drive-cleanup restore-locations`** — move everything just dragged into the
-   staging folder back to its original parent in the regular tree.
-5. **`drive-cleanup stash pop`** — refill the folders with the remaining stashed
-   (third-party-owned) files and clean up the stash subfolders and shortcuts.
+3. **`drive-cleanup pack <user>`** — first run scaffolds and asks for the
+   Container; create it with the admin's personal Gmail and re-run.
+4. **Transfer Container ownership** to the user's personal account (Drive UI;
+   the user must accept the invite).
+5. **User drags the Container into the Dropoff folder** — one drag.
+6. **`drive-cleanup unpack <user>`** — restore everything and clean up.
 
-`stash pop` must run **after** `restore-locations`: the folders have to be back
-out of the shared drive and in the regular tree before externally-owned files
-can be returned to them.
+The crawl and pack are meant to run with the user on standby, with unpack
+immediately after the drag, so the window in which the user's folders are
+absent from the org tree (and third parties briefly lose folder-inherited
+access to stashed files) stays short.
 
 The CLI is built with [Cobra](https://github.com/spf13/cobra): run
 `drive-cleanup help` (or `drive-cleanup <command> --help`) for full usage, and
@@ -328,6 +343,19 @@ recorded in the `extra_parents` table for manual review:
 
 ```sql
 SELECT * FROM extra_parents;
+```
+
+**Migration state:** `pack` records each user's scaffolding in a
+`user_migrations` table (one row per account: the per-user folder, Container,
+and Stash Drive IDs, plus `packed_at`/`unpacked_at` timestamps set when each
+half finishes with zero failures) — `unpack` needs the Container's ID because
+by then the user has dragged it away from the packing folder. Swept items with
+no `nodes` row land in `pack_orphans` with the live parent they were taken
+from, which is where `unpack` gets the Errors subfolder name for them:
+
+```sql
+SELECT * FROM user_migrations;
+SELECT * FROM pack_orphans;
 ```
 
 ## Rate limiting

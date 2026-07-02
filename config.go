@@ -19,10 +19,9 @@ type config struct {
 	// InternalDomains lists the org's own email domains (no leading "@"), e.g.
 	// "example.com". Commands can use these to distinguish internal from
 	// external owners.
-	InternalDomains  []string               `json:"internal-domains" doc:"your org's email domains"`
-	Owners           ownersConfig           `json:"owners"`
-	RestoreLocations restoreLocationsConfig `json:"restore-locations"`
-	Stash            stashConfig            `json:"stash"`
+	InternalDomains []string        `json:"internal-domains" doc:"your org's email domains"`
+	Owners          ownersConfig    `json:"owners"`
+	Migration       migrationConfig `json:"migration"`
 }
 
 type crawlConfig struct {
@@ -56,23 +55,17 @@ func (r rootConfig) validate(section string) error {
 	return nil
 }
 
-// stashConfig holds settings for the stash push/pop commands.
-type stashConfig struct {
-	// Folder is the My-Drive parking area that stash push moves folder contents
-	// into and stash pop drains. It MUST be a regular My-Drive folder inside the
-	// crawl root, never a shared drive: the files parked here are owned by third
-	// parties, which cannot be moved to a shared drive. Keeping it under the crawl root
-	// also means a user's own parked files still surface in their
-	// "owner:me" Drive search so they get migrated like any other loose file.
-	Folder rootConfig `json:"folder" doc:"a My-Drive folder inside the crawl root for parking"`
-}
-
-// restoreLocationsConfig holds settings for the restore-locations command.
-type restoreLocationsConfig struct {
-	// StagingFolder is the shared-drive folder owners drag their files into
-	// before running restore-locations. The tool scans it (one level deep),
-	// looks up each file's original parent in the database, and moves it back.
-	StagingFolder rootConfig `json:"staging-folder" doc:"the shared-drive folder owners drag files into"`
+// migrationConfig holds settings shared by the pack and unpack commands.
+type migrationConfig struct {
+	// PackingFolder holds one folder per user being migrated, each containing
+	// that user's Container and Stash. It MUST be a regular My-Drive folder,
+	// never in a shared drive (a user's Stash parks third-party-owned files,
+	// which a shared drive cannot hold), and MUST NOT be inside the crawl root
+	// (a re-crawl would ingest mid-migration scaffolding).
+	PackingFolder rootConfig `json:"packing-folder" doc:"a My-Drive folder outside the crawl root holding per-user packing folders"`
+	// DropoffFolder is the shared-drive folder a user drags their Container
+	// into; the drag flips ownership of the container's whole tree to the org.
+	DropoffFolder rootConfig `json:"dropoff-folder" doc:"the shared-drive folder users drag their Container into"`
 }
 
 func loadConfig(path string) (config, error) {
@@ -104,11 +97,13 @@ func configTemplate() (string, error) {
 		}
 	}
 	cfg := config{
-		Crawl:            crawlConfig{Root: folder("ROOT")},
-		InternalDomains:  []string{"example.com"},
-		Owners:           ownersConfig{IgnoreInternalDomains: false},
-		RestoreLocations: restoreLocationsConfig{StagingFolder: folder("STAGING")},
-		Stash:            stashConfig{Folder: folder("STASH")},
+		Crawl:           crawlConfig{Root: folder("ROOT")},
+		InternalDomains: []string{"example.com"},
+		Owners:          ownersConfig{IgnoreInternalDomains: false},
+		Migration: migrationConfig{
+			PackingFolder: folder("PACKING"),
+			DropoffFolder: folder("DROPOFF"),
+		},
 	}
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {

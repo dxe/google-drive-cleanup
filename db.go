@@ -77,6 +77,30 @@ CREATE TABLE IF NOT EXISTS folder_permissions (
 	PRIMARY KEY (node_drive_id, permission_id)
 );
 CREATE INDEX IF NOT EXISTS idx_folder_permissions_node ON folder_permissions(node_drive_id);
+
+-- One row per user migration: where that user's Container and Stash live and
+-- how far the pack/unpack cycle has progressed. Written by pack, read by
+-- unpack -- the Container must be findable by ID after the user drags it out
+-- of the packing folder into the shared drive.
+CREATE TABLE IF NOT EXISTS user_migrations (
+	account        TEXT PRIMARY KEY,   -- as passed to pack (email or owner id)
+	user_folder_id TEXT NOT NULL,
+	container_id   TEXT NOT NULL,
+	stash_id       TEXT NOT NULL,
+	packed_at      TEXT,               -- set once pack finishes with zero failures
+	unpacked_at    TEXT                -- set once unpack finishes with zero failures
+);
+
+-- Items pack swept into a Stash that have no nodes row (created after the
+-- crawl). The live parent they were taken from is recorded so unpack can
+-- quarantine them under Errors/<parent id> for manual restore.
+CREATE TABLE IF NOT EXISTS pack_orphans (
+	account              TEXT NOT NULL,
+	item_drive_id        TEXT NOT NULL,
+	from_parent_drive_id TEXT NOT NULL,
+	swept_at             TEXT NOT NULL,
+	PRIMARY KEY (account, item_drive_id)
+);
 `, sqlQuoteList(nodeTypes))
 
 func openDB(path string) (*sql.DB, error) {
@@ -378,26 +402,202 @@ func knownDriveIDs(tx *sql.Tx, ids []string) (map[string]bool, error) {
 	return known, rows.Err()
 }
 
-// foldersOwnedBy returns every folder owned by account (matched against
-// owner_email OR owner_id), ordered by row id.
-func foldersOwnedBy(db *sql.DB, account string) ([]folderRef, error) {
-	rows, err := db.Query(fmt.Sprintf(
-		`SELECT id, drive_id, name FROM nodes
-		 WHERE type = '%s' AND (owner_email = ? OR owner_id = ?)
-		 ORDER BY id`, typeFolder), account, account)
+// ownedNode is one node owned by the migrating user, of any type.
+type ownedNode struct {
+	driveID string
+	name    string
+	typ     string
+}
+
+// nodesOwnedBy returns every node owned by account (matched against
+// owner_email OR owner_id), of any type, ordered by row id.
+func nodesOwnedBy(db *sql.DB, account string) ([]ownedNode, error) {
+	rows, err := db.Query(
+		`SELECT drive_id, name, type FROM nodes
+		 WHERE owner_email = ? OR owner_id = ?
+		 ORDER BY id`, account, account)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var refs []folderRef
+	var nodes []ownedNode
 	for rows.Next() {
-		var f folderRef
-		if err := rows.Scan(&f.rowID, &f.driveID, &f.name); err != nil {
+		var n ownedNode
+		if err := rows.Scan(&n.driveID, &n.name, &n.typ); err != nil {
 			return nil, err
 		}
-		refs = append(refs, f)
+		nodes = append(nodes, n)
 	}
-	return refs, rows.Err()
+	return nodes, rows.Err()
+}
+
+// ownedRoot is an item owned by the migrating user whose parent is not: the
+// top of an owned subtree. pack moves exactly these into the Container; owned
+// items nested below them ride along.
+type ownedRoot struct {
+	driveID       string
+	name          string
+	typ           string
+	parentDriveID string // the traversal parent recorded by the crawl
+}
+
+// ownedRoots returns every node owned by account whose parent is NOT owned by
+// account, ordered by row id. The crawl root is excluded by the JOIN (it has
+// no parent row). IS NOT treats a parent with NULL owner fields as not-owned.
+func ownedRoots(db *sql.DB, account string) ([]ownedRoot, error) {
+	rows, err := db.Query(`
+		SELECT n.drive_id, n.name, n.type, p.drive_id
+		FROM nodes n
+		JOIN nodes p ON p.id = n.parent_id
+		WHERE (n.owner_email = ? OR n.owner_id = ?)
+		  AND p.owner_email IS NOT ? AND p.owner_id IS NOT ?
+		ORDER BY n.id`, account, account, account, account)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var roots []ownedRoot
+	for rows.Next() {
+		var r ownedRoot
+		if err := rows.Scan(&r.driveID, &r.name, &r.typ, &r.parentDriveID); err != nil {
+			return nil, err
+		}
+		roots = append(roots, r)
+	}
+	return roots, rows.Err()
+}
+
+// sweepPreview is one item pack's Stash sweep is expected to move: a node not
+// owned by the migrating user sitting directly inside a folder that is.
+type sweepPreview struct {
+	driveID       string
+	name          string
+	parentDriveID string
+}
+
+// unownedChildrenOfOwned returns nodes NOT owned by account whose parent IS
+// owned by account. This is the dry-run preview of pack's Stash sweep; the
+// real sweep works from live listings so it also catches post-crawl items.
+func unownedChildrenOfOwned(db *sql.DB, account string) ([]sweepPreview, error) {
+	rows, err := db.Query(`
+		SELECT n.drive_id, n.name, p.drive_id
+		FROM nodes n
+		JOIN nodes p ON p.id = n.parent_id
+		WHERE (p.owner_email = ? OR p.owner_id = ?)
+		  AND n.owner_email IS NOT ? AND n.owner_id IS NOT ?
+		ORDER BY n.id`, account, account, account, account)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []sweepPreview
+	for rows.Next() {
+		var s sweepPreview
+		if err := rows.Scan(&s.driveID, &s.name, &s.parentDriveID); err != nil {
+			return nil, err
+		}
+		items = append(items, s)
+	}
+	return items, rows.Err()
+}
+
+// extraParentNodeIDs returns the Drive IDs of every node observed under more
+// than one parent. pack warns when moving these: the round trip through the
+// shared drive collapses an item to a single parent, and unpack restores only
+// the traversal parent recorded in nodes.
+func extraParentNodeIDs(db *sql.DB) (map[string]bool, error) {
+	rows, err := db.Query(`SELECT DISTINCT node_drive_id FROM extra_parents`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := make(map[string]bool)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids[id] = true
+	}
+	return ids, rows.Err()
+}
+
+// userMigration is the recorded state of one user's pack/unpack cycle.
+type userMigration struct {
+	account      string
+	userFolderID string
+	containerID  string
+	stashID      string
+	packedAt     sql.NullString
+	unpackedAt   sql.NullString
+}
+
+// getUserMigration returns the recorded migration for account, or nil if pack
+// has never run for it.
+func getUserMigration(db *sql.DB, account string) (*userMigration, error) {
+	m := userMigration{account: account}
+	err := db.QueryRow(`
+		SELECT user_folder_id, container_id, stash_id, packed_at, unpacked_at
+		FROM user_migrations WHERE account = ?`, account).
+		Scan(&m.userFolderID, &m.containerID, &m.stashID, &m.packedAt, &m.unpackedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+// upsertUserMigration records where account's Container and Stash live. It
+// clears the packed/unpacked timestamps: a (re-)running pack means the cycle
+// is in progress again, and markPacked/markUnpacked re-set them on success.
+func upsertUserMigration(db *sql.DB, account, userFolderID, containerID, stashID string) error {
+	_, err := db.Exec(`
+		INSERT INTO user_migrations (account, user_folder_id, container_id, stash_id)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(account) DO UPDATE SET
+			user_folder_id = excluded.user_folder_id,
+			container_id   = excluded.container_id,
+			stash_id       = excluded.stash_id,
+			packed_at      = NULL,
+			unpacked_at    = NULL`,
+		account, userFolderID, containerID, stashID)
+	return err
+}
+
+func markPacked(db *sql.DB, account string) error {
+	_, err := db.Exec(`UPDATE user_migrations SET packed_at = ? WHERE account = ?`, now(), account)
+	return err
+}
+
+func markUnpacked(db *sql.DB, account string) error {
+	_, err := db.Exec(`UPDATE user_migrations SET unpacked_at = ? WHERE account = ?`, now(), account)
+	return err
+}
+
+// recordPackOrphan notes that an item with no nodes row was swept to the Stash
+// from the given live parent, so unpack can quarantine it under that parent's
+// Errors subfolder later.
+func recordPackOrphan(db *sql.DB, account, itemDriveID, fromParentDriveID string) error {
+	_, err := db.Exec(`
+		INSERT INTO pack_orphans (account, item_drive_id, from_parent_drive_id, swept_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(account, item_drive_id) DO UPDATE SET
+			from_parent_drive_id = excluded.from_parent_drive_id,
+			swept_at             = excluded.swept_at`,
+		account, itemDriveID, fromParentDriveID, now())
+	return err
+}
+
+// packOrphanParent returns the live parent an orphan was swept from. Returns
+// sql.ErrNoRows if the item was never recorded as an orphan.
+func packOrphanParent(db *sql.DB, account, itemDriveID string) (string, error) {
+	var parent string
+	err := db.QueryRow(`
+		SELECT from_parent_drive_id FROM pack_orphans
+		WHERE account = ? AND item_drive_id = ?`, account, itemDriveID).Scan(&parent)
+	return parent, err
 }
 
 // folderPermissionsFor returns the crawled permission set for the folder with
@@ -640,7 +840,7 @@ func crawlRootDriveID(db *sql.DB) (string, error) {
 }
 
 // updateNodeOwner overwrites the owner fields for the node with the given driveID.
-// Called after restore-locations moves a file back to the authenticated user's Drive.
+// Called after unpack moves a file back to the authenticated user's Drive.
 func updateNodeOwner(db *sql.DB, driveID, email, permissionID, displayName string) error {
 	_, err := db.Exec(
 		`UPDATE nodes SET owner_email = ?, owner_id = ?, owner_display_name = ? WHERE drive_id = ?`,
