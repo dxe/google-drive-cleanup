@@ -40,23 +40,20 @@ parents.`,
 }
 
 var ownersCmd = &cobra.Command{
-	Use:   "owners [parent_folder_id]",
+	Use:   "owners",
 	Short: "Print each owner and how many files (non-folders) they own",
 	Long: `Print each owner and how many files (non-folders) they own, sorted
 descending by count — this drives outreach priority.
 
-With an optional parent_folder_id, counts are limited to that folder and its
+With --folder, counts are limited to that Google Drive folder and its
 descendants (the folder must be one crawled into the database); without it, the
 whole database is counted.`,
-	Args: cobra.MaximumNArgs(1),
+	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dbPath, _ := cmd.Flags().GetString("db")
 		cfgPath, _ := cmd.Flags().GetString("config")
-		var parentID string
-		if len(args) == 1 {
-			parentID = args[0]
-		}
-		return runOwners(dbPath, cfgPath, parentID)
+		folderID, _ := cmd.Flags().GetString("folder")
+		return runOwners(dbPath, cfgPath, folderID)
 	},
 }
 
@@ -94,6 +91,8 @@ func init() {
 	rootCmd.PersistentFlags().String("db", "drive.db", "path to the SQLite database")
 	rootCmd.PersistentFlags().String("config", "config.json", "path to the config JSON")
 	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "log every item touched, not just progress summaries and errors")
+
+	ownersCmd.Flags().String("folder", "", "Google Drive folder ID to scope the report to (must be crawled into the database)")
 
 	rootCmd.AddCommand(initCmd, crawlCmd, ownersCmd, pathCmd, checkEditAccessCmd, exploreCmd, restoreCmd, stashCmd)
 }
