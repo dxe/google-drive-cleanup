@@ -31,23 +31,31 @@ Container are verified empty they are deleted, along with the per-user folder
 if nothing (such as a non-empty Errors folder) remains in it.
 
 This command requires the full Drive scope and, to move items out of the shared
-drive, manager access on it.`,
+drive, manager access on it.
+
+If the user became unavailable and never dragged the Container into the shared
+drive, pass --allow-not-moved to abort the migration: files are restored to
+their original locations straight from the packing folder so they are usable
+again, and pack can be re-run later to retry. Ownership never transferred in
+that case, so the database owner columns are left unchanged.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dbPath, _ := cmd.Flags().GetString("db")
 		cfgPath, _ := cmd.Flags().GetString("config")
 		dryRun, _ := cmd.Flags().GetBool("dry-run")
 		maxErrors, _ := cmd.Flags().GetInt("max-errors")
-		return runUnpack(dbPath, cfgPath, args[0], dryRun, maxErrors)
+		allowNotMoved, _ := cmd.Flags().GetBool("allow-not-moved")
+		return runUnpack(dbPath, cfgPath, args[0], dryRun, maxErrors, allowNotMoved)
 	},
 }
 
 func init() {
 	unpackCmd.Flags().Bool("dry-run", false, "report what would move without changing anything (read-only scope)")
 	unpackCmd.Flags().Int("max-errors", 5, "abort once more than this many items fail to move")
+	unpackCmd.Flags().Bool("allow-not-moved", false, "abort the migration: restore files even if the Container was never dragged into the shared drive (ownership never flipped, so the database owner columns are left unchanged)")
 }
 
-func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int) error {
+func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allowNotMoved bool) error {
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
 		return err
@@ -117,14 +125,25 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int) erro
 	if container.Trashed {
 		return fmt.Errorf("Container %s is trashed", m.containerID)
 	}
-	if container.DriveId == "" {
-		return fmt.Errorf("Container %s is still outside the shared drive — has %s dragged it into %q yet?", m.containerID, account, dropoff.Name)
-	}
-	if container.DriveId != dropoff.DriveId {
-		return fmt.Errorf("Container %s is in shared drive %s, not the dropoff folder's shared drive %s", m.containerID, container.DriveId, dropoff.DriveId)
-	}
-	if container.Capabilities != nil && !container.Capabilities.CanMoveItemOutOfDrive {
-		return fmt.Errorf("%s cannot move items out of shared drive %s; it needs manager access", me.EmailAddress, container.DriveId)
+	// containerInSharedDrive is the normal, post-drag state: ownership of
+	// everything inside has flipped to the org. When the Container is still in
+	// My Drive the drag never happened; --allow-not-moved lets the admin abort
+	// the migration and restore files to their original locations anyway (e.g.
+	// the user became unavailable), so they stay put until a retry. Ownership
+	// never transferred, so those restores must NOT flip the database owner.
+	containerInSharedDrive := container.DriveId != ""
+	if !containerInSharedDrive {
+		if !allowNotMoved {
+			return fmt.Errorf("Container %s is still outside the shared drive — has %s dragged it into %q yet? (pass --allow-not-moved to abort the migration and restore files to their original locations instead)", m.containerID, account, dropoff.Name)
+		}
+		log.Printf("WARN Container %s was never dragged into the shared drive; --allow-not-moved set: aborting the migration and restoring files to their original locations. Ownership did not transfer to the org, so files keep their current owners and the database owner columns are left unchanged.", m.containerID)
+	} else {
+		if container.DriveId != dropoff.DriveId {
+			return fmt.Errorf("Container %s is in shared drive %s, but not the dropoff folder's shared drive %s", m.containerID, container.DriveId, dropoff.DriveId)
+		}
+		if container.Capabilities != nil && !container.Capabilities.CanMoveItemOutOfDrive {
+			return fmt.Errorf("%s cannot move items out of shared drive %s; it needs manager access", me.EmailAddress, container.DriveId)
+		}
 	}
 
 	stashF, err := svc.Files.Get(m.stashID).
@@ -138,10 +157,17 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int) erro
 		return fmt.Errorf("Stash %s is not a My-Drive folder anymore; refusing to continue", m.stashID)
 	}
 
+	// After the drag the org owns everything, so restored items end up owned by
+	// the running account. When aborting an un-dragged migration, ownership is
+	// untouched and items return to their original owners.
+	ownership := fmt.Sprintf("owned by: %s", me.EmailAddress)
+	if !containerInSharedDrive {
+		ownership = "left with their current owners (migration aborted; nothing was dragged)"
+	}
 	if dryRun {
-		fmt.Fprintf(os.Stderr, "DRY RUN: no files will be moved. Restored files would be owned by: %s.\n", me.EmailAddress)
+		fmt.Fprintf(os.Stderr, "DRY RUN: no files will be moved. Restored files would be %s.\n", ownership)
 	} else {
-		fmt.Fprintf(os.Stderr, "Restored files will be owned by: %s.\n", me.EmailAddress)
+		fmt.Fprintf(os.Stderr, "Restored files will be %s.\n", ownership)
 		if !promptYesNo("Continue? [y/N] ") {
 			fmt.Fprintln(os.Stderr, "Aborted.")
 			return nil
@@ -282,7 +308,7 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int) erro
 	// The Container must be restored before the Stash: Stash items are owned by
 	// third parties, and a shared drive cannot hold those, so their destination
 	// folders have to be back in the regular tree first.
-	if err := restoreChildren(container, "Container", true); err != nil {
+	if err := restoreChildren(container, "Container", containerInSharedDrive); err != nil {
 		return err
 	}
 	if err := restoreChildren(stashF, "Stash", false); err != nil {

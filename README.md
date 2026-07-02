@@ -147,6 +147,10 @@ drive-cleanup pack someone@gmail.com
 # After the user drags their Container into the Dropoff folder: move
 # everything back to its original location and clean up
 drive-cleanup unpack someone@gmail.com
+
+# Abort a migration the user never completed the drag for: restore files to
+# their original locations from the packing folder, ownership unchanged
+drive-cleanup unpack someone@gmail.com --allow-not-moved
 ```
 
 The two commands that move files — `pack` and `unpack` — accept `--dry-run`,
@@ -260,6 +264,17 @@ drive), then:
    Container, and the per-user folder are deleted. Anything left over — a
    non-empty Errors folder, or items that failed to move — is reported and
    left in place.
+
+**Aborting a stuck migration (`--allow-not-moved`).** Normally `unpack` refuses
+to run until the Container is confirmed inside the dropoff folder's shared
+drive. If the user becomes unavailable and never performs the drag, pass
+`--allow-not-moved` to abort the migration instead: `unpack` restores every item
+to its original location straight from the packing folder, so the user's files
+are usable again in place until they can retry. Because nothing was dragged,
+ownership never flipped to the org, so restored items keep their current owners
+and the database owner columns are left unchanged (the normal post-drag path
+records the org account as the new owner). Cleanup runs as usual, and re-running
+`pack` later starts a fresh cycle.
 
 ### Order of operations (per user)
 
