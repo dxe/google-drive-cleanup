@@ -18,10 +18,16 @@ import (
 // must own the Container to drag it into the shared drive. The CLI creates
 // everything else.
 const (
-	containerFolderName = "Container"
-	stashFolderName     = "Stash"
-	errorsFolderName    = "Errors"
+	stashFolderName  = "Stash"
+	errorsFolderName = "Errors"
 )
+
+// containerFolderName is the required name of a user's Container folder. It is
+// scoped by account so multiple users' Containers are distinguishable once
+// dragged into the same shared drive.
+func containerFolderName(account string) string {
+	return account + "-Container"
+}
 
 var packCmd = &cobra.Command{
 	Use:   "pack <user>",
@@ -220,16 +226,16 @@ func runPack(dbPath, cfgPath, account string, dryRun bool, maxErrors int) error 
 				return fmt.Errorf("creating the Stash folder: %w", err)
 			}
 		}
-		containerF, err = findChildFolder(ctx, svc, limiter, userFolder.Id, containerFolderName)
+		containerF, err = findChildFolder(ctx, svc, limiter, userFolder.Id, containerFolderName(account))
 		if err != nil {
 			return fmt.Errorf("looking up the Container folder: %w", err)
 		}
 	}
 	containerInstructions := fmt.Sprintf(
 		"create a folder named %q inside %s/%s with the admin's PERSONAL Gmail account (only personal accounts can transfer ownership to other personal accounts; the packing folder must be shared with that account as editor), then re-run pack",
-		containerFolderName, packing.Name, account)
+		containerFolderName(account), packing.Name, account)
 	if containerF == nil && !dryRun {
-		return fmt.Errorf("no %q folder yet: %s", containerFolderName, containerInstructions)
+		return fmt.Errorf("no %q folder yet: %s", containerFolderName(account), containerInstructions)
 	}
 
 	if !dryRun {
@@ -260,7 +266,7 @@ func runPack(dbPath, cfgPath, account string, dryRun bool, maxErrors int) error 
 		fmt.Fprintf(os.Stderr, "DRY RUN: no changes will be made. Would pack %d item(s) owned by %q (%d owned subtree root(s)).\n", len(owned), account, len(roots))
 	} else {
 		fmt.Fprintf(os.Stderr, "About to pack %d item(s) owned by %q (%d owned subtree root(s)) into %s/%s/%s.\n",
-			len(owned), account, len(roots), packing.Name, account, containerFolderName)
+			len(owned), account, len(roots), packing.Name, account, containerFolderName(account))
 		if !promptYesNo("Continue? [y/N] ") {
 			fmt.Fprintln(os.Stderr, "Aborted.")
 			return nil

@@ -193,10 +193,15 @@ Inside the packing folder, each user gets:
 
 ```
 Packing/
-  someone@gmail.com/     created by pack, org-owned
-    Container/           created MANUALLY by the admin's personal Gmail
-    Stash/               created by pack, org-owned
+  someone@gmail.com/                     created by pack, org-owned
+    someone@gmail.com-Container/         created MANUALLY by the admin's personal Gmail
+    Stash/                               created by pack, org-owned
 ```
+
+The Container must be named exactly `<user>-Container` (e.g.
+`someone@gmail.com-Container`) — `pack` looks it up by that name and refuses to
+proceed until it exists. Scoping the name by account keeps each user's Container
+distinguishable once several have been dragged into the same shared drive.
 
 **Why the Container is created manually:** the user must *own* the Container
 to drag it into the shared drive, and Google only allows ownership transfers
