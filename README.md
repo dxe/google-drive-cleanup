@@ -25,11 +25,11 @@ Then, per user being migrated:
 
 ```
                (1) pack                            (3) user drags Container
-  original  ─────────────▶  Packing/<user>/  ───────────────────────────▶  Dropoff/<user>-Dropoff
-  locations                  ├─ Container         (2) admin transfers       (shared-drive subfolder;
-      ▲                      │   owned subtrees,      Container ownership    user has Content manager
-      │                      │   moved intact         to the user first      access; ownership of
-      │                      └─ Stash                 (Drive UI)             everything inside flips to org)
+  original  ─────────────▶  Packing/<user>/  ───────────────────────────▶  Dropoff (shared drive)
+  locations                  ├─ Container         (2) admin transfers       (user is granted Manager
+      ▲                      │   owned subtrees,      Container ownership    access; ownership of
+      │                      │   moved intact         to the user first      everything inside flips
+      │                      └─ Stash                 (Drive UI)             to the org)
       │                          third-party items,                               │
       │                          flat                                             │
       │                             │                                             │
@@ -97,7 +97,7 @@ can add settings without colliding:
   },
   "migration": {
     "packing-folder": { "id": "1PaCkInG...", "name": "Packing" },
-    "dropoff-folder": { "id": "1DrOpOfF...", "name": "Dropoff" }
+    "dropoff-folder": { "id": "0ADrOpOfF...", "name": "Dropoff" }
   }
 }
 ```
@@ -186,13 +186,12 @@ The two folders in the `migration` config section frame the round trip:
   cannot hold) and must **not** be inside the crawl root (a re-crawl would
   ingest mid-migration scaffolding). Share it, as editor, with the admin's
   personal Gmail account — see below.
-- **Dropoff** (`migration.dropoff-folder`) — the shared-drive folder the user
-  drags their Container into. The drag is what transfers ownership to the org.
-  `pack` creates a per-user `<user>-Dropoff` subfolder inside it and grants the
-  migrating user **Content manager** access on that subfolder, so they can move
-  (drag) their Container in; the user drags into `<user>-Dropoff`, not the
-  top-level Dropoff folder. Per-user so several users' Containers stay separable
-  in the shared drive.
+- **Dropoff** (`migration.dropoff-folder`) — the shared drive the user drags
+  their Container into. Point this at the shared drive itself (its ID, which
+  begins `0A…`), not a folder inside it. The drag is what transfers ownership to
+  the org. `pack` grants the migrating user **Manager** access on the shared
+  drive so they can move (drag) their Container in; `unpack` revokes it once the
+  round trip is done.
 
 Inside the packing folder, each user gets:
 
@@ -261,23 +260,24 @@ owned item whose owned parent lies *outside* it still moves — and both the
 edit-access pre-check and the dry-run sweep preview are limited to that subtree.
 The confirmation message shows the subfolder's path relative to the crawl root.
 
-Before scaffolding the pack, `pack` also ensures the user's `<user>-Dropoff`
-subfolder exists inside the shared-drive dropoff folder and grants the migrating
-user **Content manager** access on it (idempotent — a re-run does not re-notify
-them). This needs the user's email; an owner-id-only account is warned about and
-must be granted access manually.
+Before scaffolding the pack, `pack` also grants the migrating user **Manager**
+access on the dropoff folder (the shared drive) so they can drag their Container
+in (idempotent — a re-run does not re-notify them). This needs the user's email;
+an owner-id-only account is warned about and must be granted access manually.
+
+Note Manager access is required to move folders into a Shared Drive.
+"Content manager" access only allows creating files, not folders.
 
 `pack` ends by printing the manual steps: transfer Container ownership to the
-user (invite + accept), then have them drag the Container into their
-`<user>-Dropoff` subfolder — one drag, and the org owns everything inside.
+user (invite + accept), then have them drag the Container into the Dropoff
+folder — one drag, and the org owns everything inside.
 
 ### `unpack <user>`
 
 `unpack` finishes the migration after the drag. It looks for the Container in
-the user's `<user>-Dropoff` subfolder (falling back to the top-level dropoff
-folder) and verifies it now lives in the Dropoff folder's shared drive (and that
-the running account can move items back *out* of it — that needs **manager**
-access on the shared drive), then:
+the dropoff folder and verifies it now lives in that shared drive (and that the
+running account can move items back *out* of it — that needs **manager** access
+on the shared drive), then:
 
 1. **Restores the Container's contents.** Each direct child moves back to the
    original parent recorded in `drive.db`; owned items nested deeper ride
@@ -298,12 +298,12 @@ access on the shared drive), then:
    where it belongs — from `pack_orphans` for never-crawled items, `unknown`
    when even that is missing) instead of blocking cleanup.
 4. **Cleans up.** Once live listings confirm they are empty, the Stash, the
-   Container, the per-user packing subfolder, and the per-user dropoff subfolder
-   in the shared drive are deleted. The Container, the packing subfolder, and the
-   dropoff subfolder are only deleted when the Container was dragged into the
-   shared drive (a `--allow-not-moved` abort leaves them in place). Anything
-   left over — a non-empty Errors folder, or items that failed to move — is
-   reported and left in place.
+   Container, and the per-user packing folder are deleted, and the **Manager**
+   access `pack` granted the user on the dropoff folder is revoked. The Container
+   is only deleted, and the access only revoked, when the Container was dragged
+   into the shared drive (a `--allow-not-moved` abort leaves them in place).
+   Anything left over — a non-empty Errors folder, or items that failed to move
+   — is reported and left in place.
 
 **Aborting a stuck migration (`--allow-not-moved`).** Normally `unpack` refuses
 to run until the Container is confirmed inside the dropoff folder's shared
@@ -326,8 +326,8 @@ records the org account as the new owner). Cleanup runs as usual, and re-running
    Container; create it with the admin's personal Gmail and re-run.
 4. **Transfer Container ownership** to the user's personal account (Drive UI;
    the user must accept the invite).
-5. **User drags the Container into their `<user>-Dropoff` subfolder** (inside
-   the Dropoff folder, where `pack` gave them Content manager access) — one drag.
+5. **User drags the Container into the Dropoff folder** (the shared drive, where
+   `pack` gave them Manager access) — one drag.
 6. **`drive-cleanup unpack <user>`** — restore everything and clean up.
 
 The crawl and pack are meant to run with the user on standby, with unpack

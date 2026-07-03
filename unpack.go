@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/time/rate"
@@ -19,8 +20,9 @@ dropoff folder (which flips ownership of everything inside to the org).
 
 The Container is located live as the child named <user>-Container, not by the
 ID recorded at pack time, in case it is manually re-created by the admin.
-Normally it is found in the dropoff folder; with --allow-not-moved it is found
-in the per-user packing folder instead (where it still sits, un-dragged).
+Normally it is found in the dropoff folder (the shared drive); with
+--allow-not-moved it is found in the per-user packing folder instead (where it
+still sits, un-dragged).
 If what is found differs from the recorded ID, unpack asks for confirmation
 before proceeding. If no such folder is found in the expected place, unpack
 errors out (the Container is in the wrong location or missing) rather than
@@ -37,8 +39,8 @@ Items that cannot be placed — not in the database, or their original parent is
 gone — are quarantined under <packing-folder>/<user>/Errors/<original parent
 id>/ for manual restore instead of blocking cleanup. Once the Stash and
 Container are verified empty they are deleted, along with the per-user folder
-if nothing (such as a non-empty Errors folder) remains in it, and the per-user
-dropoff subfolder in the shared drive if it too is now empty.
+if nothing (such as a non-empty Errors folder) remains in it. The Manager
+access pack granted the user on the dropoff folder is then revoked.
 
 This command requires the full Drive scope and, to move items out of the shared
 drive, manager access on it.
@@ -148,27 +150,12 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 		return found.Id, true
 	}
 
-	// After the user drags it in, the Container is a direct child of their
-	// dropoff subfolder <account>-Dropoff (pack grants them Content manager
-	// access there). Look there first, then fall back to the top-level dropoff
-	// folder in case it was dragged directly in.
+	// After the user drags it in, the Container is a direct child of the dropoff
+	// folder (the shared drive), so look it up there.
 	containerID := m.containerID
-	var dropoffChild *drive.File
-	userDropoff, err := findChildFolder(ctx, svc, limiter, dropoff.Id, dropoffFolderName(account))
+	dropoffChild, err := findChildFolder(ctx, svc, limiter, dropoff.Id, containerFolderName(account))
 	if err != nil {
-		return fmt.Errorf("looking for the dropoff subfolder %q: %w", dropoffFolderName(account), err)
-	}
-	if userDropoff != nil {
-		dropoffChild, err = findChildFolder(ctx, svc, limiter, userDropoff.Id, containerFolderName(account))
-		if err != nil {
-			return fmt.Errorf("looking for the Container in the dropoff subfolder %s: %w", userDropoff.Id, err)
-		}
-	}
-	if dropoffChild == nil {
-		dropoffChild, err = findChildFolder(ctx, svc, limiter, dropoff.Id, containerFolderName(account))
-		if err != nil {
-			return fmt.Errorf("looking for the Container in the dropoff folder %s: %w", dropoff.Id, err)
-		}
+		return fmt.Errorf("looking for the Container in the dropoff folder %s: %w", dropoff.Id, err)
 	}
 	switch {
 	case dropoffChild != nil:
@@ -416,7 +403,7 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 	// Cleanup: delete the scaffolding only once live listings confirm it is
 	// genuinely empty, so nothing that failed to move is silently lost.
 	if dryRun {
-		log.Printf("NOTE cleanup (deleting the emptied Stash, Container, and per-user folder) is skipped in a dry run")
+		log.Printf("NOTE cleanup (deleting the emptied Stash, Container, and per-user folder, and revoking the user's dropoff access) is skipped in a dry run")
 	} else {
 		deleteIfEmpty := func(f *drive.File, label string) error {
 			remaining, err := listChildren(ctx, svc, limiter, f.Id, "nextPageToken, files(id)")
@@ -443,14 +430,20 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 			if err := deleteIfEmpty(container, "Container"); err != nil {
 				return err
 			}
-			// Delete the per-user dropoff subfolder in the shared drive
-			// once the Container's contents have been restored out of it.
-			// Only do so when the drag actually happened, otherwise leave it
-			// for future reuse.
-			if userDropoff != nil {
-				if err := deleteIfEmpty(userDropoff, fmt.Sprintf("dropoff subfolder %q", userDropoff.Name)); err != nil {
-					return err
+			// Revoke the Manager access pack granted the user on the dropoff
+			// folder (the shared drive): the round trip is done, so they no
+			// longer need it. Only when the drag actually happened — an aborted
+			// migration will be retried, and pack re-grants. Needs their email;
+			// an owner-id-only account must be revoked manually.
+			if !strings.Contains(account, "@") {
+				log.Printf("WARN %q is not an email address; cannot revoke dropoff access automatically — remove its access on %q manually", account, dropoff.Name)
+			} else if perm, err := findUserPermission(ctx, svc, limiter, dropoff.Id, account); err != nil {
+				return fmt.Errorf("checking dropoff access for %s: %w", account, err)
+			} else if perm != nil {
+				if err := revokePermission(ctx, svc, limiter, dropoff.Id, perm.Id); err != nil {
+					return fmt.Errorf("revoking %s access on the dropoff folder: %w", account, err)
 				}
+				log.Printf("revoked %s access on the dropoff folder %q", account, dropoff.Name)
 			}
 		}
 		// The per-user folder goes too, unless something remains in it — e.g. a

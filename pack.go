@@ -20,10 +20,10 @@ import (
 const (
 	stashFolderName  = "Stash"
 	errorsFolderName = "Errors"
-	// dropoffRole is the shared-drive role granted to the migrating user on
-	// their dropoff subfolder. "fileOrganizer" is "Content manager" in the
-	// Drive UI — enough to move (drag) their Container into the folder.
-	dropoffRole = "fileOrganizer"
+	// dropoffRole is the shared-drive role granted to the migrating user on the
+	// dropoff folder. "organizer" is "Manager" in the Drive UI — enough to move
+	// (drag) their Container into the shared drive. unpack revokes it afterward.
+	dropoffRole = "organizer"
 )
 
 // containerFolderName is the required name of a user's Container folder. It is
@@ -31,14 +31,6 @@ const (
 // dragged into the same shared drive.
 func containerFolderName(account string) string {
 	return account + "-Container"
-}
-
-// dropoffFolderName is the name of a user's per-user subfolder inside the
-// shared-drive dropoff folder. pack creates it and grants the user Content
-// manager access; the user drags their Container into it. Scoped by account so
-// several users' Containers stay separable in the shared drive.
-func dropoffFolderName(account string) string {
-	return account + "-Dropoff"
 }
 
 var packCmd = &cobra.Command{
@@ -319,44 +311,29 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 		}
 	}
 
-	// Resolve (or create) the user's dropoff subfolder <account>-Dropoff inside
-	// the shared-drive dropoff folder, and grant the migrating user Content
-	// manager access on it so they can move (drag) their Container in. This is
-	// independent of the per-user packing scaffolding above, so it is set up on
-	// the first run too — before the run stops to ask for the Container.
-	// Find-before-create keeps re-runs safe.
-	userDropoff, err := findChildFolder(ctx, svc, limiter, dropoff.Id, dropoffFolderName(account))
-	if err != nil {
-		return fmt.Errorf("looking up the dropoff subfolder: %w", err)
-	}
-	if userDropoff == nil {
-		if dryRun {
-			log.Printf("WOULD create dropoff subfolder %q under %q", dropoffFolderName(account), dropoff.Name)
-		} else if userDropoff, err = createFolder(ctx, svc, limiter, dropoff.Id, dropoffFolderName(account)); err != nil {
-			return fmt.Errorf("creating the dropoff subfolder: %w", err)
-		}
-	}
-	// Grant Content manager (fileOrganizer) access to the migrating user. This
-	// needs their email; an owner-id-only account must be granted access
+	// Grant the migrating user Manager (organizer) access on the dropoff folder
+	// — the shared drive itself — so they can move (drag) their Container in.
+	// This needs their email; an owner-id-only account must be granted access
 	// manually. The grant is idempotent — skip it when they already have a role
-	// so a re-run does not re-notify them.
+	// so a re-run does not re-notify them. unpack revokes it once the round trip
+	// is done.
 	switch {
 	case !strings.Contains(account, "@"):
-		log.Printf("WARN %q is not an email address; cannot grant dropoff access automatically — grant it Content manager access on %q manually", account, dropoffFolderName(account))
+		log.Printf("WARN %q is not an email address; cannot grant dropoff access automatically — grant it Manager access on %q manually", account, dropoff.Name)
 	case dryRun:
-		log.Printf("WOULD grant %q Content manager access on the dropoff subfolder %q", account, dropoffFolderName(account))
+		log.Printf("WOULD grant %q Manager access on the dropoff folder %q", account, dropoff.Name)
 	default:
-		existing, err := findUserPermission(ctx, svc, limiter, userDropoff.Id, account)
+		existing, err := findUserPermission(ctx, svc, limiter, dropoff.Id, account)
 		if err != nil {
-			return fmt.Errorf("checking dropoff subfolder access for %s: %w", account, err)
+			return fmt.Errorf("checking dropoff access for %s: %w", account, err)
 		}
 		if existing == nil {
-			if err := grantPermission(ctx, svc, limiter, userDropoff.Id, account, dropoffRole); err != nil {
-				return fmt.Errorf("granting %s Content manager access on the dropoff subfolder: %w", account, err)
+			if err := grantPermission(ctx, svc, limiter, dropoff.Id, account, dropoffRole); err != nil {
+				return fmt.Errorf("granting %s Manager access on the dropoff folder: %w", account, err)
 			}
-			fmt.Fprintf(os.Stderr, "Granted %s Content manager access on %s/%s.\n", account, dropoff.Name, dropoffFolderName(account))
+			fmt.Fprintf(os.Stderr, "Granted %s Manager access on %s.\n", account, dropoff.Name)
 		} else {
-			fmt.Fprintf(os.Stderr, "Dropoff access: %s already has %q on %s/%s.\n", account, existing.Role, dropoff.Name, dropoffFolderName(account))
+			fmt.Fprintf(os.Stderr, "Dropoff access: %s already has %q on %s.\n", account, existing.Role, dropoff.Name)
 		}
 	}
 
@@ -628,9 +605,9 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 		}
 		fmt.Fprintf(os.Stderr, `Pack complete. Next steps:
   1. Transfer ownership of the Container to %[1]s via the Drive UI (invite + accept).
-  2. Ask %[1]s to drag the Container into the %[2]q/%[3]q folder, where they now have Content manager access (one drag; this flips ownership of everything inside to the org).
+  2. Ask %[1]s to drag the Container into the %[2]q folder, where they now have Manager access (one drag; this flips ownership of everything inside to the org).
   3. Run: drive-cleanup unpack %[1]s
-`, account, dropoff.Name, dropoffFolderName(account))
+`, account, dropoff.Name)
 	}
 	return nil
 }

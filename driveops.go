@@ -52,8 +52,22 @@ func getConfiguredFolder(ctx context.Context, svc *drive.Service, rc rootConfig,
 	if f.MimeType != folderMimeType {
 		return nil, fmt.Errorf("%s folder %s is not a folder (mimeType %q)", section, rc.ID, f.MimeType)
 	}
-	if f.Name != rc.Name {
-		return nil, fmt.Errorf("%s folder name mismatch: config says %q, Drive says %q", section, rc.Name, f.Name)
+	// The name verified against the config is normally the folder's own name.
+	// But the root folder of a shared drive (id == driveId) is generically named
+	// "Drive"; its meaningful name lives on the Drive resource. Look that up and
+	// verify — and adopt — the shared drive's name, so callers that print f.Name
+	// show the drive's real name rather than "Drive".
+	name := f.Name
+	if f.DriveId != "" && f.Id == f.DriveId {
+		d, err := svc.Drives.Get(f.DriveId).Context(ctx).Do()
+		if err != nil {
+			return nil, fmt.Errorf("fetching shared drive %s for %s: %w", f.DriveId, section, err)
+		}
+		name = d.Name
+		f.Name = d.Name
+	}
+	if name != rc.Name {
+		return nil, fmt.Errorf("%s folder name mismatch: config says %q, Drive says %q", section, rc.Name, name)
 	}
 	return f, nil
 }
@@ -193,8 +207,8 @@ func findUserPermission(ctx context.Context, svc *drive.Service, limiter *rate.L
 }
 
 // grantPermission grants email the given role on fileID. role uses the Drive
-// API name — "fileOrganizer" is "Content manager" in the Drive UI. A
-// notification email is sent so the user gets a link to the folder.
+// API name — "organizer" is "Manager" in the Drive UI. A notification email is
+// sent so the user gets a link to the folder.
 func grantPermission(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, fileID, email, role string) error {
 	if err := limiter.Wait(ctx); err != nil {
 		return err
@@ -205,6 +219,15 @@ func grantPermission(ctx context.Context, svc *drive.Service, limiter *rate.Limi
 		EmailAddress: email,
 	}).SupportsAllDrives(true).SendNotificationEmail(true).Context(ctx).Do()
 	return err
+}
+
+// revokePermission removes the permission with permissionID from fileID. Used
+// by unpack to drop the migrating user's access once the round trip is done.
+func revokePermission(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, fileID, permissionID string) error {
+	if err := limiter.Wait(ctx); err != nil {
+		return err
+	}
+	return svc.Permissions.Delete(fileID, permissionID).SupportsAllDrives(true).Context(ctx).Do()
 }
 
 func deleteFile(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, fileID string) error {
