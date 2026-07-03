@@ -405,9 +405,8 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 	if dryRun {
 		log.Printf("NOTE cleanup (deleting the emptied Stash, Container, and per-user folder, and revoking the user's dropoff access) is skipped in a dry run")
 	} else {
-		// deleteIfEmpty removes f only when a live listing confirms it is empty,
-		// and reports whether it actually deleted it.
-		deleteIfEmpty := func(f *drive.File, label string) (bool, error) {
+		// isEmpty reports whether a live listing shows f has no remaining children.
+		isEmpty := func(f *drive.File, label string) (bool, error) {
 			remaining, err := listChildren(ctx, svc, limiter, f.Id, "nextPageToken, files(id)")
 			if err != nil {
 				return false, fmt.Errorf("re-checking %s contents: %w", label, err)
@@ -416,50 +415,74 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 				log.Printf("WARN %s still has %d item(s); leaving it in place", label, len(remaining))
 				return false, nil
 			}
-			if err := deleteFile(ctx, svc, limiter, f.Id); err != nil {
-				return false, fmt.Errorf("deleting empty %s: %w", label, err)
-			}
-			log.Printf("deleted empty %s", label)
 			return true, nil
 		}
-		stashEmptied, err := deleteIfEmpty(stashF, "Stash")
-		if err != nil {
-			return err
+		del := func(f *drive.File, label string) error {
+			if err := deleteFile(ctx, svc, limiter, f.Id); err != nil {
+				return fmt.Errorf("deleting empty %s: %w", label, err)
+			}
+			log.Printf("deleted empty %s", label)
+			return nil
 		}
-		// Only tear down the Container (and finalize the migration) if it was
-		// dragged into the shared drive (so we own it) AND the Stash emptied. If
-		// un-stashing left items behind, unpack must be re-run to finish restoring
-		// them — and that re-run re-locates the Container by name in the dropoff
-		// folder, erroring out if it is gone. So leave the Container (and the
-		// user's dropoff access, and the per-user folder) in place until the Stash
-		// is fully restored. When the migration was aborted, the Container is still
-		// in the user's My Drive and owned by them — leave it untouched.
-		switch {
-		case containerInSharedDrive && !stashEmptied:
-			log.Printf("WARN Stash was not fully restored; leaving the Container %s in place", container.Id)
-		case containerInSharedDrive:
-			if _, err := deleteIfEmpty(container, "Container"); err != nil {
+		deleteIfEmpty := func(f *drive.File, label string) error {
+			ok, err := isEmpty(f, label)
+			if err != nil || !ok {
 				return err
 			}
-			// Revoke the Manager access pack granted the user on the dropoff
-			// folder (the shared drive): the round trip is done, so they no
-			// longer need it. Only when the drag actually happened — an aborted
-			// migration will be retried, and pack re-grants. Needs their email;
-			// an owner-id-only account must be revoked manually.
-			if !strings.Contains(account, "@") {
-				log.Printf("WARN %q is not an email address; cannot revoke dropoff access automatically — remove its access on %q manually", account, dropoff.Name)
-			} else if perm, err := findUserPermission(ctx, svc, limiter, dropoff.Id, account); err != nil {
-				return fmt.Errorf("checking dropoff access for %s: %w", account, err)
-			} else if perm != nil {
-				if err := revokePermission(ctx, svc, limiter, dropoff.Id, perm.Id); err != nil {
-					return fmt.Errorf("revoking %s access on the dropoff folder: %w", account, err)
+			return del(f, label)
+		}
+
+		if !containerInSharedDrive {
+			// Migration aborted (--allow-not-moved): the Container stays in the
+			// user's My Drive, owned by them, for a later re-pack; only the emptied
+			// Stash is cleaned up here.
+			if err := deleteIfEmpty(stashF, "Stash"); err != nil {
+				return err
+			}
+		} else {
+			// Post-drag cleanup is all-or-nothing: delete the Stash and Container,
+			// revoke the user's dropoff access, and delete the per-user folder only
+			// once BOTH the Container and the Stash are confirmed empty. If either
+			// still has items — a restore error left some behind — the migration is
+			// unfinished and must be re-run, and that re-run needs the Container
+			// and the Stash to still exist. So leave all the scaffolding, and the
+			// user's access, in place until both are clear.
+			containerEmpty, err := isEmpty(container, "Container")
+			if err != nil {
+				return err
+			}
+			stashEmpty, err := isEmpty(stashF, "Stash")
+			if err != nil {
+				return err
+			}
+			if !containerEmpty || !stashEmpty {
+				log.Printf("WARN migration for %s is unfinished; leaving the Container, Stash, per-user folder, and the user's dropoff access in place — re-run unpack to finish", account)
+			} else {
+				if err := del(stashF, "Stash"); err != nil {
+					return err
 				}
-				log.Printf("revoked %s access on the dropoff folder %q", account, dropoff.Name)
-			}
-			// The per-user folder goes too, unless something remains in it — e.g. a
-			// non-empty Errors folder.
-			if _, err := deleteIfEmpty(&drive.File{Id: m.userFolderID}, fmt.Sprintf("per-user folder for %s", account)); err != nil {
-				return err
+				if err := del(container, "Container"); err != nil {
+					return err
+				}
+				// Revoke the Manager access pack granted the user on the dropoff
+				// folder (the shared drive): the round trip is done, so they no
+				// longer need it. Needs their email; an owner-id-only account must be
+				// revoked manually.
+				if !strings.Contains(account, "@") {
+					log.Printf("WARN %q is not an email address; cannot revoke dropoff access automatically — remove its access on %q manually", account, dropoff.Name)
+				} else if perm, err := findUserPermission(ctx, svc, limiter, dropoff.Id, account); err != nil {
+					return fmt.Errorf("checking dropoff access for %s: %w", account, err)
+				} else if perm != nil {
+					if err := revokePermission(ctx, svc, limiter, dropoff.Id, perm.Id); err != nil {
+						return fmt.Errorf("revoking %s access on the dropoff folder: %w", account, err)
+					}
+					log.Printf("revoked %s access on the dropoff folder %q", account, dropoff.Name)
+				}
+				// The per-user folder goes too, unless something remains in it — e.g.
+				// a non-empty Errors folder.
+				if err := deleteIfEmpty(&drive.File{Id: m.userFolderID}, fmt.Sprintf("per-user folder for %s", account)); err != nil {
+					return err
+				}
 			}
 		}
 	}
