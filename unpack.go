@@ -147,12 +147,27 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 		return found.Id, true
 	}
 
-	// After the user drags it in, the Container is a direct child of the dropoff
-	// folder, so look it up there first.
+	// After the user drags it in, the Container is a direct child of their
+	// dropoff subfolder <account>-Dropoff (pack grants them Content manager
+	// access there). Look there first, then fall back to the top-level dropoff
+	// folder in case it was dragged directly in.
 	containerID := m.containerID
-	dropoffChild, err := findChildFolder(ctx, svc, limiter, dropoff.Id, containerFolderName(account))
+	var dropoffChild *drive.File
+	userDropoff, err := findChildFolder(ctx, svc, limiter, dropoff.Id, dropoffFolderName(account))
 	if err != nil {
-		return fmt.Errorf("looking for the Container in the dropoff folder %s: %w", dropoff.Id, err)
+		return fmt.Errorf("looking for the dropoff subfolder %q: %w", dropoffFolderName(account), err)
+	}
+	if userDropoff != nil {
+		dropoffChild, err = findChildFolder(ctx, svc, limiter, userDropoff.Id, containerFolderName(account))
+		if err != nil {
+			return fmt.Errorf("looking for the Container in the dropoff subfolder %s: %w", userDropoff.Id, err)
+		}
+	}
+	if dropoffChild == nil {
+		dropoffChild, err = findChildFolder(ctx, svc, limiter, dropoff.Id, containerFolderName(account))
+		if err != nil {
+			return fmt.Errorf("looking for the Container in the dropoff folder %s: %w", dropoff.Id, err)
+		}
 	}
 	switch {
 	case dropoffChild != nil:

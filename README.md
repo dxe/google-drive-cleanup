@@ -25,11 +25,11 @@ Then, per user being migrated:
 
 ```
                (1) pack                            (3) user drags Container
-  original  ─────────────▶  Packing/<user>/  ───────────────────────────▶  Dropoff folder
-  locations                  ├─ Container         (2) admin transfers       (shared drive:
-      ▲                      │   owned subtrees,      Container ownership    ownership of
-      │                      │   moved intact         to the user first      everything inside
-      │                      └─ Stash                 (Drive UI)             flips to the org)
+  original  ─────────────▶  Packing/<user>/  ───────────────────────────▶  Dropoff/<user>-Dropoff
+  locations                  ├─ Container         (2) admin transfers       (shared-drive subfolder;
+      ▲                      │   owned subtrees,      Container ownership    user has Content manager
+      │                      │   moved intact         to the user first      access; ownership of
+      │                      └─ Stash                 (Drive UI)             everything inside flips to org)
       │                          third-party items,                               │
       │                          flat                                             │
       │                             │                                             │
@@ -188,6 +188,11 @@ The two folders in the `migration` config section frame the round trip:
   personal Gmail account — see below.
 - **Dropoff** (`migration.dropoff-folder`) — the shared-drive folder the user
   drags their Container into. The drag is what transfers ownership to the org.
+  `pack` creates a per-user `<user>-Dropoff` subfolder inside it and grants the
+  migrating user **Content manager** access on that subfolder, so they can move
+  (drag) their Container in; the user drags into `<user>-Dropoff`, not the
+  top-level Dropoff folder. Per-user so several users' Containers stay separable
+  in the shared drive.
 
 Inside the packing folder, each user gets:
 
@@ -256,16 +261,23 @@ owned item whose owned parent lies *outside* it still moves — and both the
 edit-access pre-check and the dry-run sweep preview are limited to that subtree.
 The confirmation message shows the subfolder's path relative to the crawl root.
 
+Before scaffolding the pack, `pack` also ensures the user's `<user>-Dropoff`
+subfolder exists inside the shared-drive dropoff folder and grants the migrating
+user **Content manager** access on it (idempotent — a re-run does not re-notify
+them). This needs the user's email; an owner-id-only account is warned about and
+must be granted access manually.
+
 `pack` ends by printing the manual steps: transfer Container ownership to the
-user (invite + accept), then have them drag the Container into the Dropoff
-folder — one drag, and the org owns everything inside.
+user (invite + accept), then have them drag the Container into their
+`<user>-Dropoff` subfolder — one drag, and the org owns everything inside.
 
 ### `unpack <user>`
 
-`unpack` finishes the migration after the drag. It verifies the Container now
-lives in the Dropoff folder's shared drive (and that the running account can
-move items back *out* of it — that needs **manager** access on the shared
-drive), then:
+`unpack` finishes the migration after the drag. It looks for the Container in
+the user's `<user>-Dropoff` subfolder (falling back to the top-level dropoff
+folder) and verifies it now lives in the Dropoff folder's shared drive (and that
+the running account can move items back *out* of it — that needs **manager**
+access on the shared drive), then:
 
 1. **Restores the Container's contents.** Each direct child moves back to the
    original parent recorded in `drive.db`; owned items nested deeper ride
@@ -311,7 +323,8 @@ records the org account as the new owner). Cleanup runs as usual, and re-running
    Container; create it with the admin's personal Gmail and re-run.
 4. **Transfer Container ownership** to the user's personal account (Drive UI;
    the user must accept the invite).
-5. **User drags the Container into the Dropoff folder** — one drag.
+5. **User drags the Container into their `<user>-Dropoff` subfolder** (inside
+   the Dropoff folder, where `pack` gave them Content manager access) — one drag.
 6. **`drive-cleanup unpack <user>`** — restore everything and clean up.
 
 The crawl and pack are meant to run with the user on standby, with unpack

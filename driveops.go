@@ -159,6 +159,54 @@ func moveFile(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, fi
 	return err
 }
 
+// findUserPermission returns email's existing permission on fileID
+// (case-insensitive), or nil if none. Used to make granting idempotent so a
+// re-run does not re-notify the user.
+func findUserPermission(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, fileID, email string) (*drive.Permission, error) {
+	pageToken := ""
+	for {
+		if err := limiter.Wait(ctx); err != nil {
+			return nil, err
+		}
+		call := svc.Permissions.List(fileID).
+			Fields("nextPageToken, permissions(id, type, emailAddress, role)").
+			SupportsAllDrives(true).
+			PageSize(100).
+			Context(ctx)
+		if pageToken != "" {
+			call = call.PageToken(pageToken)
+		}
+		list, err := call.Do()
+		if err != nil {
+			return nil, err
+		}
+		for _, p := range list.Permissions {
+			if p.Type == "user" && strings.EqualFold(p.EmailAddress, email) {
+				return p, nil
+			}
+		}
+		if list.NextPageToken == "" {
+			return nil, nil
+		}
+		pageToken = list.NextPageToken
+	}
+}
+
+// grantPermission grants email the given role on fileID. role uses the Drive
+// API name — "fileOrganizer" is "Content manager" in the Drive UI. A
+// notification email is sent so the user gets a link to the folder.
+func grantPermission(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, fileID, email, role string) error {
+	if err := limiter.Wait(ctx); err != nil {
+		return err
+	}
+	_, err := svc.Permissions.Create(fileID, &drive.Permission{
+		Type:         "user",
+		Role:         role,
+		EmailAddress: email,
+	}).SupportsAllDrives(true).SendNotificationEmail(true).Context(ctx).Do()
+	return err
+}
+
 func deleteFile(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, fileID string) error {
 	if err := limiter.Wait(ctx); err != nil {
 		return err
