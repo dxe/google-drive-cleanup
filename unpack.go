@@ -237,11 +237,13 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 		if err != nil {
 			return fmt.Errorf("listing %s: %w", sourceLabel, err)
 		}
-		for _, c := range children {
+		prog := newProgress()
+		for i, c := range children {
 			if err := ctx.Err(); err != nil {
 				log.Printf("interrupted: %d restored, %d quarantined, %d failed", restored, quarantined, failed)
 				return err
 			}
+			prog.tick("progress: restoring %s: %d/%d", sourceLabel, i, len(children))
 			orig, derr := originalParentDriveID(db, c.Id)
 			if derr == sql.ErrNoRows {
 				label := orphanLabel(c.Id)

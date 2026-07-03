@@ -289,11 +289,13 @@ func runPack(dbPath, cfgPath, account string, dryRun bool, maxErrors int) error 
 	// one files.update per item, removing the parent the crawl recorded. If
 	// that parent is stale the update fails loudly (Drive items have a single
 	// parent), and only then do we fetch the item's live state to diagnose.
+	prog := newProgress()
 	for _, r := range roots {
 		if err := ctx.Err(); err != nil {
 			log.Printf("interrupted: %d moved to Container, %d swept to Stash, %d failed", movedToContainer, sweptToStash, failed)
 			return err
 		}
+		prog.tick("progress: %d/%d moved to Container", movedToContainer, len(roots))
 		warnExtraParents(r.driveID, r.name)
 		if dryRun {
 			log.Printf("WOULD move %s %q (%s) from %s into the Container", r.typ, r.name, r.driveID, r.parentDriveID)
@@ -335,7 +337,10 @@ func runPack(dbPath, cfgPath, account string, dryRun bool, maxErrors int) error 
 					return err
 				}
 			} else {
-				log.Printf("WARN %q (%s) had moved since the crawl (live parent %v); moved into the Container from there", r.name, r.driveID, f.Parents)
+				// Its recorded parent was stale — expected, since packing moves
+				// roots out from under one another. Retrying from the live parent
+				// (above) is the normal path, so this is not worth a warning.
+				detailf("OK %s %q (%s) -> Container (from live parent %v)", r.typ, r.name, r.driveID, f.Parents)
 				movedToContainer++
 			}
 		}

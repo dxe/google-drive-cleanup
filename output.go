@@ -1,11 +1,38 @@
 package main
 
-import "log"
+import (
+	"log"
+	"time"
+)
 
 // verbose is set by the persistent --verbose/-v flag (see main.go). When false
 // (the default) the tool prints only progress summaries, warnings, errors, and
 // final tallies; when true it also prints a line per item it touches.
 var verbose bool
+
+// progressInterval is how often a long-running move phase emits a heartbeat.
+const progressInterval = 5 * time.Second
+
+// progress throttles heartbeat lines during a long move phase so it shows it is
+// advancing without flooding the log. Construct one with newProgress before the
+// loop and call tick after each item; it prints at most once per
+// progressInterval. Heartbeats are suppressed under --verbose, where the
+// per-item detailf lines already show progress.
+type progress struct {
+	last time.Time
+}
+
+func newProgress() *progress {
+	return &progress{last: time.Now()}
+}
+
+func (p *progress) tick(format string, args ...any) {
+	if verbose || time.Since(p.last) < progressInterval {
+		return
+	}
+	p.last = time.Now()
+	log.Printf(format, args...)
+}
 
 // detailf logs a per-item detail line, but only when --verbose is set. Use it
 // for the "OK moved X -> Y", "listing folder Z", "SKIP ..." chatter that is
