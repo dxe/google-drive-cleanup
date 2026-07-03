@@ -73,7 +73,7 @@ func init() {
 	packCmd.Flags().Bool("dry-run", false, "report what would move without changing anything (read-only scope)")
 	packCmd.Flags().Int("max-errors", 5, "abort once more than this many items fail to move")
 	packCmd.Flags().String("folder", "", "Google Drive folder ID to scope the pack to (must be crawled into the database); packs only the user's items within that subfolder of the crawl root")
-	packCmd.Flags().Bool("skip-unmovable", false, "proceed even when some crawled items are not editable by the crawling account (those items will fail to move)")
+	packCmd.Flags().Bool("skip-unmovable", false, "skip crawled items the crawling account cannot edit (they cannot be moved) and pack the rest, instead of aborting")
 }
 
 // subtreeRelativePath returns the path of driveID relative to the crawl root,
@@ -211,12 +211,23 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 			}
 		}
 		if !skipUnmovable {
-			return fmt.Errorf("%d crawled item(s) are not editable by the crawling account: %d folder(s), %d file(s); any of these that need to move will fail. Run check-edit-access for the full list, or pass --skip-unmovable to pack the rest anyway",
+			return fmt.Errorf("%d crawled item(s) are not editable by the crawling account: %d folder(s), %d file(s); any of these that need to move will fail. Run check-edit-access for the full list, or pass --skip-unmovable to skip those items and pack the rest",
 				len(uneditable), folderCount, fileCount)
 		}
 		fmt.Fprintf(os.Stderr, "WARNING: %d crawled item(s) are not editable by the crawling account: %d folder(s), %d file(s).\n",
 			len(uneditable), folderCount, fileCount)
-		fmt.Fprintln(os.Stderr, "Proceeding due to --skip-unmovable; any of these that need to move will fail. Run check-edit-access for the full list.")
+		fmt.Fprintln(os.Stderr, "Proceeding due to --skip-unmovable; these items will be skipped, not moved. Run check-edit-access for the full list.")
+	}
+
+	// unmovable is the set of nodes the crawling account cannot edit, keyed by
+	// Drive ID. When --skip-unmovable is set we consult it before attempting any
+	// move and skip those items outright — moving one is a guaranteed Google API
+	// failure, so checking the database first avoids the wasted call and keeps it
+	// from eating the --max-errors budget. Empty (a no-op) when nothing is
+	// uneditable; only ever populated here because the run aborts above otherwise.
+	unmovable := make(map[string]bool, len(uneditable))
+	for _, r := range uneditable {
+		unmovable[r.driveID] = true
 	}
 
 	ctx, cancel := cancelOnSignal()
@@ -373,6 +384,11 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 		}
 		prog.tick("progress: %d/%d moved to Container", movedToContainer, len(roots))
 		warnExtraParents(r.driveID, r.name)
+		if unmovable[r.driveID] {
+			log.Printf("SKIP %s %q (%s): not editable by the crawling account; cannot move it", r.typ, r.name, r.driveID)
+			skipped++
+			continue
+		}
 		if dryRun {
 			log.Printf("WOULD move %s %q (%s) from %s into the Container", r.typ, r.name, r.driveID, r.parentDriveID)
 			movedToContainer++
@@ -435,6 +451,11 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 			return err
 		}
 		for _, s := range preview {
+			if unmovable[s.driveID] {
+				log.Printf("WOULD skip %q (%s): not editable by the crawling account; cannot sweep it to the Stash", s.name, s.driveID)
+				skipped++
+				continue
+			}
 			log.Printf("WOULD move %q (%s) out of owned folder %s into the Stash", s.name, s.driveID, s.parentDriveID)
 			sweptToStash++
 		}
@@ -459,6 +480,11 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 					if c.MimeType == folderMimeType {
 						queue = append(queue, c.Id)
 					}
+					continue
+				}
+				if unmovable[c.Id] {
+					log.Printf("SKIP %q (%s): not editable by the crawling account; cannot sweep it to the Stash (it will block the drag until handled manually)", c.Name, c.Id)
+					skipped++
 					continue
 				}
 				if _, derr := nodeTypeByDriveID(db, c.Id); derr == sql.ErrNoRows {
@@ -493,6 +519,11 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 	if !dryRun {
 		for _, n := range owned {
 			if seen[n.driveID] || n.driveID == crawlRoot {
+				continue
+			}
+			if unmovable[n.driveID] {
+				detailf("SKIP straggler %q (%s): not editable by the crawling account; cannot move it", n.name, n.driveID)
+				skipped++
 				continue
 			}
 			if err := ctx.Err(); err != nil {
