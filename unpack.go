@@ -405,29 +405,40 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 	if dryRun {
 		log.Printf("NOTE cleanup (deleting the emptied Stash, Container, and per-user folder, and revoking the user's dropoff access) is skipped in a dry run")
 	} else {
-		deleteIfEmpty := func(f *drive.File, label string) error {
+		// deleteIfEmpty removes f only when a live listing confirms it is empty,
+		// and reports whether it actually deleted it.
+		deleteIfEmpty := func(f *drive.File, label string) (bool, error) {
 			remaining, err := listChildren(ctx, svc, limiter, f.Id, "nextPageToken, files(id)")
 			if err != nil {
-				return fmt.Errorf("re-checking %s contents: %w", label, err)
+				return false, fmt.Errorf("re-checking %s contents: %w", label, err)
 			}
 			if len(remaining) > 0 {
 				log.Printf("WARN %s still has %d item(s); leaving it in place", label, len(remaining))
-				return nil
+				return false, nil
 			}
 			if err := deleteFile(ctx, svc, limiter, f.Id); err != nil {
-				return fmt.Errorf("deleting empty %s: %w", label, err)
+				return false, fmt.Errorf("deleting empty %s: %w", label, err)
 			}
 			log.Printf("deleted empty %s", label)
-			return nil
+			return true, nil
 		}
-		if err := deleteIfEmpty(stashF, "Stash"); err != nil {
+		stashEmptied, err := deleteIfEmpty(stashF, "Stash")
+		if err != nil {
 			return err
 		}
-		// Only delete the Container if it was dragged into the shared drive (so we
-		// own it). When the migration was aborted, the Container is still in the
-		// user's My Drive and owned by them — leave it untouched.
-		if containerInSharedDrive {
-			if err := deleteIfEmpty(container, "Container"); err != nil {
+		// Only tear down the Container (and finalize the migration) if it was
+		// dragged into the shared drive (so we own it) AND the Stash emptied. If
+		// un-stashing left items behind, unpack must be re-run to finish restoring
+		// them — and that re-run re-locates the Container by name in the dropoff
+		// folder, erroring out if it is gone. So leave the Container (and the
+		// user's dropoff access, and the per-user folder) in place until the Stash
+		// is fully restored. When the migration was aborted, the Container is still
+		// in the user's My Drive and owned by them — leave it untouched.
+		switch {
+		case containerInSharedDrive && !stashEmptied:
+			log.Printf("WARN Stash was not fully restored; leaving the Container %s in place", container.Id)
+		case containerInSharedDrive:
+			if _, err := deleteIfEmpty(container, "Container"); err != nil {
 				return err
 			}
 			// Revoke the Manager access pack granted the user on the dropoff
@@ -445,13 +456,9 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 				}
 				log.Printf("revoked %s access on the dropoff folder %q", account, dropoff.Name)
 			}
-		}
-		// The per-user folder goes too, unless something remains in it — e.g. a
-		// non-empty Errors folder, or a Stash/Container that could not empty. When
-		// the migration was aborted the Container is deliberately left in place, so
-		// the per-user folder can never empty; skip it to avoid a misleading WARN.
-		if containerInSharedDrive {
-			if err := deleteIfEmpty(&drive.File{Id: m.userFolderID}, fmt.Sprintf("per-user folder for %s", account)); err != nil {
+			// The per-user folder goes too, unless something remains in it — e.g. a
+			// non-empty Errors folder.
+			if _, err := deleteIfEmpty(&drive.File{Id: m.userFolderID}, fmt.Sprintf("per-user folder for %s", account)); err != nil {
 				return err
 			}
 		}
