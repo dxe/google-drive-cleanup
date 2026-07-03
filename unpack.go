@@ -396,7 +396,18 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 	if err := restoreChildren(container, "Container", containerInSharedDrive); err != nil {
 		return err
 	}
-	if err := restoreChildren(stashF, "Stash", false); err != nil {
+	// A Stash item's destination is an owned folder that was inside the Container
+	// (it rides back out only when its owned-root ancestor restores). If any
+	// Container move failed — but stayed under --max-errors — those folders are
+	// still in the shared drive, and every Stash item bound for them would fail
+	// too (a shared drive cannot hold third-party items), turning one root cause
+	// into a cascade that also burns the error budget. So skip the Stash entirely
+	// when the Container did not fully clear; re-running unpack after the cause is
+	// fixed converges. `failed` counts only Container failures here, since nothing
+	// else has run yet.
+	if failed > 0 {
+		log.Printf("WARN Container restore left %d item(s) in the shared drive; skipping the Stash restore because stashed items' destination folders may still be in the shared drive. Fix the cause and re-run unpack to finish.", failed)
+	} else if err := restoreChildren(stashF, "Stash", false); err != nil {
 		return err
 	}
 
