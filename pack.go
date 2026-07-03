@@ -174,7 +174,7 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 		return err
 	}
 
-	if pending, err := countPendingFolders(db); err != nil {
+	if pending, err := countPendingFolders(db, ""); err != nil {
 		return err
 	} else if pending > 0 {
 		return fmt.Errorf("the crawl is incomplete (%d folder(s) not fully listed); the database may be missing items. Re-run crawl first for a complete pack", pending)

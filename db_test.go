@@ -120,7 +120,7 @@ func TestPendingFolders(t *testing.T) {
 	mustUpsert(t, db, node{driveID: "f", name: "f.pdf", typ: typeBinary, mimeType: "application/pdf",
 		parentID: sql.NullInt64{Int64: rootID, Valid: true}})
 
-	pending, err := pendingFolders(db)
+	pending, err := pendingFolders(db, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,13 +131,13 @@ func TestPendingFolders(t *testing.T) {
 	tx, _ := db.Begin()
 	markChildrenDone(tx, rootID)
 	tx.Commit()
-	if n, _ := countPendingFolders(db); n != 1 {
+	if n, _ := countPendingFolders(db, ""); n != 1 {
 		t.Errorf("after marking root done, %d pending, want 1", n)
 	}
-	if err := resetChildrenDone(db); err != nil {
+	if err := resetChildrenDone(db, ""); err != nil {
 		t.Fatal(err)
 	}
-	if n, _ := countPendingFolders(db); n != 2 {
+	if n, _ := countPendingFolders(db, ""); n != 2 {
 		t.Errorf("after refresh, %d pending, want 2", n)
 	}
 }
@@ -797,6 +797,166 @@ func TestDeleteStaleNodesReparentsSurvivor(t *testing.T) {
 	}
 	if parent.Valid {
 		t.Errorf("survivor parent_id = %v, want NULL after its parent was removed", parent)
+	}
+}
+
+func TestScopedPendingFolders(t *testing.T) {
+	db := testDB(t)
+	// root ─┬─ A ── sub
+	//       └─ B
+	rootID, _, _, _ := mustUpsert(t, db, node{driveID: "root", name: "Root", typ: typeFolder, mimeType: folderMimeType})
+	aID, _, _, _ := mustUpsert(t, db, node{driveID: "A", name: "A", typ: typeFolder, mimeType: folderMimeType,
+		parentID: sql.NullInt64{Int64: rootID, Valid: true}})
+	mustUpsert(t, db, node{driveID: "sub", name: "Sub", typ: typeFolder, mimeType: folderMimeType,
+		parentID: sql.NullInt64{Int64: aID, Valid: true}})
+	mustUpsert(t, db, node{driveID: "B", name: "B", typ: typeFolder, mimeType: folderMimeType,
+		parentID: sql.NullInt64{Int64: rootID, Valid: true}})
+
+	// Everything done, then scope a reset to A's subtree.
+	if err := markAllChildrenDone(t, db); err != nil {
+		t.Fatal(err)
+	}
+	if err := resetChildrenDone(db, "A"); err != nil {
+		t.Fatal(err)
+	}
+
+	pending, err := pendingFolders(db, "A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, f := range pending {
+		got = append(got, f.driveID)
+	}
+	if strings.Join(got, ",") != "A,sub" {
+		t.Errorf("pendingFolders(A) = %v, want [A sub] (root and B untouched)", got)
+	}
+	if n, _ := countPendingFolders(db, "A"); n != 2 {
+		t.Errorf("countPendingFolders(A) = %d, want 2", n)
+	}
+	// The reset must not have touched folders outside A's subtree.
+	if n, _ := countPendingFolders(db, ""); n != 2 {
+		t.Errorf("total pending = %d, want 2 (only A and sub); reset leaked outside the subtree", n)
+	}
+}
+
+func markAllChildrenDone(t *testing.T, db *sql.DB) error {
+	t.Helper()
+	_, err := db.Exec(`UPDATE nodes SET children_done = 1 WHERE type = '` + typeFolder + `'`)
+	return err
+}
+
+func TestDeleteStaleNodesUnder(t *testing.T) {
+	db := testDB(t)
+	const cutoff = "2026-06-01T00:00:00Z"
+	old, fresh := "2026-05-01T00:00:00Z", "2026-06-15T00:00:00Z"
+
+	// root ─┬─ A ─┬─ aKeep        (re-indexed subtree: A)
+	//       │     └─ aStaleDir ── aStaleChild
+	//       └─ B ── bChild        (outside A: must be left alone even though stale)
+	rootID, _, _, _ := mustUpsert(t, db, node{driveID: "root", name: "Root", typ: typeFolder, mimeType: folderMimeType})
+	aID, _, _, _ := mustUpsert(t, db, node{driveID: "A", name: "A", typ: typeFolder, mimeType: folderMimeType,
+		parentID: sql.NullInt64{Int64: rootID, Valid: true}})
+	mustUpsert(t, db, node{driveID: "aKeep", name: "keep.txt", typ: typeBinary, mimeType: "application/x",
+		parentID: sql.NullInt64{Int64: aID, Valid: true}})
+	staleDirID, _, _, _ := mustUpsert(t, db, node{driveID: "aStaleDir", name: "Gone", typ: typeFolder, mimeType: folderMimeType,
+		parentID: sql.NullInt64{Int64: aID, Valid: true}})
+	mustUpsert(t, db, node{driveID: "aStaleChild", name: "gone.txt", typ: typeBinary, mimeType: "application/x",
+		parentID: sql.NullInt64{Int64: staleDirID, Valid: true}})
+	bID, _, _, _ := mustUpsert(t, db, node{driveID: "B", name: "B", typ: typeFolder, mimeType: folderMimeType,
+		parentID: sql.NullInt64{Int64: rootID, Valid: true}})
+	mustUpsert(t, db, node{driveID: "bChild", name: "b.txt", typ: typeBinary, mimeType: "application/x",
+		parentID: sql.NullInt64{Int64: bID, Valid: true}})
+
+	// Aux rows: one on the stale folder (should be pruned) and one on B outside
+	// the scope (must survive even though B is stale, because it is not re-indexed).
+	tx, _ := db.Begin()
+	if err := replacePermissions(tx, "aStaleDir", []permission{{permissionID: "p1", typ: "user", role: "writer"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := replacePermissions(tx, "B", []permission{{permissionID: "p2", typ: "user", role: "owner"}}); err != nil {
+		t.Fatal(err)
+	}
+	tx.Commit()
+
+	// Re-index of A refreshed A, aKeep; the vanished aStaleDir/aStaleChild keep
+	// their old timestamps. B's subtree was never touched this run, so it is old.
+	setCrawledAt(t, db, "root", fresh)
+	setCrawledAt(t, db, "A", fresh)
+	setCrawledAt(t, db, "aKeep", fresh)
+	setCrawledAt(t, db, "aStaleDir", old)
+	setCrawledAt(t, db, "aStaleChild", old)
+	setCrawledAt(t, db, "B", old)
+	setCrawledAt(t, db, "bChild", old)
+
+	removed, err := deleteStaleNodesUnder(db, "A", cutoff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 2 {
+		t.Errorf("removed = %d, want 2 (aStaleDir, aStaleChild)", removed)
+	}
+	for _, id := range []string{"root", "A", "aKeep", "B", "bChild"} {
+		if _, err := nodeTypeByDriveID(db, id); err != nil {
+			t.Errorf("%q should have survived: %v", id, err)
+		}
+	}
+	for _, id := range []string{"aStaleDir", "aStaleChild"} {
+		if _, err := nodeTypeByDriveID(db, id); err != sql.ErrNoRows {
+			t.Errorf("%q should have been deleted, err=%v", id, err)
+		}
+	}
+	if perms, _ := folderPermissionsFor(db, "aStaleDir"); len(perms) != 0 {
+		t.Errorf("stale folder permissions not pruned: %d rows", len(perms))
+	}
+	if perms, _ := folderPermissionsFor(db, "B"); len(perms) != 1 {
+		t.Errorf("out-of-scope folder permissions = %d, want 1 (must not be pruned)", len(perms))
+	}
+}
+
+// A stale node deep beneath a survivor whose own (stale) parent is being deleted
+// must still be pruned: the subtree is snapshotted before the survivor is
+// detached, so severing its parent link does not hide descendants from the sweep.
+func TestDeleteStaleNodesUnderDeepStaleBelowDetachedSurvivor(t *testing.T) {
+	db := testDB(t)
+	const cutoff = "2026-06-01T00:00:00Z"
+	old, fresh := "2026-05-01T00:00:00Z", "2026-06-15T00:00:00Z"
+
+	// S ── staleParent ── survivor ── deepStale
+	// survivor is re-observed (fresh) but keeps staleParent as first-discovered
+	// parent; staleParent and deepStale vanished from Drive.
+	sID, _, _, _ := mustUpsert(t, db, node{driveID: "S", name: "S", typ: typeFolder, mimeType: folderMimeType})
+	spID, _, _, _ := mustUpsert(t, db, node{driveID: "staleParent", name: "Gone", typ: typeFolder, mimeType: folderMimeType,
+		parentID: sql.NullInt64{Int64: sID, Valid: true}})
+	survID, _, _, _ := mustUpsert(t, db, node{driveID: "survivor", name: "Survivor", typ: typeFolder, mimeType: folderMimeType,
+		parentID: sql.NullInt64{Int64: spID, Valid: true}})
+	mustUpsert(t, db, node{driveID: "deepStale", name: "deep.txt", typ: typeBinary, mimeType: "application/x",
+		parentID: sql.NullInt64{Int64: survID, Valid: true}})
+
+	setCrawledAt(t, db, "S", fresh)
+	setCrawledAt(t, db, "staleParent", old)
+	setCrawledAt(t, db, "survivor", fresh)
+	setCrawledAt(t, db, "deepStale", old)
+
+	removed, err := deleteStaleNodesUnder(db, "S", cutoff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 2 {
+		t.Errorf("removed = %d, want 2 (staleParent, deepStale)", removed)
+	}
+	for _, id := range []string{"staleParent", "deepStale"} {
+		if _, err := nodeTypeByDriveID(db, id); err != sql.ErrNoRows {
+			t.Errorf("%q should have been deleted, err=%v", id, err)
+		}
+	}
+	// The survivor is kept and detached to a root, mirroring deleteStaleNodes.
+	var parent sql.NullInt64
+	if err := db.QueryRow(`SELECT parent_id FROM nodes WHERE drive_id = 'survivor'`).Scan(&parent); err != nil {
+		t.Fatal(err)
+	}
+	if parent.Valid {
+		t.Errorf("survivor parent_id = %v, want NULL after its stale parent was removed", parent)
 	}
 }
 

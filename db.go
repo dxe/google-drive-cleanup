@@ -214,11 +214,28 @@ type folderRef struct {
 	name    string
 }
 
-// pendingFolders returns every folder whose children have not been fully
-// listed yet — the resumable work queue.
-func pendingFolders(db *sql.DB) ([]folderRef, error) {
-	rows, err := db.Query(fmt.Sprintf(
-		`SELECT id, drive_id, name FROM nodes WHERE type = '%s' AND children_done = 0 ORDER BY id`, typeFolder))
+// pendingFolders returns every folder whose children have not been fully listed
+// yet — the resumable work queue. When subtreeRoot is non-empty the queue is
+// limited to that subtree (inclusive), the work list for a scoped re-index.
+// Either way folders are seeded directly, not only through parent discovery, so
+// a folder deleted from Drive (whose parent no longer lists it) is still listed,
+// comes back empty, is marked done, and can then be pruned.
+func pendingFolders(db *sql.DB, subtreeRoot string) ([]folderRef, error) {
+	query := fmt.Sprintf(
+		`SELECT id, drive_id, name FROM nodes WHERE type = '%s' AND children_done = 0 ORDER BY id`, typeFolder)
+	args := []any{}
+	if subtreeRoot != "" {
+		query = fmt.Sprintf(`WITH RECURSIVE subtree(id) AS (
+			SELECT id FROM nodes WHERE drive_id = ?
+			UNION ALL
+			SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
+		)
+		SELECT id, drive_id, name FROM nodes
+		WHERE type = '%s' AND children_done = 0 AND id IN (SELECT id FROM subtree)
+		ORDER BY id`, typeFolder)
+		args = []any{subtreeRoot}
+	}
+	rows, err := db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -234,16 +251,54 @@ func pendingFolders(db *sql.DB) ([]folderRef, error) {
 	return refs, rows.Err()
 }
 
-func countPendingFolders(db *sql.DB) (int, error) {
+// countPendingFolders counts folders still awaiting listing (children_done = 0),
+// restricted to the subtree rooted at subtreeRoot (inclusive) when non-empty.
+func countPendingFolders(db *sql.DB, subtreeRoot string) (int, error) {
+	query := fmt.Sprintf(`SELECT COUNT(*) FROM nodes WHERE type = '%s' AND children_done = 0`, typeFolder)
+	args := []any{}
+	if subtreeRoot != "" {
+		query = fmt.Sprintf(`WITH RECURSIVE subtree(id) AS (
+			SELECT id FROM nodes WHERE drive_id = ?
+			UNION ALL
+			SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
+		)
+		SELECT COUNT(*) FROM nodes
+		WHERE type = '%s' AND children_done = 0 AND id IN (SELECT id FROM subtree)`, typeFolder)
+		args = []any{subtreeRoot}
+	}
 	var n int
-	err := db.QueryRow(fmt.Sprintf(
-		`SELECT COUNT(*) FROM nodes WHERE type = '%s' AND children_done = 0`, typeFolder)).Scan(&n)
+	err := db.QueryRow(query, args...).Scan(&n)
 	return n, err
 }
 
-func resetChildrenDone(db *sql.DB) error {
-	_, err := db.Exec(fmt.Sprintf(`UPDATE nodes SET children_done = 0 WHERE type = '%s'`, typeFolder))
+// resetChildrenDone resets children_done to 0 on every folder, forcing them to
+// be re-listed. When subtreeRoot is non-empty only folders within that subtree
+// (inclusive) are reset, so a scoped re-index re-lists just that subtree rather
+// than skipping folders an earlier crawl already marked done.
+func resetChildrenDone(db *sql.DB, subtreeRoot string) error {
+	query := fmt.Sprintf(`UPDATE nodes SET children_done = 0 WHERE type = '%s'`, typeFolder)
+	args := []any{}
+	if subtreeRoot != "" {
+		query = fmt.Sprintf(`WITH RECURSIVE subtree(id) AS (
+			SELECT id FROM nodes WHERE drive_id = ?
+			UNION ALL
+			SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
+		)
+		UPDATE nodes SET children_done = 0
+		WHERE type = '%s' AND id IN (SELECT id FROM subtree)`, typeFolder)
+		args = []any{subtreeRoot}
+	}
+	_, err := db.Exec(query, args...)
 	return err
+}
+
+// folderRefByDriveID returns the queue entry for the folder with the given
+// Drive ID. Returns sql.ErrNoRows if it was not crawled.
+func folderRefByDriveID(db *sql.DB, driveID string) (folderRef, error) {
+	var f folderRef
+	err := db.QueryRow(`SELECT id, drive_id, name FROM nodes WHERE drive_id = ?`, driveID).
+		Scan(&f.rowID, &f.driveID, &f.name)
+	return f, err
 }
 
 func recordExtraParent(tx *sql.Tx, nodeDriveID, parentDriveID string) error {
@@ -1022,16 +1077,81 @@ func deleteStaleNodes(db *sql.DB, sessionStart string) (int64, error) {
 		return 0, err
 	}
 	removed, _ := res.RowsAffected()
-	// The auxiliary tables key on drive_id with no foreign key, so prune the
-	// rows whose node is now gone by hand.
-	if _, err := tx.Exec(
-		`DELETE FROM folder_permissions WHERE node_drive_id NOT IN (SELECT drive_id FROM nodes)`); err != nil {
+	if err := pruneOrphanedAuxRows(tx); err != nil {
 		return 0, err
 	}
-	if _, err := tx.Exec(`
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return removed, nil
+}
+
+// pruneOrphanedAuxRows deletes folder_permissions and extra_parents rows whose
+// referenced node no longer exists. These tables key on drive_id with no foreign
+// key, so they must be swept by hand after nodes are deleted.
+func pruneOrphanedAuxRows(tx *sql.Tx) error {
+	if _, err := tx.Exec(
+		`DELETE FROM folder_permissions WHERE node_drive_id NOT IN (SELECT drive_id FROM nodes)`); err != nil {
+		return err
+	}
+	_, err := tx.Exec(`
 		DELETE FROM extra_parents
 		WHERE node_drive_id NOT IN (SELECT drive_id FROM nodes)
-		   OR parent_drive_id NOT IN (SELECT drive_id FROM nodes)`); err != nil {
+		   OR parent_drive_id NOT IN (SELECT drive_id FROM nodes)`)
+	return err
+}
+
+// deleteStaleNodesUnder is the subtree-scoped counterpart of deleteStaleNodes,
+// used by a --folder re-index: it removes only the nodes within the subtree
+// rooted at subfolderDriveID that were not re-observed since cutoff, leaving the
+// rest of the snapshot alone. Like deleteStaleNodes it is only safe after the
+// subtree has been fully re-listed. Returns the number of nodes removed.
+func deleteStaleNodesUnder(db *sql.DB, subfolderDriveID, cutoff string) (int64, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`PRAGMA defer_foreign_keys = ON`); err != nil {
+		return 0, err
+	}
+	// Snapshot the subtree membership before mutating anything. Detaching a
+	// survivor below (next statement) severs its parent link, which would
+	// otherwise hide still-deeper stale rows from a recursive walk recomputed
+	// after the detach. A rollback drops this temp table with the rest of the tx.
+	if _, err := tx.Exec(`
+		CREATE TEMP TABLE scoped_subtree AS
+		WITH RECURSIVE subtree(id) AS (
+			SELECT id FROM nodes WHERE drive_id = ?
+			UNION ALL
+			SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
+		)
+		SELECT id FROM subtree`, subfolderDriveID); err != nil {
+		return 0, err
+	}
+	// A surviving node whose first-discovered parent (within the subtree) is
+	// going away — a re-discovered multi-parent item whose original parent
+	// vanished — would dangle; detach it to a root rather than block the delete.
+	if _, err := tx.Exec(`
+		UPDATE nodes SET parent_id = NULL
+		WHERE id IN (SELECT id FROM scoped_subtree)
+		  AND crawled_at >= ?
+		  AND parent_id IN (
+			SELECT s.id FROM scoped_subtree s JOIN nodes n ON n.id = s.id
+			WHERE n.crawled_at < ?
+		  )`, cutoff, cutoff); err != nil {
+		return 0, err
+	}
+	res, err := tx.Exec(
+		`DELETE FROM nodes WHERE id IN (SELECT id FROM scoped_subtree) AND crawled_at < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	removed, _ := res.RowsAffected()
+	if _, err := tx.Exec(`DROP TABLE scoped_subtree`); err != nil {
+		return 0, err
+	}
+	if err := pruneOrphanedAuxRows(tx); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(); err != nil {

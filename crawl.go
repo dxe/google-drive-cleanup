@@ -69,23 +69,29 @@ database. Ctrl-C stops cleanly between writes; just re-run to resume.
 
 --refresh re-lists every folder but keeps the existing snapshot rows; --wipe
 deletes the previous snapshot outright (as also happens automatically when the
-configured root changes) and crawls from scratch.`,
+configured root changes) and crawls from scratch.
+
+--folder re-indexes only the subtree rooted at the given Drive folder ID,
+pruning stale rows under it alone. The folder must already exist in the snapshot
+(which guarantees it is a descendant of the crawl root).`,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dbPath, _ := cmd.Flags().GetString("db")
 		cfgPath, _ := cmd.Flags().GetString("config")
 		refresh, _ := cmd.Flags().GetBool("refresh")
 		wipe, _ := cmd.Flags().GetBool("wipe")
-		return runCrawl(dbPath, cfgPath, refresh, wipe)
+		subfolder, _ := cmd.Flags().GetString("folder")
+		return runCrawl(dbPath, cfgPath, refresh, wipe, subfolder)
 	},
 }
 
 func init() {
 	crawlCmd.Flags().Bool("refresh", false, "reset children_done on all folders to force a full re-crawl")
 	crawlCmd.Flags().Bool("wipe", false, "discard the previous crawl snapshot entirely and crawl from scratch")
+	crawlCmd.Flags().String("folder", "", "Drive folder ID (already crawled) to re-index in place, pruning stale rows under that subfolder only")
 }
 
-func runCrawl(dbPath, cfgPath string, refresh, wipe bool) error {
+func runCrawl(dbPath, cfgPath string, refresh, wipe bool, subfolder string) error {
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
 		return err
@@ -97,8 +103,48 @@ func runCrawl(dbPath, cfgPath string, refresh, wipe bool) error {
 	}
 	defer db.Close()
 
+	// A scoped re-index (--folder) touches only one subtree, so the whole-tree
+	// session flags do not apply to it.
+	if subfolder != "" && (refresh || wipe) {
+		return fmt.Errorf("--folder cannot be combined with --refresh or --wipe")
+	}
+
+	// Cancel the context on the first SIGINT/SIGTERM so the crawl stops
+	// cleanly between API pages/folders; transactions in flight always run to
+	// completion because they don't use this context. A second signal kills
+	// the process the default way.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		log.Printf("received %s — finishing current write, then exiting (signal again to force quit)", sig)
+		signal.Stop(sigCh)
+		cancel()
+	}()
+
+	srv, err := newDriveService(ctx, drive.DriveReadonlyScope)
+	if err != nil {
+		return err
+	}
+
+	c := &crawler{
+		db:      db,
+		srv:     srv,
+		limiter: rate.NewLimiter(rate.Limit(3), 3), // Drive sustains only a few req/sec
+		visited: make(map[string]bool),
+	}
+
+	// --folder re-indexes one already-crawled subtree in place; it shares the
+	// Drive client and signal handling above but none of the whole-tree session
+	// bookkeeping below.
+	if subfolder != "" {
+		return c.runScopedCrawl(ctx, subfolder)
+	}
+
 	if refresh {
-		if err := resetChildrenDone(db); err != nil {
+		if err := resetChildrenDone(db, ""); err != nil {
 			return err
 		}
 		log.Print("refresh: reset children_done=0 on all folders")
@@ -141,33 +187,6 @@ func runCrawl(dbPath, cfgPath string, refresh, wipe bool) error {
 		}
 	}
 
-	// Cancel the context on the first SIGINT/SIGTERM so the crawl stops
-	// cleanly between API pages/folders; transactions in flight always run to
-	// completion because they don't use this context. A second signal kills
-	// the process the default way.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		sig := <-sigCh
-		log.Printf("received %s — finishing current write, then exiting (signal again to force quit)", sig)
-		signal.Stop(sigCh)
-		cancel()
-	}()
-
-	srv, err := newDriveService(ctx, drive.DriveReadonlyScope)
-	if err != nil {
-		return err
-	}
-
-	c := &crawler{
-		db:      db,
-		srv:     srv,
-		limiter: rate.NewLimiter(rate.Limit(3), 3), // Drive sustains only a few req/sec
-		visited: make(map[string]bool),
-	}
-
 	if err := c.validateAndInsertRoot(ctx, cfg.Crawl.Root); err != nil {
 		return err
 	}
@@ -177,7 +196,7 @@ func runCrawl(dbPath, cfgPath string, refresh, wipe bool) error {
 	// discovered mid-crawl are also appended in memory, but since they are
 	// inserted with children_done=0 before their parent is marked done, an
 	// interrupted run picks them up here on resume.
-	queue, err := pendingFolders(db)
+	queue, err := pendingFolders(db, "")
 	if err != nil {
 		return err
 	}
@@ -187,6 +206,129 @@ func runCrawl(dbPath, cfgPath string, refresh, wipe bool) error {
 		log.Printf("starting new crawl: %d folders pending", len(queue))
 	}
 
+	failed := c.drainQueue(ctx, queue)
+
+	remaining, cerr := countPendingFolders(db, "")
+	if cerr != nil {
+		return cerr
+	}
+	switch {
+	case ctx.Err() != nil:
+		log.Printf("interrupted: %d folders remaining (children_done=0) — re-run `crawl` to resume", remaining)
+	case failed > 0:
+		return fmt.Errorf("crawl finished with %d folder errors; %d folders remaining — re-run to retry", failed, remaining)
+	default:
+		// The crawl finished cleanly, so every live node was re-observed this
+		// session: drop the rows that were not (deleted from Drive since the
+		// previous crawl) so the snapshot reflects the tree as it is now.
+		if remaining == 0 {
+			removed, err := deleteStaleNodes(db, sessionStart)
+			if err != nil {
+				return fmt.Errorf("removing stale rows from the previous crawl: %w", err)
+			}
+			if removed > 0 {
+				log.Printf("removed %d stale node(s) not seen in this crawl", removed)
+			}
+		}
+		log.Printf("crawl complete: %d folders remaining (children_done=0), %d files seen this run", remaining, c.fileCount)
+	}
+	return nil
+}
+
+// runScopedCrawl re-indexes only the subtree rooted at subfolder, an already
+// crawled folder, and prunes stale rows under it alone. Requiring the folder to
+// already exist in the snapshot guarantees it is a descendant of the crawl root.
+// The whole-tree session bookkeeping (crawl_meta, wipe/root-change handling) is
+// deliberately left untouched: a local cutoff timestamp scopes the stale sweep
+// to this subtree.
+func (c *crawler) runScopedCrawl(ctx context.Context, subfolder string) error {
+	typ, err := nodeTypeByDriveID(c.db, subfolder)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("subfolder %s not found in the database; it must be a folder already crawled under the crawl root", subfolder)
+	}
+	if err != nil {
+		return err
+	}
+	if typ != typeFolder {
+		return fmt.Errorf("subfolder %s is a %s, not a folder", subfolder, typ)
+	}
+	rel, err := subtreeRelativePath(c.db, subfolder)
+	if err != nil {
+		return err
+	}
+	if rel == "" {
+		// The subfolder is the crawl root itself; name it for the log line.
+		ref, err := folderRefByDriveID(c.db, subfolder)
+		if err != nil {
+			return err
+		}
+		rel = ref.name
+	}
+
+	// Capture the cutoff before re-observing anything: every node re-observed
+	// this run gets a fresh crawled_at (>= cutoff), so descendants still bearing
+	// an older timestamp afterwards no longer exist in Drive.
+	cutoff := now()
+
+	// Re-fetch and upsert the subfolder itself. Unlike its descendants it is
+	// never re-observed through a parent listing (its parent is outside the
+	// scope), so without this its crawled_at would stay stale and the prune
+	// below would delete the very folder being re-indexed — the same reason a
+	// full crawl re-inserts the root up front. A 404 here means the folder was
+	// removed from Drive; report it rather than silently pruning the subtree.
+	f, err := c.fetchFolder(ctx, subfolder)
+	if err != nil {
+		return fmt.Errorf("fetching subfolder %s: %w", subfolder, err)
+	}
+	if err := c.upsertFolder(f); err != nil {
+		return err
+	}
+
+	// resetChildrenDone on the subtree forces the walk to re-list every folder
+	// under it rather than treat already-done folders as complete.
+	if err := resetChildrenDone(c.db, subfolder); err != nil {
+		return err
+	}
+	log.Printf("re-indexing subfolder %q (%s)", rel, subfolder)
+
+	// Seed the queue with every folder in the subtree (all now children_done=0),
+	// not just the subfolder: listing each directly means a folder deleted from
+	// Drive still gets a (now empty) listing, is marked done, and can be pruned.
+	queue, err := pendingFolders(c.db, subfolder)
+	if err != nil {
+		return err
+	}
+	failed := c.drainQueue(ctx, queue)
+
+	remaining, cerr := countPendingFolders(c.db, subfolder)
+	if cerr != nil {
+		return cerr
+	}
+	switch {
+	case ctx.Err() != nil:
+		log.Printf("interrupted: %d folders remaining (children_done=0) under %q — re-run `crawl --folder %s` to resume", remaining, rel, subfolder)
+	case failed > 0:
+		return fmt.Errorf("re-index finished with %d folder errors; %d folders remaining under %q — re-run to retry", failed, remaining, rel)
+	default:
+		if remaining == 0 {
+			removed, err := deleteStaleNodesUnder(c.db, subfolder, cutoff)
+			if err != nil {
+				return fmt.Errorf("removing stale rows under %q: %w", rel, err)
+			}
+			if removed > 0 {
+				log.Printf("removed %d stale node(s) not seen under %q this run", removed, rel)
+			}
+		}
+		log.Printf("re-index complete: %d folders remaining (children_done=0) under %q, %d files seen this run", remaining, rel, c.fileCount)
+	}
+	return nil
+}
+
+// drainQueue lists folders breadth-first, appending each newly discovered
+// subfolder to the queue, until the queue empties or ctx is cancelled. It
+// returns the number of folders whose listing failed (their children_done stays
+// 0 so a later run retries them).
+func (c *crawler) drainQueue(ctx context.Context, queue []folderRef) int {
 	var failed, processed int
 	for len(queue) > 0 {
 		if ctx.Err() != nil {
@@ -217,65 +359,42 @@ func runCrawl(dbPath, cfgPath string, refresh, wipe bool) error {
 				f.name, f.driveID, err)
 		}
 	}
-
-	remaining, cerr := countPendingFolders(db)
-	if cerr != nil {
-		return cerr
-	}
-	switch {
-	case ctx.Err() != nil:
-		log.Printf("interrupted: %d folders remaining (children_done=0) — re-run `crawl` to resume", remaining)
-	case failed > 0:
-		return fmt.Errorf("crawl finished with %d folder errors; %d folders remaining — re-run to retry", failed, remaining)
-	default:
-		// The crawl finished cleanly, so every live node was re-observed this
-		// session: drop the rows that were not (deleted from Drive since the
-		// previous crawl) so the snapshot reflects the tree as it is now.
-		if remaining == 0 {
-			removed, err := deleteStaleNodes(db, sessionStart)
-			if err != nil {
-				return fmt.Errorf("removing stale rows from the previous crawl: %w", err)
-			}
-			if removed > 0 {
-				log.Printf("removed %d stale node(s) not seen in this crawl", removed)
-			}
-		}
-		log.Printf("crawl complete: %d folders remaining (children_done=0), %d files seen this run", remaining, c.fileCount)
-	}
-	return nil
+	return failed
 }
 
-// validateAndInsertRoot fetches the configured root from Drive, verifies it
-// is a folder whose name exactly matches the config (a guard against crawling
-// the wrong folder), and upserts it with parent_id = NULL.
-func (c *crawler) validateAndInsertRoot(ctx context.Context, cfg rootConfig) error {
+// fetchFolder gets a single folder from Drive with the fields we persist, and
+// verifies it is still a folder.
+func (c *crawler) fetchFolder(ctx context.Context, id string) (*drive.File, error) {
 	var f *drive.File
-	err := c.withRetry(ctx, "files.get "+cfg.ID, func() error {
+	err := c.withRetry(ctx, "files.get "+id, func() error {
 		var err error
-		f, err = c.srv.Files.Get(cfg.ID).
+		f, err = c.srv.Files.Get(id).
 			Fields("id, name, mimeType, owners(emailAddress, displayName, permissionId), capabilities(canEdit, canListChildren), " + permissionFields).
 			SupportsAllDrives(true).
 			Context(ctx).Do()
 		return err
 	})
 	if err != nil {
-		return fmt.Errorf("fetching root folder %s: %w", cfg.ID, err)
+		return nil, err
 	}
 	if f.MimeType != folderMimeType {
-		return fmt.Errorf("root %s is not a folder (mimeType %q)", cfg.ID, f.MimeType)
+		return nil, fmt.Errorf("%s is not a folder (mimeType %q)", id, f.MimeType)
 	}
-	if f.Name != cfg.Name {
-		return fmt.Errorf("root name mismatch for %s: config expects %q but Drive has %q — refusing to crawl (is the id pointing at the right folder?)",
-			cfg.ID, cfg.Name, f.Name)
-	}
+	return f, nil
+}
 
+// upsertFolder records a folder fetched directly (not via a parent listing) and
+// its permissions, refreshing its crawled_at. parent_id is left to the upsert's
+// COALESCE, which preserves the first-discovered parent (NULL for the crawl
+// root, the existing parent for a re-observed subfolder).
+func (c *crawler) upsertFolder(f *drive.File) error {
 	tx, err := c.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	email, ownerID, display := ownerOf(f)
-	_, _, _, _, err = upsertNode(tx, node{
+	if _, _, _, _, err := upsertNode(tx, node{
 		driveID:      f.Id,
 		name:         f.Name,
 		typ:          typeFolder,
@@ -284,15 +403,28 @@ func (c *crawler) validateAndInsertRoot(ctx context.Context, cfg rootConfig) err
 		ownerID:      ownerID,
 		ownerDisplay: display,
 		canEdit:      canEditOf(f),
-		// parentID stays NULL: this is the crawl root
-	})
-	if err != nil {
-		return fmt.Errorf("inserting root: %w", err)
+	}); err != nil {
+		return fmt.Errorf("inserting %s: %w", f.Id, err)
 	}
 	if err := replacePermissions(tx, f.Id, permissionsOf(f)); err != nil {
-		return fmt.Errorf("recording root permissions: %w", err)
+		return fmt.Errorf("recording permissions for %s: %w", f.Id, err)
 	}
 	return tx.Commit()
+}
+
+// validateAndInsertRoot fetches the configured root from Drive, verifies it
+// is a folder whose name exactly matches the config (a guard against crawling
+// the wrong folder), and upserts it with parent_id = NULL.
+func (c *crawler) validateAndInsertRoot(ctx context.Context, cfg rootConfig) error {
+	f, err := c.fetchFolder(ctx, cfg.ID)
+	if err != nil {
+		return fmt.Errorf("fetching root folder %s: %w", cfg.ID, err)
+	}
+	if f.Name != cfg.Name {
+		return fmt.Errorf("root name mismatch for %s: config expects %q but Drive has %q — refusing to crawl (is the id pointing at the right folder?)",
+			cfg.ID, cfg.Name, f.Name)
+	}
+	return c.upsertFolder(f)
 }
 
 // listFolder lists every child of f, committing each page of children in one
