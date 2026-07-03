@@ -36,6 +36,11 @@ var packCmd = &cobra.Command{
 under <packing-folder>/<user>/, so the user can transfer it all to the org with
 a single drag of the Container into the shared-drive dropoff folder.
 
+Pass --folder <id> (a Drive folder ID that was crawled into the database) to
+pack only the user's items within that subfolder of the crawl root, instead of
+everything they own. The rest of the user's files stay put; the confirmation
+message shows the subfolder's path relative to the crawl root.
+
 Owned subtrees move intact: only "owned roots" (owned items whose parent is not
 owned by the user) are moved into the Container; owned items nested below them
 ride along. A recursive sweep then moves every item inside the Container tree
@@ -58,16 +63,33 @@ read-only access, the tool re-runs consent automatically to obtain it.`,
 		cfgPath, _ := cmd.Flags().GetString("config")
 		dryRun, _ := cmd.Flags().GetBool("dry-run")
 		maxErrors, _ := cmd.Flags().GetInt("max-errors")
-		return runPack(dbPath, cfgPath, args[0], dryRun, maxErrors)
+		subfolder, _ := cmd.Flags().GetString("folder")
+		return runPack(dbPath, cfgPath, args[0], subfolder, dryRun, maxErrors)
 	},
 }
 
 func init() {
 	packCmd.Flags().Bool("dry-run", false, "report what would move without changing anything (read-only scope)")
 	packCmd.Flags().Int("max-errors", 5, "abort once more than this many items fail to move")
+	packCmd.Flags().String("folder", "", "Google Drive folder ID to scope the pack to (must be crawled into the database); packs only the user's items within that subfolder of the crawl root")
 }
 
-func runPack(dbPath, cfgPath, account string, dryRun bool, maxErrors int) error {
+// subtreeRelativePath returns the path of driveID relative to the crawl root,
+// e.g. "Projects/2025" for a folder two levels below the root. nodePath yields
+// the segments from the crawl root down (root name first), so dropping the
+// first segment gives the path relative to it; it is empty for the root itself.
+func subtreeRelativePath(db *sql.DB, driveID string) (string, error) {
+	segments, err := nodePath(db, driveID)
+	if err != nil {
+		return "", err
+	}
+	if len(segments) > 1 {
+		return strings.Join(segments[1:], "/"), nil
+	}
+	return "", nil
+}
+
+func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors int) error {
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
 		return err
@@ -102,15 +124,41 @@ func runPack(dbPath, cfgPath, account string, dryRun bool, maxErrors int) error 
 			cfg.Crawl.Root.ID, cfg.Crawl.Root.Name, crawlRoot)
 	}
 
-	owned, err := nodesOwnedBy(db, account)
+	// An optional subfolder scopes the pack to the user's items within one
+	// crawled folder of the tree. It must be a folder in the snapshot (anything
+	// crawled is by construction under the crawl root). subfolderPath is its
+	// path relative to the crawl root, shown in the confirmation message.
+	var subfolderPath string
+	if subfolder != "" {
+		typ, err := nodeTypeByDriveID(db, subfolder)
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("subfolder %s not found in the database; it must be a folder crawled under the crawl root", subfolder)
+		}
+		if err != nil {
+			return err
+		}
+		if typ != typeFolder {
+			return fmt.Errorf("subfolder %s is a %s, not a folder", subfolder, typ)
+		}
+		subfolderPath, err = subtreeRelativePath(db, subfolder)
+		if err != nil {
+			return err
+		}
+	}
+
+	owned, err := nodesOwnedBy(db, account, subfolder)
 	if err != nil {
 		return err
 	}
 	if len(owned) == 0 {
-		fmt.Fprintf(os.Stderr, "Nothing owned by %q in the database; nothing to pack.\n", account)
+		if subfolder != "" {
+			fmt.Fprintf(os.Stderr, "Nothing owned by %q under subfolder %q in the database; nothing to pack.\n", account, subfolderPath)
+		} else {
+			fmt.Fprintf(os.Stderr, "Nothing owned by %q in the database; nothing to pack.\n", account)
+		}
 		return nil
 	}
-	roots, err := ownedRoots(db, account)
+	roots, err := ownedRoots(db, account, subfolder)
 	if err != nil {
 		return err
 	}
@@ -132,10 +180,24 @@ func runPack(dbPath, cfgPath, account string, dryRun bool, maxErrors int) error 
 
 	// Edit-access pre-check: the same scan check-edit-access reports. If any
 	// crawled node is not editable, the run may fail to move some items, so
-	// confirm before proceeding.
+	// confirm before proceeding. Scope it to the subfolder when one is given, so
+	// uneditable items elsewhere in the tree don't trigger a spurious prompt.
 	uneditable, err := nodesLackingEditAccess(db)
 	if err != nil {
 		return err
+	}
+	if subfolder != "" {
+		inSubtree, err := subtreeDriveIDs(db, subfolder)
+		if err != nil {
+			return err
+		}
+		filtered := uneditable[:0]
+		for _, r := range uneditable {
+			if inSubtree[r.driveID] {
+				filtered = append(filtered, r)
+			}
+		}
+		uneditable = filtered
 	}
 	if len(uneditable) > 0 {
 		var folderCount, fileCount int
@@ -262,11 +324,17 @@ func runPack(dbPath, cfgPath, account string, dryRun bool, maxErrors int) error 
 		}
 	}
 
+	// scopeNote describes the subfolder restriction for the confirmation, empty
+	// for a whole-tree pack.
+	scopeNote := ""
+	if subfolder != "" {
+		scopeNote = fmt.Sprintf(" from subfolder %q", subfolderPath)
+	}
 	if dryRun {
-		fmt.Fprintf(os.Stderr, "DRY RUN: no changes will be made. Would pack %d item(s) owned by %q (%d owned subtree root(s)).\n", len(owned), account, len(roots))
+		fmt.Fprintf(os.Stderr, "DRY RUN: no changes will be made. Would pack %d item(s) owned by %q%s (%d owned subtree root(s)).\n", len(owned), account, scopeNote, len(roots))
 	} else {
-		fmt.Fprintf(os.Stderr, "About to pack %d item(s) owned by %q (%d owned subtree root(s)) into %s/%s/%s.\n",
-			len(owned), account, len(roots), packing.Name, account, containerFolderName(account))
+		fmt.Fprintf(os.Stderr, "About to pack %d item(s) owned by %q%s (%d owned subtree root(s)) into %s/%s/%s.\n",
+			len(owned), account, scopeNote, len(roots), packing.Name, account, containerFolderName(account))
 		if !promptYesNo("Continue? [y/N] ") {
 			fmt.Fprintln(os.Stderr, "Aborted.")
 			return nil
@@ -360,7 +428,7 @@ func runPack(dbPath, cfgPath, account string, dryRun bool, maxErrors int) error 
 	// seen collects every user-owned item observed in the tree for Phase C.
 	seen := make(map[string]bool)
 	if dryRun {
-		preview, err := unownedChildrenOfOwned(db, account)
+		preview, err := unownedChildrenOfOwned(db, account, subfolder)
 		if err != nil {
 			return err
 		}

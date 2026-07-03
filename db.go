@@ -423,12 +423,27 @@ type ownedNode struct {
 }
 
 // nodesOwnedBy returns every node owned by account (matched against
-// owner_email OR owner_id), of any type, ordered by row id.
-func nodesOwnedBy(db *sql.DB, account string) ([]ownedNode, error) {
-	rows, err := db.Query(
-		`SELECT drive_id, name, type FROM nodes
-		 WHERE owner_email = ? OR owner_id = ?
-		 ORDER BY id`, account, account)
+// owner_email OR owner_id), of any type, ordered by row id. When subtreeRoot is
+// non-empty, only nodes within the subtree rooted at that Drive ID (inclusive)
+// are returned, so a pack can be scoped to one subfolder of the crawl root.
+func nodesOwnedBy(db *sql.DB, account, subtreeRoot string) ([]ownedNode, error) {
+	query := `SELECT drive_id, name, type FROM nodes
+		 WHERE (owner_email = ? OR owner_id = ?)
+		 ORDER BY id`
+	queryArgs := []any{account, account}
+	if subtreeRoot != "" {
+		query = `WITH RECURSIVE subtree(id) AS (
+			SELECT id FROM nodes WHERE drive_id = ?
+			UNION ALL
+			SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
+		)
+		SELECT drive_id, name, type FROM nodes
+		WHERE id IN (SELECT id FROM subtree)
+		  AND (owner_email = ? OR owner_id = ?)
+		ORDER BY id`
+		queryArgs = []any{subtreeRoot, account, account}
+	}
+	rows, err := db.Query(query, queryArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -457,14 +472,41 @@ type ownedRoot struct {
 // ownedRoots returns every node owned by account whose parent is NOT owned by
 // account, ordered by row id. The crawl root is excluded by the JOIN (it has
 // no parent row). IS NOT treats a parent with NULL owner fields as not-owned.
-func ownedRoots(db *sql.DB, account string) ([]ownedRoot, error) {
-	rows, err := db.Query(`
+//
+// When subtreeRoot is non-empty the roots are computed relative to that
+// subfolder: only owned nodes within its subtree are considered, and the
+// subfolder itself acts as a boundary — an owned node whose parent lies outside
+// the subtree (i.e. the subfolder itself, when it is owned) counts as a root
+// even though that parent is owned, so scoping to a subfolder always moves the
+// owned material inside it intact.
+func ownedRoots(db *sql.DB, account, subtreeRoot string) ([]ownedRoot, error) {
+	query := `
 		SELECT n.drive_id, n.name, n.type, p.drive_id
 		FROM nodes n
 		JOIN nodes p ON p.id = n.parent_id
 		WHERE (n.owner_email = ? OR n.owner_id = ?)
 		  AND p.owner_email IS NOT ? AND p.owner_id IS NOT ?
-		ORDER BY n.id`, account, account, account, account)
+		ORDER BY n.id`
+	queryArgs := []any{account, account, account, account}
+	if subtreeRoot != "" {
+		query = `WITH RECURSIVE subtree(id) AS (
+			SELECT id FROM nodes WHERE drive_id = ?
+			UNION ALL
+			SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
+		)
+		SELECT n.drive_id, n.name, n.type, p.drive_id
+		FROM nodes n
+		JOIN nodes p ON p.id = n.parent_id
+		WHERE n.id IN (SELECT id FROM subtree)
+		  AND (n.owner_email = ? OR n.owner_id = ?)
+		  AND (
+		    p.id NOT IN (SELECT id FROM subtree)
+		    OR (p.owner_email IS NOT ? AND p.owner_id IS NOT ?)
+		  )
+		ORDER BY n.id`
+		queryArgs = []any{subtreeRoot, account, account, account, account}
+	}
+	rows, err := db.Query(query, queryArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -491,14 +533,33 @@ type sweepPreview struct {
 // unownedChildrenOfOwned returns nodes NOT owned by account whose parent IS
 // owned by account. This is the dry-run preview of pack's Stash sweep; the
 // real sweep works from live listings so it also catches post-crawl items.
-func unownedChildrenOfOwned(db *sql.DB, account string) ([]sweepPreview, error) {
-	rows, err := db.Query(`
+// When subtreeRoot is non-empty the preview is limited to that subfolder's
+// subtree, matching a subfolder-scoped pack.
+func unownedChildrenOfOwned(db *sql.DB, account, subtreeRoot string) ([]sweepPreview, error) {
+	query := `
 		SELECT n.drive_id, n.name, p.drive_id
 		FROM nodes n
 		JOIN nodes p ON p.id = n.parent_id
 		WHERE (p.owner_email = ? OR p.owner_id = ?)
 		  AND n.owner_email IS NOT ? AND n.owner_id IS NOT ?
-		ORDER BY n.id`, account, account, account, account)
+		ORDER BY n.id`
+	queryArgs := []any{account, account, account, account}
+	if subtreeRoot != "" {
+		query = `WITH RECURSIVE subtree(id) AS (
+			SELECT id FROM nodes WHERE drive_id = ?
+			UNION ALL
+			SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
+		)
+		SELECT n.drive_id, n.name, p.drive_id
+		FROM nodes n
+		JOIN nodes p ON p.id = n.parent_id
+		WHERE n.id IN (SELECT id FROM subtree)
+		  AND (p.owner_email = ? OR p.owner_id = ?)
+		  AND n.owner_email IS NOT ? AND n.owner_id IS NOT ?
+		ORDER BY n.id`
+		queryArgs = []any{subtreeRoot, account, account, account, account}
+	}
+	rows, err := db.Query(query, queryArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -842,6 +903,32 @@ func countOwned(n *exploreNode) (folders, files int) {
 	n.ownedFolders = folders
 	n.ownedFiles = files
 	return folders, files
+}
+
+// subtreeDriveIDs returns the set of Drive IDs of every node within the subtree
+// rooted at rootDriveID (inclusive), walking parent_id downwards. Used to scope
+// whole-tree reports (e.g. the edit-access pre-check) to one subfolder.
+func subtreeDriveIDs(db *sql.DB, rootDriveID string) (map[string]bool, error) {
+	rows, err := db.Query(`
+		WITH RECURSIVE subtree(id) AS (
+			SELECT id FROM nodes WHERE drive_id = ?
+			UNION ALL
+			SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
+		)
+		SELECT drive_id FROM nodes WHERE id IN (SELECT id FROM subtree)`, rootDriveID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := make(map[string]bool)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids[id] = true
+	}
+	return ids, rows.Err()
 }
 
 // crawlRootDriveID returns the Drive ID of the crawl root (the node with no

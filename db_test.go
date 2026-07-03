@@ -329,7 +329,7 @@ func TestNodesOwnedBy(t *testing.T) {
 	db := testDB(t)
 	buildPackTree(t, db)
 
-	nodes, err := nodesOwnedBy(db, "alice@example.com")
+	nodes, err := nodesOwnedBy(db, "alice@example.com", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -342,11 +342,30 @@ func TestNodesOwnedBy(t *testing.T) {
 	}
 }
 
+func TestNodesOwnedBySubfolder(t *testing.T) {
+	db := testDB(t)
+	buildPackTree(t, db)
+
+	// Scoped to A: only alice's items within A's subtree (A itself, a1, B, e1),
+	// not loose or c1 which live elsewhere under the root.
+	nodes, err := nodesOwnedBy(db, "alice@example.com", "A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, n := range nodes {
+		got = append(got, n.driveID)
+	}
+	if strings.Join(got, ",") != "A,a1,B,e1" {
+		t.Errorf("nodesOwnedBy(A) = %v, want [A a1 B e1]", got)
+	}
+}
+
 func TestOwnedRoots(t *testing.T) {
 	db := testDB(t)
 	buildPackTree(t, db)
 
-	roots, err := ownedRoots(db, "alice@example.com")
+	roots, err := ownedRoots(db, "alice@example.com", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -367,6 +386,60 @@ func TestOwnedRoots(t *testing.T) {
 	}
 }
 
+func TestOwnedRootsSubfolder(t *testing.T) {
+	db := testDB(t)
+	buildPackTree(t, db)
+
+	// Scoped to A: A itself is a root even though its parent Root is owned by
+	// bob — the subfolder boundary makes it one, and it carries a1/B along. e1's
+	// parent E (carol's) is not owned, so e1 is a separate root. loose and c1
+	// live outside A and are excluded.
+	roots, err := ownedRoots(db, "alice@example.com", "A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, r := range roots {
+		got[r.driveID] = r.parentDriveID
+	}
+	want := map[string]string{"A": "root", "e1": "E"}
+	if len(got) != len(want) {
+		t.Fatalf("ownedRoots(A) = %v, want %v", got, want)
+	}
+	for id, parent := range want {
+		if got[id] != parent {
+			t.Errorf("ownedRoots(A)[%s] parent = %q, want %q", id, got[id], parent)
+		}
+	}
+}
+
+func TestOwnedRootsSubfolderOwnedParent(t *testing.T) {
+	db := testDB(t)
+	buildPackTree(t, db)
+
+	// Scoped to B (owned by alice, whose parent A is also owned by alice): B must
+	// still count as a root of the scoped pack even though its parent is owned,
+	// because A lies outside the subfolder. b1 (bob's) is not owned, so B is the
+	// only root.
+	roots, err := ownedRoots(db, "alice@example.com", "B")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, r := range roots {
+		got[r.driveID] = r.parentDriveID
+	}
+	want := map[string]string{"B": "A"}
+	if len(got) != len(want) {
+		t.Fatalf("ownedRoots(B) = %v, want %v", got, want)
+	}
+	for id, parent := range want {
+		if got[id] != parent {
+			t.Errorf("ownedRoots(B)[%s] parent = %q, want %q", id, got[id], parent)
+		}
+	}
+}
+
 func TestOwnedRootsExcludesCrawlRoot(t *testing.T) {
 	db := testDB(t)
 	// The crawl root itself owned by the migrating user must never be a root.
@@ -375,7 +448,7 @@ func TestOwnedRootsExcludesCrawlRoot(t *testing.T) {
 	mustUpsert(t, db, node{driveID: "f", name: "f.pdf", typ: typeBinary, mimeType: "application/pdf",
 		parentID: sql.NullInt64{Int64: rootID, Valid: true}, ownerEmail: nullString("alice@example.com")})
 
-	roots, err := ownedRoots(db, "alice@example.com")
+	roots, err := ownedRoots(db, "alice@example.com", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -388,7 +461,7 @@ func TestUnownedChildrenOfOwned(t *testing.T) {
 	db := testDB(t)
 	buildPackTree(t, db)
 
-	items, err := unownedChildrenOfOwned(db, "alice@example.com")
+	items, err := unownedChildrenOfOwned(db, "alice@example.com", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -404,6 +477,31 @@ func TestUnownedChildrenOfOwned(t *testing.T) {
 	for id, parent := range want {
 		if got[id] != parent {
 			t.Errorf("unownedChildrenOfOwned[%s] parent = %q, want %q", id, got[id], parent)
+		}
+	}
+}
+
+func TestUnownedChildrenOfOwnedSubfolder(t *testing.T) {
+	db := testDB(t)
+	buildPackTree(t, db)
+
+	// Scoped to B: only b1 (bob's, inside alice's B) is previewed. E and x1 live
+	// directly under A, outside B's subtree, so they are excluded.
+	items, err := unownedChildrenOfOwned(db, "alice@example.com", "B")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, s := range items {
+		got[s.driveID] = s.parentDriveID
+	}
+	want := map[string]string{"b1": "B"}
+	if len(got) != len(want) {
+		t.Fatalf("unownedChildrenOfOwned(B) = %v, want %v", got, want)
+	}
+	for id, parent := range want {
+		if got[id] != parent {
+			t.Errorf("unownedChildrenOfOwned(B)[%s] parent = %q, want %q", id, got[id], parent)
 		}
 	}
 }
@@ -524,6 +622,48 @@ func TestNodePath(t *testing.T) {
 	}
 	if _, err := nodePath(db, "missing"); err == nil {
 		t.Error("expected error for unknown drive id")
+	}
+}
+
+func TestSubtreeRelativePath(t *testing.T) {
+	db := testDB(t)
+	rootID, _, _, _ := mustUpsert(t, db, node{driveID: "root", name: "DxE General", typ: typeFolder, mimeType: folderMimeType})
+	subID, _, _, _ := mustUpsert(t, db, node{driveID: "sub", name: "Finance", typ: typeFolder, mimeType: folderMimeType,
+		parentID: sql.NullInt64{Int64: rootID, Valid: true}})
+	mustUpsert(t, db, node{driveID: "deep", name: "2025", typ: typeFolder, mimeType: folderMimeType,
+		parentID: sql.NullInt64{Int64: subID, Valid: true}})
+
+	// Path relative to the crawl root drops the root's own name.
+	if got, err := subtreeRelativePath(db, "deep"); err != nil {
+		t.Fatal(err)
+	} else if got != "Finance/2025" {
+		t.Errorf("subtreeRelativePath(deep) = %q, want %q", got, "Finance/2025")
+	}
+	// The crawl root itself has an empty relative path.
+	if got, err := subtreeRelativePath(db, "root"); err != nil {
+		t.Fatal(err)
+	} else if got != "" {
+		t.Errorf("subtreeRelativePath(root) = %q, want empty", got)
+	}
+}
+
+func TestSubtreeDriveIDs(t *testing.T) {
+	db := testDB(t)
+	buildPackTree(t, db)
+
+	ids, err := subtreeDriveIDs(db, "A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A and everything beneath it, but not loose, C, c1, or the root.
+	want := map[string]bool{"A": true, "a1": true, "B": true, "b1": true, "E": true, "e1": true, "x1": true}
+	if len(ids) != len(want) {
+		t.Fatalf("subtreeDriveIDs(A) = %v, want %v", ids, want)
+	}
+	for id := range want {
+		if !ids[id] {
+			t.Errorf("subtreeDriveIDs(A) missing %q", id)
+		}
 	}
 }
 

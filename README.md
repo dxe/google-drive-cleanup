@@ -248,6 +248,14 @@ new root) before packing. `unpack` deliberately skips this check — it finishes
 an in-flight migration from the per-user state recorded at pack time, not from
 the crawl root.
 
+Pass **`--folder <id>`** (a Drive folder ID that was crawled into the database)
+to scope the pack to just the user's items within that subfolder of the crawl
+root, leaving the rest of their files in place. Owned roots are then
+computed relative to the subfolder — the subfolder acts as the boundary, so an
+owned item whose owned parent lies *outside* it still moves — and both the
+edit-access pre-check and the dry-run sweep preview are limited to that subtree.
+The confirmation message shows the subfolder's path relative to the crawl root.
+
 `pack` ends by printing the manual steps: transfer Container ownership to the
 user (invite + accept), then have them drag the Container into the Dropoff
 folder — one drag, and the org owns everything inside.
