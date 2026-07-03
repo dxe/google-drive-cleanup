@@ -55,7 +55,8 @@ func (r rootConfig) validate(section string) error {
 	return nil
 }
 
-// migrationConfig holds settings shared by the pack and unpack commands.
+// migrationConfig holds settings for the migration commands. Most are shared by
+// pack and unpack; a few (e.g. SkipUnmovable) apply to only one of them.
 type migrationConfig struct {
 	// PackingFolder holds one folder per user being migrated, each containing
 	// that user's Container and Stash. It MUST be a regular My-Drive folder,
@@ -66,6 +67,11 @@ type migrationConfig struct {
 	// DropoffFolder is the shared-drive folder a user drags their Container
 	// into; the drag flips ownership of the container's whole tree to the org.
 	DropoffFolder rootConfig `json:"dropoff-folder" doc:"the shared-drive folder users drag their Container into"`
+	// SkipUnmovable mirrors the pack command's --skip-unmovable flag: skip
+	// crawled items the crawling account cannot edit (they cannot be moved) and
+	// pack the rest instead of aborting. Either the flag or this setting enables
+	// the behavior.
+	SkipUnmovable bool `json:"skip-unmovable" doc:"set true to skip uneditable items and pack the rest instead of aborting (same as pack's --skip-unmovable)"`
 }
 
 func loadConfig(path string) (config, error) {
@@ -103,6 +109,7 @@ func configTemplate() (string, error) {
 		Migration: migrationConfig{
 			PackingFolder: folder("PACKING"),
 			DropoffFolder: folder("DROPOFF"),
+			SkipUnmovable: false,
 		},
 	}
 	b, err := json.MarshalIndent(cfg, "", "  ")

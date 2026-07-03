@@ -77,7 +77,7 @@ func init() {
 	packCmd.Flags().Bool("dry-run", false, "report what would move without changing anything (read-only scope)")
 	packCmd.Flags().Int("max-errors", 5, "abort once more than this many items fail to move")
 	packCmd.Flags().String("folder", "", "Google Drive folder ID to scope the pack to (must be crawled into the database); packs only the user's items within that subfolder of the crawl root")
-	packCmd.Flags().Bool("skip-unmovable", false, "skip crawled items the crawling account cannot edit (they cannot be moved) and pack the rest, instead of aborting")
+	packCmd.Flags().Bool("skip-unmovable", false, "skip crawled items the crawling account cannot edit (they cannot be moved) and pack the rest, instead of aborting (equivalent to migration.skip-unmovable in config.json)")
 }
 
 // subtreeRelativePath returns the path of driveID relative to the crawl root,
@@ -100,6 +100,8 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 	if err != nil {
 		return err
 	}
+	// The config setting and the flag are equivalent; either one enables skipping.
+	skipUnmovable = skipUnmovable || cfg.Migration.SkipUnmovable
 	if err := cfg.Migration.PackingFolder.validate("migration.packing-folder"); err != nil {
 		return fmt.Errorf("%s: %w", cfgPath, err)
 	}
@@ -215,12 +217,12 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 			}
 		}
 		if !skipUnmovable {
-			return fmt.Errorf("%d crawled item(s) are not editable by the crawling account: %d folder(s), %d file(s); any of these that need to move will fail. Run check-edit-access for the full list, or pass --skip-unmovable to skip those items and pack the rest",
+			return fmt.Errorf("%d crawled item(s) are not editable by the crawling account: %d folder(s), %d file(s); any of these that need to move will fail. Run check-edit-access for the full list, or pass --skip-unmovable (or set migration.skip-unmovable in config) to skip those items and pack the rest",
 				len(uneditable), folderCount, fileCount)
 		}
 		fmt.Fprintf(os.Stderr, "WARNING: %d crawled item(s) are not editable by the crawling account: %d folder(s), %d file(s).\n",
 			len(uneditable), folderCount, fileCount)
-		fmt.Fprintln(os.Stderr, "Proceeding due to --skip-unmovable; these items will be skipped, not moved. Run check-edit-access for the full list.")
+		fmt.Fprintln(os.Stderr, "Proceeding due to skip-unmovable; these items will be skipped, not moved. Run check-edit-access for the full list.")
 	}
 
 	// unmovable is the set of nodes the crawling account cannot edit, keyed by
