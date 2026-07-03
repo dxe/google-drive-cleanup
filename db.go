@@ -1160,13 +1160,33 @@ func deleteStaleNodesUnder(db *sql.DB, subfolderDriveID, cutoff string) (int64, 
 	return removed, nil
 }
 
-// updateNodeOwner overwrites the owner fields for the node with the given driveID.
-// Called after unpack moves a file back to the authenticated user's Drive.
-func updateNodeOwner(db *sql.DB, driveID, email, permissionID, displayName string) error {
-	_, err := db.Exec(
-		`UPDATE nodes SET owner_email = ?, owner_id = ?, owner_display_name = ? WHERE drive_id = ?`,
-		email, permissionID, displayName, driveID)
-	return err
+// updateSubtreeOwner overwrites the owner fields for every node in the subtree
+// rooted at rootDriveID (inclusive) that the database currently records as owned
+// by fromAccount (matched against owner_email OR owner_id). It returns the number
+// of rows updated.
+//
+// Called after unpack moves an item back from a Container that was dragged into
+// the shared drive: that drag flips ownership of everything physically inside the
+// Container to the org, so we can record the new owner for the whole restored
+// subtree without a per-file Drive lookup. Scoping to fromAccount leaves the
+// third-party items that were parked in the Stash (nested elsewhere in the same
+// crawled subtree) untouched — those never entered the Container, so their
+// ownership did not change and they are restored separately.
+func updateSubtreeOwner(db *sql.DB, rootDriveID, fromAccount, email, permissionID, displayName string) (int64, error) {
+	res, err := db.Exec(`
+		WITH RECURSIVE subtree(id) AS (
+			SELECT id FROM nodes WHERE drive_id = ?
+			UNION ALL
+			SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
+		)
+		UPDATE nodes SET owner_email = ?, owner_id = ?, owner_display_name = ?
+		WHERE id IN (SELECT id FROM subtree)
+		  AND (owner_email = ? OR owner_id = ?)`,
+		rootDriveID, email, permissionID, displayName, fromAccount, fromAccount)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // originalParentDriveID returns the Drive ID of the folder the given file was

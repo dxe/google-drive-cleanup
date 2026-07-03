@@ -342,6 +342,63 @@ func TestNodesOwnedBy(t *testing.T) {
 	}
 }
 
+func TestUpdateSubtreeOwner(t *testing.T) {
+	db := testDB(t)
+	buildPackTree(t, db)
+
+	// Flip the whole subtree rooted at A (an owned root pack moves intact) to the
+	// org account, as unpack does after the drag. Only alice's rows within A's
+	// subtree — A, a1, B, and e1 (owned via owner_id) — should change; the nested
+	// third-party items b1 (bob) and E (carol), which pack parks in the Stash,
+	// and the ownerless x1 must be left alone.
+	n, err := updateSubtreeOwner(db, "A", "alice@example.com", "org@example.com", "orgPID", "Org Admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 4 {
+		t.Errorf("updateSubtreeOwner rows affected = %d, want 4", n)
+	}
+
+	owners := map[string]string{}
+	rows, err := db.Query(`SELECT drive_id, COALESCE(owner_email, owner_id, "") FROM nodes`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, owner string
+		if err := rows.Scan(&id, &owner); err != nil {
+			t.Fatal(err)
+		}
+		owners[id] = owner
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, id := range []string{"A", "a1", "B", "e1"} {
+		if owners[id] != "org@example.com" {
+			t.Errorf("owner[%s] = %q after flip, want org@example.com", id, owners[id])
+		}
+	}
+	if owners["b1"] != "bob@example.com" {
+		t.Errorf("owner[b1] = %q, want bob@example.com (stashed, unchanged)", owners["b1"])
+	}
+	if owners["E"] != "carol@example.com" {
+		t.Errorf("owner[E] = %q, want carol@example.com (stashed, unchanged)", owners["E"])
+	}
+	if owners["x1"] != "" {
+		t.Errorf("owner[x1] = %q, want empty (ownerless, unchanged)", owners["x1"])
+	}
+	// Alice's items outside A's subtree must not be touched.
+	if owners["loose"] != "alice@example.com" {
+		t.Errorf("owner[loose] = %q, want alice@example.com (outside subtree)", owners["loose"])
+	}
+	if owners["c1"] != "alice@example.com" {
+		t.Errorf("owner[c1] = %q, want alice@example.com (outside subtree)", owners["c1"])
+	}
+}
+
 func TestNodesOwnedBySubfolder(t *testing.T) {
 	db := testDB(t)
 	buildPackTree(t, db)

@@ -269,8 +269,12 @@ drive), then:
 
 1. **Restores the Container's contents.** Each direct child moves back to the
    original parent recorded in `drive.db`; owned items nested deeper ride
-   along with their folders. The database's owner columns are updated to the
-   running account as items return.
+   along with their folders. Because the drag flipped ownership of everything
+   inside the Container to the org, the database's owner columns are updated to
+   the running account for each restored item and its subtree (only
+   the rows the snapshot attributed to the migrating user — nested third-party
+   items were parked in the Stash and keep their owners), without a per-file
+   Drive lookup.
 2. **Restores the Stash.** Same mechanism. The Container must come first:
    Stash items are owned by third parties, and a shared drive cannot hold
    those, so their destination folders have to be back in the regular tree

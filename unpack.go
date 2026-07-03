@@ -277,8 +277,17 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 			if merr == nil {
 				detailf("OK %q (%s) -> parent %s", c.Name, c.Id, orig)
 				if flipOwner {
-					if err := updateNodeOwner(db, c.Id, me.EmailAddress, me.PermissionId, me.DisplayName); err != nil {
-						log.Printf("WARN could not update owner in DB for %q (%s): %v", c.Name, c.Id, err)
+					// The drag flipped ownership of everything inside the
+					// Container to the org, so this child and every item that
+					// rode along inside it (an owned subtree moves as one item)
+					// is now owned by the running account. Record that for the
+					// whole subtree without a per-file Drive lookup; the update
+					// only touches rows the DB attributes to the migrating user,
+					// leaving nested third-party (stashed) items alone.
+					if n, err := updateSubtreeOwner(db, c.Id, account, me.EmailAddress, me.PermissionId, me.DisplayName); err != nil {
+						log.Printf("WARN could not update owner in DB for %q (%s) subtree: %v", c.Name, c.Id, err)
+					} else {
+						detailf("   updated owner for %d DB row(s) under %q (%s)", n, c.Name, c.Id)
 					}
 				}
 				restored++
