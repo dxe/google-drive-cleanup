@@ -310,7 +310,8 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 		"create a folder named %q inside %s/%s with the admin's PERSONAL Gmail account (only personal accounts can transfer ownership to other personal accounts; the packing folder must be shared with that account as editor), then re-run pack",
 		containerFolderName(account), packing.Name, account)
 	if containerF == nil && !dryRun {
-		return fmt.Errorf("no %q folder yet: %s", containerFolderName(account), containerInstructions)
+		parentLink := "https://drive.google.com/drive/folders/" + userFolder.Id
+		return fmt.Errorf("no %q folder yet: %s\nParent folder to create it in: %s", containerFolderName(account), containerInstructions, parentLink)
 	}
 
 	if !dryRun {

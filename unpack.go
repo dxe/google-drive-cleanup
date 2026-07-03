@@ -17,6 +17,15 @@ var unpackCmd = &cobra.Command{
 	Long: `Finish <user>'s migration after they drag their Container into the shared-drive
 dropoff folder (which flips ownership of everything inside to the org).
 
+The Container is located live as the child named <user>-Container, not by the
+ID recorded at pack time, in case it is manually re-created by the admin.
+Normally it is found in the dropoff folder; with --allow-not-moved it is found
+in the per-user packing folder instead (where it still sits, un-dragged).
+If what is found differs from the recorded ID, unpack asks for confirmation
+before proceeding. If no such folder is found in the expected place, unpack
+errors out (the Container is in the wrong location or missing) rather than
+falling back to the recorded ID.
+
 Each direct child of the Container is moved back to the original parent
 recorded in the database (owned items nested deeper ride along with their
 folders), then each Stash item is returned the same way. The Container must be
@@ -113,17 +122,81 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 		return fmt.Errorf("dropoff folder %s is not in a shared drive", dropoff.Id)
 	}
 
+	limiter := rate.NewLimiter(rate.Limit(3), 3)
+
+	// resolveContainer picks the Container to unpack from what was found live by
+	// name, rather than trusting the ID recorded at pack time — the drag can
+	// substitute a re-created folder, and the live tree is the source of truth
+	// for what is about to be unpacked. When the found folder differs from the
+	// recorded ID it confirms first (or just notes it, in a dry run). Returns
+	// the chosen ID and whether to proceed.
+	resolveContainer := func(found *drive.File, location string) (string, bool) {
+		if found.Id == m.containerID {
+			return found.Id, true
+		}
+		fmt.Fprintf(os.Stderr, "The %q folder in the %s (id %s) does not match the Container recorded at pack time (id %s).\n",
+			containerFolderName(account), location, found.Id, m.containerID)
+		if dryRun {
+			fmt.Fprintf(os.Stderr, "DRY RUN: would unpack the folder found in the %s (%s).\n", location, found.Id)
+			return found.Id, true
+		}
+		if !promptYesNo(fmt.Sprintf("Unpack the folder found in the %s (%s) instead? [y/N] ", location, found.Id)) {
+			fmt.Fprintln(os.Stderr, "Aborted.")
+			return "", false
+		}
+		return found.Id, true
+	}
+
+	// After the user drags it in, the Container is a direct child of the dropoff
+	// folder, so look it up there first.
+	containerID := m.containerID
+	dropoffChild, err := findChildFolder(ctx, svc, limiter, dropoff.Id, containerFolderName(account))
+	if err != nil {
+		return fmt.Errorf("looking for the Container in the dropoff folder %s: %w", dropoff.Id, err)
+	}
+	switch {
+	case dropoffChild != nil:
+		id, ok := resolveContainer(dropoffChild, fmt.Sprintf("dropoff folder %q", dropoff.Name))
+		if !ok {
+			return nil
+		}
+		containerID = id
+	case allowNotMoved:
+		// Migration abort: the Container was never dragged, so it still lives in
+		// the per-user packing folder. Find it there instead of trusting the
+		// recorded ID.
+		packingChild, err := findChildFolder(ctx, svc, limiter, m.userFolderID, containerFolderName(account))
+		if err != nil {
+			return fmt.Errorf("looking for the Container in the packing folder %s: %w", m.userFolderID, err)
+		}
+		if packingChild == nil {
+			return fmt.Errorf("no %q folder found in the dropoff folder %q or the per-user packing folder %s; the Container recorded at pack time (%s) is missing from both", containerFolderName(account), dropoff.Name, m.userFolderID, m.containerID)
+		}
+		id, ok := resolveContainer(packingChild, "per-user packing folder")
+		if !ok {
+			return nil
+		}
+		containerID = id
+	default:
+		// No Container by that name in the dropoff folder means the drag has not
+		// happened (or it was dragged somewhere else). The recorded Container is
+		// in the wrong location; refuse rather than silently unpacking from it.
+		// --allow-not-moved is the deliberate exception handled above.
+		return fmt.Errorf("no %q folder found in the dropoff folder %q — the Container recorded at pack time (%s) is not there; it is in the wrong location and must be dragged into the dropoff folder before unpacking (pass --allow-not-moved to abort the migration and restore from the packing folder instead)",
+			containerFolderName(account), dropoff.Name, m.containerID)
+	}
+
 	// The Container must actually have been dragged into the shared drive, and
 	// the running account must be able to move items back out of it.
-	container, err := svc.Files.Get(m.containerID).
+	container, err := svc.Files.Get(containerID).
 		Fields("id, name, driveId, trashed, capabilities(canMoveItemOutOfDrive)").
 		SupportsAllDrives(true).
 		Context(ctx).Do()
 	if err != nil {
-		return fmt.Errorf("fetching Container %s: %w", m.containerID, err)
+		return fmt.Errorf("fetching Container %s: %w", containerID, err)
 	}
 	if container.Trashed {
-		return fmt.Errorf("Container %s is trashed", m.containerID)
+		return fmt.Errorf("Container %s is trashed", containerID)
 	}
 	// containerInSharedDrive is the normal, post-drag state: ownership of
 	// everything inside has flipped to the org. When the Container is still in
@@ -134,12 +207,12 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 	containerInSharedDrive := container.DriveId != ""
 	if !containerInSharedDrive {
 		if !allowNotMoved {
-			return fmt.Errorf("Container %s is still outside the shared drive — has %s dragged it into %q yet? (pass --allow-not-moved to abort the migration and restore files to their original locations instead)", m.containerID, account, dropoff.Name)
+			return fmt.Errorf("Container %s is still outside the shared drive — has %s dragged it into %q yet? (pass --allow-not-moved to abort the migration and restore files to their original locations instead)", containerID, account, dropoff.Name)
 		}
-		log.Printf("WARN Container %s was never dragged into the shared drive; --allow-not-moved set: aborting the migration and restoring files to their original locations. Ownership did not transfer to the org, so files keep their current owners and the database owner columns are left unchanged.", m.containerID)
+		log.Printf("WARN Container %s was never dragged into the shared drive; --allow-not-moved set: aborting the migration and restoring files to their original locations. Ownership did not transfer to the org, so files keep their current owners and the database owner columns are left unchanged.", containerID)
 	} else {
 		if container.DriveId != dropoff.DriveId {
-			return fmt.Errorf("Container %s is in shared drive %s, but not the dropoff folder's shared drive %s", m.containerID, container.DriveId, dropoff.DriveId)
+			return fmt.Errorf("Container %s is in shared drive %s, but not the dropoff folder's shared drive %s", containerID, container.DriveId, dropoff.DriveId)
 		}
 		if container.Capabilities != nil && !container.Capabilities.CanMoveItemOutOfDrive {
 			return fmt.Errorf("%s cannot move items out of shared drive %s; it needs manager access", me.EmailAddress, container.DriveId)
@@ -173,8 +246,6 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 			return nil
 		}
 	}
-
-	limiter := rate.NewLimiter(rate.Limit(3), 3)
 
 	var restored, quarantined, failed int
 	fail := func(format string, args ...any) error {
