@@ -160,17 +160,20 @@ func createFolder(ctx context.Context, svc *drive.Service, limiter *rate.Limiter
 	}).SupportsAllDrives(true).Fields("id, name").Context(ctx).Do()
 }
 
+// moveFile reparents an item, retrying transient failures with backoff. Notably
+// this includes the eventual-consistency 403 unpack can hit right after moving a
+// destination folder out of a shared drive (see retryable); the pack/unpack
+// write path has no other retry, so it lives here.
 func moveFile(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, fileID, addParent, removeParent string) error {
-	if err := limiter.Wait(ctx); err != nil {
+	return withRetry(ctx, limiter, "files.update move "+fileID, func() error {
+		_, err := svc.Files.Update(fileID, nil).
+			AddParents(addParent).
+			RemoveParents(removeParent).
+			SupportsAllDrives(true).
+			Fields("id").
+			Context(ctx).Do()
 		return err
-	}
-	_, err := svc.Files.Update(fileID, nil).
-		AddParents(addParent).
-		RemoveParents(removeParent).
-		SupportsAllDrives(true).
-		Fields("id").
-		Context(ctx).Do()
-	return err
+	})
 }
 
 // findUserPermission returns email's existing permission on fileID

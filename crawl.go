@@ -625,10 +625,18 @@ func joinKnown(ids []string, known map[string]bool) string {
 // backoff plus jitter on 403 rateLimitExceeded, 429 and 5xx responses.
 // Retries go back through the limiter too — they never bypass it.
 func (c *crawler) withRetry(ctx context.Context, op string, fn func() error) error {
+	return withRetry(ctx, c.limiter, op, fn)
+}
+
+// withRetry runs fn through the given rate limiter, retrying with exponential
+// backoff plus jitter on the errors retryable reports transient. Retries go
+// back through the limiter too — they never bypass it. Used by the crawl and by
+// the pack/unpack write operations alike.
+func withRetry(ctx context.Context, limiter *rate.Limiter, op string, fn func() error) error {
 	const maxAttempts = 8
 	backoff := time.Second
 	for attempt := 1; ; attempt++ {
-		if err := c.limiter.Wait(ctx); err != nil {
+		if err := limiter.Wait(ctx); err != nil {
 			return err
 		}
 		err := fn()
@@ -661,7 +669,18 @@ func retryable(err error) bool {
 		return true
 	case gerr.Code == 403:
 		for _, e := range gerr.Errors {
-			if e.Reason == "rateLimitExceeded" || e.Reason == "userRateLimitExceeded" {
+			switch e.Reason {
+			case "rateLimitExceeded", "userRateLimitExceeded":
+				return true
+			case "fileWriterTeamDriveMoveInDisabled":
+				// Raised by unpack when moving an item into a destination that is
+				// (still) inside a shared drive. Right after the Container restore
+				// moves a folder subtree out of the shared drive, Drive's backend is
+				// eventually consistent: for a short window it still treats the just-
+				// moved destination as residing in the shared drive and rejects the
+				// move-in. Retrying lets that settle. If the destination is genuinely
+				// still in the shared drive (e.g. its owned-root ancestor failed to
+				// restore), the retries exhaust and it fails as before.
 				return true
 			}
 		}
