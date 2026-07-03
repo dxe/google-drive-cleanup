@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -54,11 +56,38 @@ func classify(mimeType string) string {
 }
 
 type crawler struct {
-	db        *sql.DB
-	srv       *drive.Service
-	limiter   *rate.Limiter
-	visited   map[string]bool // Drive IDs of folders already listed this run (cycle guard)
-	fileCount int64           // running count of child rows upserted this run
+	db          *sql.DB
+	srv         *drive.Service
+	limiter     *rate.Limiter
+	concurrency int // how many folders to list in parallel (see --concurrency)
+
+	// visited guards against listing a folder twice (a cycle or a second parent).
+	// The concurrent drain does a test-and-set on it from many workers, so it and
+	// its mutex must be used together (see markVisited/isVisited).
+	visitedMu sync.Mutex
+	visited   map[string]bool
+
+	fileCount atomic.Int64 // running count of child rows upserted this run
+}
+
+// markVisited records driveID as listed and reports whether this call is the one
+// that claimed it — the first worker to reach a folder gets true and lists it;
+// any later sighting (a cycle or a second parent) gets false and skips.
+func (c *crawler) markVisited(driveID string) bool {
+	c.visitedMu.Lock()
+	defer c.visitedMu.Unlock()
+	if c.visited[driveID] {
+		return false
+	}
+	c.visited[driveID] = true
+	return true
+}
+
+// isVisited reports whether driveID has already been claimed for listing.
+func (c *crawler) isVisited(driveID string) bool {
+	c.visitedMu.Lock()
+	defer c.visitedMu.Unlock()
+	return c.visited[driveID]
 }
 
 var crawlCmd = &cobra.Command{
@@ -81,17 +110,27 @@ pruning stale rows under it alone. The folder must already exist in the snapshot
 		refresh, _ := cmd.Flags().GetBool("refresh")
 		wipe, _ := cmd.Flags().GetBool("wipe")
 		subfolder, _ := cmd.Flags().GetString("folder")
-		return runCrawl(dbPath, cfgPath, refresh, wipe, subfolder)
+		concurrency, _ := cmd.Flags().GetInt("concurrency")
+		return runCrawl(dbPath, cfgPath, refresh, wipe, subfolder, concurrency)
 	},
 }
+
+// defaultCrawlConcurrency is how many folders the crawl lists in parallel by
+// default. Each files.list carries hundreds of ms of latency, so a single worker
+// only reaches a few folders per second regardless of the rate limit; a handful
+// of workers keeps enough requests in flight to reach the shared limiter's
+// ceiling. The limiter (not the worker count) is the quota safety cap, so this
+// stays modest.
+const defaultCrawlConcurrency = 8
 
 func init() {
 	crawlCmd.Flags().Bool("refresh", false, "reset children_done on all folders to force a full re-crawl")
 	crawlCmd.Flags().Bool("wipe", false, "discard the previous crawl snapshot entirely and crawl from scratch")
 	crawlCmd.Flags().String("folder", "", "Drive folder ID (already crawled) to re-index in place, pruning stale rows under that subfolder only")
+	crawlCmd.Flags().Int("concurrency", defaultCrawlConcurrency, "how many folders to list in parallel (all still share the global rate limiter)")
 }
 
-func runCrawl(dbPath, cfgPath string, refresh, wipe bool, subfolder string) error {
+func runCrawl(dbPath, cfgPath string, refresh, wipe bool, subfolder string, concurrency int) error {
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
 		return err
@@ -130,10 +169,15 @@ func runCrawl(dbPath, cfgPath string, refresh, wipe bool, subfolder string) erro
 	}
 
 	c := &crawler{
-		db:      db,
-		srv:     srv,
-		limiter: rate.NewLimiter(rate.Limit(3), 3), // Drive sustains only a few req/sec
-		visited: make(map[string]bool),
+		db:  db,
+		srv: srv,
+		// Folders are listed concurrently (see --concurrency), but every call still
+		// passes through this one shared limiter, so it — not the worker count — is
+		// the quota safety cap. 20/sec is far under Drive's per-user ceiling
+		// (~12k/min); backoff-on-429/403 self-throttles if we ever overshoot.
+		limiter:     rate.NewLimiter(rate.Limit(20), 20),
+		concurrency: concurrency,
+		visited:     make(map[string]bool),
 	}
 
 	// --folder re-indexes one already-crawled subtree in place; it shares the
@@ -230,7 +274,7 @@ func runCrawl(dbPath, cfgPath string, refresh, wipe bool, subfolder string) erro
 				log.Printf("removed %d stale node(s) not seen in this crawl", removed)
 			}
 		}
-		log.Printf("crawl complete: %d folders remaining (children_done=0), %d files seen this run", remaining, c.fileCount)
+		log.Printf("crawl complete: %d folders remaining (children_done=0), %d files seen this run", remaining, c.fileCount.Load())
 	}
 	return nil
 }
@@ -319,46 +363,97 @@ func (c *crawler) runScopedCrawl(ctx context.Context, subfolder string) error {
 				log.Printf("removed %d stale node(s) not seen under %q this run", removed, rel)
 			}
 		}
-		log.Printf("re-index complete: %d folders remaining (children_done=0) under %q, %d files seen this run", remaining, rel, c.fileCount)
+		log.Printf("re-index complete: %d folders remaining (children_done=0) under %q, %d files seen this run", remaining, rel, c.fileCount.Load())
 	}
 	return nil
 }
 
-// drainQueue lists folders breadth-first, appending each newly discovered
-// subfolder to the queue, until the queue empties or ctx is cancelled. It
-// returns the number of folders whose listing failed (their children_done stays
-// 0 so a later run retries them).
-func (c *crawler) drainQueue(ctx context.Context, queue []folderRef) int {
-	var failed, processed int
-	for len(queue) > 0 {
-		if ctx.Err() != nil {
-			break
-		}
-		f := queue[0]
-		queue = queue[1:]
-		if c.visited[f.driveID] {
-			continue
-		}
-		c.visited[f.driveID] = true
-		detailf("folder %q (%s): listing children [%d folders queued, %d files so far]",
-			f.name, f.driveID, len(queue), c.fileCount)
-		subs, err := c.listFolder(ctx, f)
-		queue = append(queue, subs...)
-		processed++
-		// Without --verbose the per-folder line above is suppressed; emit a
-		// periodic heartbeat so a long crawl still shows it is making progress.
-		if !verbose && processed%3 == 0 {
-			log.Printf("progress: %d folders listed, %d queued, %d files so far", processed, len(queue), c.fileCount)
-		}
-		if err != nil {
-			if ctx.Err() != nil {
-				break
+// drainQueue lists folders breadth-first until the queue empties or ctx is
+// cancelled. Up to c.concurrency workers share one queue: each lists a folder,
+// then pushes the subfolders it discovers back onto the queue for any worker to
+// pick up. The crawl is done when the queue is empty and no worker is still
+// listing. It returns the number of folders whose listing failed (their
+// children_done stays 0 so a later run retries them).
+//
+// visited (test-and-set via markVisited) guarantees each folder is listed once
+// even when reached through multiple parents, and fileCount is atomic; database
+// writes serialize on the single SQLite connection (see openDB). Listing happens
+// off-lock, so the mutex is only ever held for cheap bookkeeping — never for I/O.
+func (c *crawler) drainQueue(ctx context.Context, seed []folderRef) int {
+	workers := c.concurrency
+	if workers < 1 {
+		workers = 1
+	}
+	var (
+		mu        sync.Mutex
+		cond      = sync.NewCond(&mu)
+		queue     = append([]folderRef(nil), seed...)
+		active    int // workers currently listing a folder (may still add to queue)
+		failed    int
+		processed int
+	)
+
+	worker := func() {
+		for {
+			mu.Lock()
+			// Wait for work while some other worker might still enqueue more. Once
+			// the queue is empty and nobody is listing, the crawl is done; a
+			// cancelled context ends it too.
+			for len(queue) == 0 && active > 0 && ctx.Err() == nil {
+				cond.Wait()
 			}
-			failed++
-			log.Printf("error: folder %q (%s): %v (children_done stays 0; next run retries it)",
-				f.name, f.driveID, err)
+			if ctx.Err() != nil || (len(queue) == 0 && active == 0) {
+				mu.Unlock()
+				cond.Broadcast() // let the other idle workers observe the same end state
+				return
+			}
+			f := queue[0]
+			queue = queue[1:]
+			active++
+			queued := len(queue)
+			mu.Unlock()
+
+			// A later sighting of an already-claimed folder (cycle / second parent)
+			// is a no-op; release the active slot and let the loop re-evaluate.
+			if !c.markVisited(f.driveID) {
+				mu.Lock()
+				active--
+				mu.Unlock()
+				cond.Broadcast()
+				continue
+			}
+
+			detailf("folder %q (%s): listing children [%d folders queued, %d files so far]",
+				f.name, f.driveID, queued, c.fileCount.Load())
+			subs, err := c.listFolder(ctx, f)
+
+			mu.Lock()
+			active--
+			queue = append(queue, subs...)
+			processed++
+			// Without --verbose the per-folder line above is suppressed; emit a
+			// periodic heartbeat so a long crawl still shows it is making progress.
+			if !verbose && processed%3 == 0 {
+				log.Printf("progress: %d folders listed, %d queued, %d files so far", processed, len(queue), c.fileCount.Load())
+			}
+			// A cancelled listing returns ctx.Err(); that is an interruption, not a
+			// folder error, so don't count it (children_done stays 0 regardless).
+			if err != nil && ctx.Err() == nil {
+				failed++
+				log.Printf("error: folder %q (%s): %v (children_done stays 0; next run retries it)",
+					f.name, f.driveID, err)
+			}
+			mu.Unlock()
+			cond.Broadcast()
 		}
 	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); worker() }()
+	}
+	wg.Wait()
 	return failed
 }
 
@@ -541,7 +636,7 @@ func (c *crawler) commitPage(parent folderRef, files []*drive.File, last bool) (
 		// Recurse into folders only — shortcuts are recorded, never followed.
 		// Skip folders already fully listed (resume) or already visited this
 		// run (cycle / second parent).
-		if n.typ == typeFolder && !prevDone && !c.visited[file.Id] {
+		if n.typ == typeFolder && !prevDone && !c.isVisited(file.Id) {
 			subfolders = append(subfolders, folderRef{rowID: rowID, driveID: file.Id, name: file.Name})
 		}
 	}
@@ -553,7 +648,7 @@ func (c *crawler) commitPage(parent folderRef, files []*drive.File, last bool) (
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	c.fileCount += int64(len(files))
+	c.fileCount.Add(int64(len(files)))
 	return subfolders, nil
 }
 

@@ -442,29 +442,38 @@ SELECT * FROM pack_orphans;
 
 A token-bucket limiter caps API calls, and every call retries with exponential
 backoff plus jitter on `403 rateLimitExceeded`, `429`, and 5xx responses
-(retries pass back through the limiter). The crawl is intentionally
-single-threaded at ~3/sec — durability over speed.
+(retries pass back through the limiter).
 
-`pack` and `unpack` are different: they make one `files.update` per item, and
-the Drive API has no bulk-move call (HTTP batching wouldn't help — batched
-sub-requests still each count against quota). Since each move carries hundreds of
-ms of latency, a single sequential worker only reaches a few moves per second no
-matter the rate limit. So both commands run the moves through a bounded worker
+`crawl`, `pack`, and `unpack` all run their Drive calls through a bounded worker
 pool (default 8, set with `--concurrency`) behind a shared ~20/sec limiter —
-still far under Drive's per-user ceiling (~12k/min), but roughly 6x the old
-sequential throughput. All workers share the one limiter, so it (not the worker
-count) is the quota cap; backoff self-throttles if a burst overshoots.
-`--max-errors` still applies across the pool: exceeding the budget cancels the
-shared context, stopping in-flight moves and short-circuiting the remaining
-phases.
+still far under Drive's per-user ceiling (~12k/min). Each `files.list` (crawl) or
+`files.update` (pack/unpack) carries hundreds of ms of latency, so a single
+sequential worker only reaches a few requests per second no matter the rate
+limit; a handful of workers keeps enough in flight to reach the limiter's
+ceiling, roughly 6x the old sequential throughput. All workers share the one
+limiter, so it (not the worker count) is the quota cap; backoff self-throttles if
+a burst overshoots. (The Drive API has no bulk call, and HTTP batching wouldn't
+help — batched sub-requests still each count against quota.)
 
-Each phase enumerates its work first (listing + database lookups, single-
-threaded) and only then fans the moves out, so the database bookkeeping and
-ownership classification stay lock-free; `unpack` also serializes creation of the
-`Errors` quarantine folders so concurrent workers can't make duplicates. The
-phase ordering is unchanged — `pack` fills the Container before sweeping the
-Stash, `unpack` restores the Container before the Stash — only the moves *within*
-a phase run in parallel.
+`crawl` fans out its breadth-first walk over the pool: workers share one folder
+queue, each listing a folder and pushing the subfolders it discovers back onto
+the queue for any worker to pick up, until the queue drains and no worker is
+still listing. Its shared state is synchronized — a folder is listed once even
+when reached through multiple parents, the file counter is atomic, and per-page
+database writes serialize on the single SQLite connection — so listing (the
+latency-bound part) is the only thing that actually runs in parallel. Ctrl-C
+still stops cleanly: in-flight listings finish their current page, and any folder
+not fully listed keeps `children_done = 0` so a re-run resumes it.
+
+`pack` and `unpack` enumerate each phase's work first (listing + database
+lookups, single-threaded) and only then fan the moves out, so the database
+bookkeeping and ownership classification stay lock-free; `unpack` also serializes
+creation of the `Errors` quarantine folders so concurrent workers can't make
+duplicates. Their phase ordering is unchanged — `pack` fills the Container before
+sweeping the Stash, `unpack` restores the Container before the Stash — only the
+moves *within* a phase run in parallel. `--max-errors` applies across the pool:
+exceeding the budget cancels the shared context, stopping in-flight moves and
+short-circuiting the remaining phases.
 
 ## TODO
 
