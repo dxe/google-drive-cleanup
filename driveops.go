@@ -286,7 +286,7 @@ func grantPermission(ctx context.Context, svc *drive.Service, limiter *rate.Limi
 		Type:         "user",
 		Role:         role,
 		EmailAddress: email,
-	}).SupportsAllDrives(true).SendNotificationEmail(true).Context(ctx).Do()
+	}).SupportsAllDrives(true).SendNotificationEmail(false).Context(ctx).Do()
 	return err
 }
 
