@@ -435,13 +435,22 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 		if err := deleteIfEmpty(stashF, "Stash"); err != nil {
 			return err
 		}
-		if err := deleteIfEmpty(container, "Container"); err != nil {
-			return err
+		// Only delete the Container if it was dragged into the shared drive (so we
+		// own it). When the migration was aborted, the Container is still in the
+		// user's My Drive and owned by them — leave it untouched.
+		if containerInSharedDrive {
+			if err := deleteIfEmpty(container, "Container"); err != nil {
+				return err
+			}
 		}
 		// The per-user folder goes too, unless something remains in it — e.g. a
-		// non-empty Errors folder, or a Stash/Container that could not empty.
-		if err := deleteIfEmpty(&drive.File{Id: m.userFolderID}, fmt.Sprintf("per-user folder for %s", account)); err != nil {
-			return err
+		// non-empty Errors folder, or a Stash/Container that could not empty. When
+		// the migration was aborted the Container is deliberately left in place, so
+		// the per-user folder can never empty; skip it to avoid a misleading WARN.
+		if containerInSharedDrive {
+			if err := deleteIfEmpty(&drive.File{Id: m.userFolderID}, fmt.Sprintf("per-user folder for %s", account)); err != nil {
+				return err
+			}
 		}
 	}
 
