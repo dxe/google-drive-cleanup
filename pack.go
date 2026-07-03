@@ -64,7 +64,8 @@ read-only access, the tool re-runs consent automatically to obtain it.`,
 		dryRun, _ := cmd.Flags().GetBool("dry-run")
 		maxErrors, _ := cmd.Flags().GetInt("max-errors")
 		subfolder, _ := cmd.Flags().GetString("folder")
-		return runPack(dbPath, cfgPath, args[0], subfolder, dryRun, maxErrors)
+		skipUnmovable, _ := cmd.Flags().GetBool("skip-unmovable")
+		return runPack(dbPath, cfgPath, args[0], subfolder, dryRun, maxErrors, skipUnmovable)
 	},
 }
 
@@ -72,6 +73,7 @@ func init() {
 	packCmd.Flags().Bool("dry-run", false, "report what would move without changing anything (read-only scope)")
 	packCmd.Flags().Int("max-errors", 5, "abort once more than this many items fail to move")
 	packCmd.Flags().String("folder", "", "Google Drive folder ID to scope the pack to (must be crawled into the database); packs only the user's items within that subfolder of the crawl root")
+	packCmd.Flags().Bool("skip-unmovable", false, "proceed even when some crawled items are not editable by the crawling account (those items will fail to move)")
 }
 
 // subtreeRelativePath returns the path of driveID relative to the crawl root,
@@ -89,7 +91,7 @@ func subtreeRelativePath(db *sql.DB, driveID string) (string, error) {
 	return "", nil
 }
 
-func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors int) error {
+func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors int, skipUnmovable bool) error {
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
 		return err
@@ -175,7 +177,7 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 	if pending, err := countPendingFolders(db); err != nil {
 		return err
 	} else if pending > 0 {
-		log.Printf("WARN the crawl is incomplete (%d folder(s) not fully listed); the database may be missing items. Re-run crawl first for a complete pack.", pending)
+		return fmt.Errorf("the crawl is incomplete (%d folder(s) not fully listed); the database may be missing items. Re-run crawl first for a complete pack", pending)
 	}
 
 	// Edit-access pre-check: the same scan check-edit-access reports. If any
@@ -208,13 +210,13 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 				fileCount++
 			}
 		}
+		if !skipUnmovable {
+			return fmt.Errorf("%d crawled item(s) are not editable by the crawling account: %d folder(s), %d file(s); any of these that need to move will fail. Run check-edit-access for the full list, or pass --skip-unmovable to pack the rest anyway",
+				len(uneditable), folderCount, fileCount)
+		}
 		fmt.Fprintf(os.Stderr, "WARNING: %d crawled item(s) are not editable by the crawling account: %d folder(s), %d file(s).\n",
 			len(uneditable), folderCount, fileCount)
-		fmt.Fprintln(os.Stderr, "Moving those items will fail. Run check-edit-access for the full list.")
-		if !dryRun && !promptYesNo("Continue with pack anyway? [y/N] ") {
-			fmt.Fprintln(os.Stderr, "Aborted.")
-			return nil
-		}
+		fmt.Fprintln(os.Stderr, "Proceeding due to --skip-unmovable; any of these that need to move will fail. Run check-edit-access for the full list.")
 	}
 
 	ctx, cancel := cancelOnSignal()
