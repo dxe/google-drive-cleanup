@@ -65,21 +65,27 @@ var crawlCmd = &cobra.Command{
 	Use:   "crawl",
 	Short: "Recursively crawl the configured root folder into the database",
 	Long: `Crawl (or resume a previous crawl of) the configured root folder into the
-database. Ctrl-C stops cleanly between writes; just re-run to resume.`,
+database. Ctrl-C stops cleanly between writes; just re-run to resume.
+
+--refresh re-lists every folder but keeps the existing snapshot rows; --wipe
+deletes the previous snapshot outright (as also happens automatically when the
+configured root changes) and crawls from scratch.`,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dbPath, _ := cmd.Flags().GetString("db")
 		cfgPath, _ := cmd.Flags().GetString("config")
 		refresh, _ := cmd.Flags().GetBool("refresh")
-		return runCrawl(dbPath, cfgPath, refresh)
+		wipe, _ := cmd.Flags().GetBool("wipe")
+		return runCrawl(dbPath, cfgPath, refresh, wipe)
 	},
 }
 
 func init() {
 	crawlCmd.Flags().Bool("refresh", false, "reset children_done on all folders to force a full re-crawl")
+	crawlCmd.Flags().Bool("wipe", false, "discard the previous crawl snapshot entirely and crawl from scratch")
 }
 
-func runCrawl(dbPath, cfgPath string, refresh bool) error {
+func runCrawl(dbPath, cfgPath string, refresh, wipe bool) error {
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
 		return err
@@ -109,6 +115,13 @@ func runCrawl(dbPath, cfgPath string, refresh bool) error {
 	if err != nil {
 		return err
 	}
+	if wipe {
+		log.Print("--wipe: discarding the previous crawl snapshot")
+		if err := wipeCrawlSnapshot(db); err != nil {
+			return err
+		}
+		haveMeta = false
+	}
 	if haveMeta && storedRoot != cfg.Crawl.Root.ID {
 		log.Printf("crawl root changed since the last crawl (%s -> %s); discarding the previous snapshot",
 			storedRoot, cfg.Crawl.Root.ID)
@@ -117,7 +130,11 @@ func runCrawl(dbPath, cfgPath string, refresh bool) error {
 		}
 		haveMeta = false
 	}
-	if !haveMeta || refresh {
+	// A resume continues the recorded session over the existing snapshot;
+	// anything that starts a new session (fresh db, --wipe, --refresh, root
+	// change) is a new crawl.
+	resuming := haveMeta && !refresh
+	if !resuming {
 		sessionStart = now()
 		if err := setCrawlMeta(db, cfg.Crawl.Root.ID, sessionStart); err != nil {
 			return err
@@ -164,7 +181,11 @@ func runCrawl(dbPath, cfgPath string, refresh bool) error {
 	if err != nil {
 		return err
 	}
-	log.Printf("starting crawl: %d folders pending", len(queue))
+	if resuming {
+		log.Printf("resuming previous crawl: %d folders pending", len(queue))
+	} else {
+		log.Printf("starting new crawl: %d folders pending", len(queue))
+	}
 
 	var failed, processed int
 	for len(queue) > 0 {
