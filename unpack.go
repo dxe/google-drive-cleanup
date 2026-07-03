@@ -37,7 +37,8 @@ Items that cannot be placed — not in the database, or their original parent is
 gone — are quarantined under <packing-folder>/<user>/Errors/<original parent
 id>/ for manual restore instead of blocking cleanup. Once the Stash and
 Container are verified empty they are deleted, along with the per-user folder
-if nothing (such as a non-empty Errors folder) remains in it.
+if nothing (such as a non-empty Errors folder) remains in it, and the per-user
+dropoff subfolder in the shared drive if it too is now empty.
 
 This command requires the full Drive scope and, to move items out of the shared
 drive, manager access on it.
@@ -441,6 +442,15 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 		if containerInSharedDrive {
 			if err := deleteIfEmpty(container, "Container"); err != nil {
 				return err
+			}
+			// Delete the per-user dropoff subfolder in the shared drive
+			// once the Container's contents have been restored out of it.
+			// Only do so when the drag actually happened, otherwise leave it
+			// for future reuse.
+			if userDropoff != nil {
+				if err := deleteIfEmpty(userDropoff, fmt.Sprintf("dropoff subfolder %q", userDropoff.Name)); err != nil {
+					return err
+				}
 			}
 		}
 		// The per-user folder goes too, unless something remains in it — e.g. a

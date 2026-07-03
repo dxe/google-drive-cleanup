@@ -298,9 +298,12 @@ access on the shared drive), then:
    where it belongs — from `pack_orphans` for never-crawled items, `unknown`
    when even that is missing) instead of blocking cleanup.
 4. **Cleans up.** Once live listings confirm they are empty, the Stash, the
-   Container, and the per-user folder are deleted. Anything left over — a
-   non-empty Errors folder, or items that failed to move — is reported and
-   left in place.
+   Container, the per-user packing subfolder, and the per-user dropoff subfolder
+   in the shared drive are deleted. The Container, the packing subfolder, and the
+   dropoff subfolder are only deleted when the Container was dragged into the
+   shared drive (a `--allow-not-moved` abort leaves them in place). Anything
+   left over — a non-empty Errors folder, or items that failed to move — is
+   reported and left in place.
 
 **Aborting a stuck migration (`--allow-not-moved`).** Normally `unpack` refuses
 to run until the Container is confirmed inside the dropoff folder's shared
