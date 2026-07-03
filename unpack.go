@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/time/rate"
@@ -57,7 +59,8 @@ that case, so the database owner columns are left unchanged.`,
 		dryRun, _ := cmd.Flags().GetBool("dry-run")
 		maxErrors, _ := cmd.Flags().GetInt("max-errors")
 		allowNotMoved, _ := cmd.Flags().GetBool("allow-not-moved")
-		return runUnpack(dbPath, cfgPath, args[0], dryRun, maxErrors, allowNotMoved)
+		concurrency, _ := cmd.Flags().GetInt("concurrency")
+		return runUnpack(dbPath, cfgPath, args[0], dryRun, maxErrors, allowNotMoved, concurrency)
 	},
 }
 
@@ -65,9 +68,33 @@ func init() {
 	unpackCmd.Flags().Bool("dry-run", false, "report what would move without changing anything (read-only scope)")
 	unpackCmd.Flags().Int("max-errors", 5, "abort once more than this many items fail to move")
 	unpackCmd.Flags().Bool("allow-not-moved", false, "abort the migration: restore files even if the Container was never dragged into the shared drive (ownership never flipped, so the database owner columns are left unchanged)")
+	unpackCmd.Flags().Int("concurrency", defaultMoveConcurrency, "how many file moves to run in parallel (all still share the global rate limiter)")
 }
 
-func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allowNotMoved bool) error {
+// restoreStats holds an unpack run's running tallies. restoreChildren updates it
+// from its worker pool, so the counters are guarded by mu; the shared error
+// budget (embedded) carries the failure count and abort logic.
+type restoreStats struct {
+	*errorBudget
+	mu          sync.Mutex
+	restored    int
+	quarantined int
+}
+
+func (s *restoreStats) incRestored()    { s.mu.Lock(); s.restored++; s.mu.Unlock() }
+func (s *restoreStats) incQuarantined() { s.mu.Lock(); s.quarantined++; s.mu.Unlock() }
+
+func (s *restoreStats) restoredCount() int    { s.mu.Lock(); defer s.mu.Unlock(); return s.restored }
+func (s *restoreStats) quarantinedCount() int { s.mu.Lock(); defer s.mu.Unlock(); return s.quarantined }
+
+// processed is a best-effort count for the progress heartbeat.
+func (s *restoreStats) processed() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.restored + s.quarantined
+}
+
+func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allowNotMoved bool, concurrency int) error {
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
 		return err
@@ -125,7 +152,11 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 		return fmt.Errorf("dropoff folder %s is not in a shared drive", dropoff.Id)
 	}
 
-	limiter := rate.NewLimiter(rate.Limit(3), 3)
+	// The restores below run concurrently (see --concurrency), but every call
+	// still passes through this one shared limiter, so it — not the worker count —
+	// is the quota safety cap. See pack for the reasoning; backoff-on-429/403
+	// self-throttles if a burst overshoots.
+	limiter := rate.NewLimiter(rate.Limit(20), 20)
 
 	// resolveContainer picks the Container to unpack from what was found live by
 	// name, rather than trusting the ID recorded at pack time — the drag can
@@ -250,49 +281,65 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 		}
 	}
 
-	var restored, quarantined, failed int
-	fail := func(format string, args ...any) error {
-		log.Printf(format, args...)
-		failed++
-		if failed > maxErrors {
-			return fmt.Errorf("aborting after %d failures (--max-errors %d); fix the cause and re-run unpack", failed, maxErrors)
-		}
-		return nil
+	// The restores run through a bounded worker pool sharing one context: when the
+	// error budget is spent, stats.fail cancels it so in-flight workers stop and
+	// the Stash restore short-circuits. A dry run only logs, so keep it
+	// single-file for deterministic output.
+	moveCtx, moveCancel := context.WithCancel(ctx)
+	defer moveCancel()
+	stats := &restoreStats{errorBudget: &errorBudget{cmd: "unpack", maxErrors: maxErrors, cancel: moveCancel}}
+	workers := concurrency
+	if dryRun {
+		workers = 1
 	}
 
-	// quarantine moves an item that cannot be placed into
-	// <user folder>/Errors/<parentLabel>/, where parentLabel is the Drive ID of
-	// the folder it belongs in (or "unknown"), creating folders lazily.
+	// ensureErrorsSub resolves (lazily creating) the <user folder>/Errors/<label>/
+	// subfolder quarantine drops an unplaceable item into. Creation is serialized
+	// by quarantineMu so concurrent workers can't race to make duplicate Errors
+	// folders; the common already-resolved case is a fast map hit under the lock.
+	var quarantineMu sync.Mutex
 	var errorsFolder *drive.File
 	errorsSubs := make(map[string]*drive.File)
-	quarantine := func(itemID, fromParent, parentLabel string) error {
+	ensureErrorsSub := func(parentLabel string) (*drive.File, error) {
+		quarantineMu.Lock()
+		defer quarantineMu.Unlock()
 		if errorsFolder == nil {
-			ef, err := findChildFolder(ctx, svc, limiter, m.userFolderID, errorsFolderName)
+			ef, err := findChildFolder(moveCtx, svc, limiter, m.userFolderID, errorsFolderName)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			if ef == nil {
-				if ef, err = createFolder(ctx, svc, limiter, m.userFolderID, errorsFolderName); err != nil {
-					return err
+				if ef, err = createFolder(moveCtx, svc, limiter, m.userFolderID, errorsFolderName); err != nil {
+					return nil, err
 				}
 			}
 			errorsFolder = ef
 		}
 		sub := errorsSubs[parentLabel]
 		if sub == nil {
-			s, err := findChildFolder(ctx, svc, limiter, errorsFolder.Id, parentLabel)
+			s, err := findChildFolder(moveCtx, svc, limiter, errorsFolder.Id, parentLabel)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			if s == nil {
-				if s, err = createFolder(ctx, svc, limiter, errorsFolder.Id, parentLabel); err != nil {
-					return err
+				if s, err = createFolder(moveCtx, svc, limiter, errorsFolder.Id, parentLabel); err != nil {
+					return nil, err
 				}
 			}
 			errorsSubs[parentLabel] = s
 			sub = s
 		}
-		return moveFile(ctx, svc, limiter, itemID, sub.Id, fromParent)
+		return sub, nil
+	}
+	// quarantine moves an item that cannot be placed into
+	// <user folder>/Errors/<parentLabel>/, where parentLabel is the Drive ID of
+	// the folder it belongs in (or "unknown").
+	quarantine := func(itemID, fromParent, parentLabel string) error {
+		sub, err := ensureErrorsSub(parentLabel)
+		if err != nil {
+			return err
+		}
+		return moveFile(moveCtx, svc, limiter, itemID, sub.Id, fromParent)
 	}
 
 	// orphanLabel names the Errors subfolder for an item with no database row:
@@ -305,87 +352,110 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 	}
 
 	// restoreChildren drains one level of source (the Container or the Stash),
-	// moving each child back to its original parent from the database.
+	// moving each child back to its original parent from the database. It first
+	// walks the level (listing + DB lookups, on this goroutine, so the database
+	// bookkeeping stays single-threaded), then runs the independent moves through
+	// the worker pool. Moving a child out never changes another child's recorded
+	// original parent, so enumerating before moving is safe.
 	restoreChildren := func(source *drive.File, sourceLabel string, flipOwner bool) error {
 		children, err := listChildren(ctx, svc, limiter, source.Id, "nextPageToken, files(id, name)")
 		if err != nil {
 			return fmt.Errorf("listing %s: %w", sourceLabel, err)
 		}
-		prog := newProgress()
-		for i, c := range children {
+		// task describes one child to restore: back to its recorded parent (dest),
+		// or, when it has no usable database row, into the Errors subfolder label.
+		type task struct {
+			id, name    string
+			dest, label string
+			orphan      bool
+		}
+		var tasks []task
+		for _, c := range children {
 			if err := ctx.Err(); err != nil {
-				log.Printf("interrupted: %d restored, %d quarantined, %d failed", restored, quarantined, failed)
+				log.Printf("interrupted: %d restored, %d quarantined, %d failed", stats.restoredCount(), stats.quarantinedCount(), stats.failedCount())
 				return err
 			}
-			prog.tick("progress: restoring %s: %d/%d", sourceLabel, i, len(children))
 			orig, derr := originalParentDriveID(db, c.Id)
 			if derr == sql.ErrNoRows {
-				label := orphanLabel(c.Id)
-				if dryRun {
-					log.Printf("WOULD quarantine %q (%s): not in database -> %s/%s", c.Name, c.Id, errorsFolderName, label)
-					quarantined++
-					continue
-				}
-				if qerr := quarantine(c.Id, source.Id, label); qerr != nil {
-					if ctx.Err() != nil {
-						return ctx.Err()
-					}
-					if err := fail("ERROR quarantining %q (%s): %v", c.Name, c.Id, qerr); err != nil {
-						return err
-					}
-					continue
-				}
-				log.Printf("WARN %q (%s) is not in the database; quarantined under %s/%s for manual restore", c.Name, c.Id, errorsFolderName, label)
-				quarantined++
+				tasks = append(tasks, task{id: c.Id, name: c.Name, label: orphanLabel(c.Id), orphan: true})
 				continue
 			}
 			if derr != nil {
 				return derr
 			}
-			if dryRun {
-				log.Printf("WOULD move %q (%s) -> parent %s", c.Name, c.Id, orig)
-				restored++
-				continue
+			tasks = append(tasks, task{id: c.Id, name: c.Name, dest: orig})
+		}
+
+		prog := newProgress()
+		forEachConcurrent(moveCtx, workers, tasks, func(t task) {
+			prog.tick("progress: restoring %s: %d/%d", sourceLabel, stats.processed(), len(tasks))
+			if t.orphan {
+				if dryRun {
+					log.Printf("WOULD quarantine %q (%s): not in database -> %s/%s", t.name, t.id, errorsFolderName, t.label)
+					stats.incQuarantined()
+					return
+				}
+				if qerr := quarantine(t.id, source.Id, t.label); qerr != nil {
+					if moveCtx.Err() != nil {
+						return
+					}
+					stats.fail("ERROR quarantining %q (%s): %v", t.name, t.id, qerr)
+					return
+				}
+				log.Printf("WARN %q (%s) is not in the database; quarantined under %s/%s for manual restore", t.name, t.id, errorsFolderName, t.label)
+				stats.incQuarantined()
+				return
 			}
-			merr := moveFile(ctx, svc, limiter, c.Id, orig, source.Id)
+			if dryRun {
+				log.Printf("WOULD move %q (%s) -> parent %s", t.name, t.id, t.dest)
+				stats.incRestored()
+				return
+			}
+			merr := moveFile(moveCtx, svc, limiter, t.id, t.dest, source.Id)
 			if merr == nil {
-				detailf("OK %q (%s) -> parent %s", c.Name, c.Id, orig)
+				detailf("OK %q (%s) -> parent %s", t.name, t.id, t.dest)
 				if flipOwner {
-					// The drag flipped ownership of everything inside the
-					// Container to the org, so this child and every item that
-					// rode along inside it (an owned subtree moves as one item)
-					// is now owned by the running account. Record that for the
-					// whole subtree without a per-file Drive lookup; the update
-					// only touches rows the DB attributes to the migrating user,
-					// leaving nested third-party (stashed) items alone.
-					if n, err := updateSubtreeOwner(db, c.Id, account, me.EmailAddress, me.PermissionId, me.DisplayName); err != nil {
-						log.Printf("WARN could not update owner in DB for %q (%s) subtree: %v", c.Name, c.Id, err)
+					// The drag flipped ownership of everything inside the Container
+					// to the org, so this child and every item that rode along
+					// inside it (an owned subtree moves as one item) is now owned by
+					// the running account. Record that for the whole subtree without
+					// a per-file Drive lookup; the update only touches rows the DB
+					// attributes to the migrating user, leaving nested third-party
+					// (stashed) items alone.
+					if n, err := updateSubtreeOwner(db, t.id, account, me.EmailAddress, me.PermissionId, me.DisplayName); err != nil {
+						log.Printf("WARN could not update owner in DB for %q (%s) subtree: %v", t.name, t.id, err)
 					} else {
-						detailf("   updated owner for %d DB row(s) under %q (%s)", n, c.Name, c.Id)
+						detailf("   updated owner for %d DB row(s) under %q (%s)", n, t.name, t.id)
 					}
 				}
-				restored++
-				continue
+				stats.incRestored()
+				return
 			}
-			if ctx.Err() != nil {
-				return ctx.Err()
+			if moveCtx.Err() != nil {
+				return
 			}
 			if isNotFound(merr) {
 				// The destination is the problem (original parent deleted or
 				// trashed): quarantine so cleanup is not blocked.
-				if qerr := quarantine(c.Id, source.Id, orig); qerr != nil {
-					if err := fail("ERROR quarantining %q (%s) after missing parent %s: %v", c.Name, c.Id, orig, qerr); err != nil {
-						return err
+				if qerr := quarantine(t.id, source.Id, t.dest); qerr != nil {
+					if moveCtx.Err() != nil {
+						return
 					}
-					continue
+					stats.fail("ERROR quarantining %q (%s) after missing parent %s: %v", t.name, t.id, t.dest, qerr)
+					return
 				}
-				log.Printf("WARN original parent %s of %q (%s) is gone; quarantined under %s/%s for manual restore", orig, c.Name, c.Id, errorsFolderName, orig)
-				quarantined++
-				continue
+				log.Printf("WARN original parent %s of %q (%s) is gone; quarantined under %s/%s for manual restore", t.dest, t.name, t.id, errorsFolderName, t.dest)
+				stats.incQuarantined()
+				return
 			}
-			if err := fail("ERROR moving %q (%s) to parent %s: %v (if the destination is still inside the shared drive, re-run unpack after the Container restore succeeds)", c.Name, c.Id, orig, merr); err != nil {
-				return err
-			}
+			stats.fail("ERROR moving %q (%s) to parent %s: %v (if the destination is still inside the shared drive, re-run unpack after the Container restore succeeds)", t.name, t.id, t.dest, merr)
+		})
+		if err := ctx.Err(); err != nil {
+			log.Printf("interrupted: %d restored, %d quarantined, %d failed", stats.restoredCount(), stats.quarantinedCount(), stats.failedCount())
+			return err
+		}
+		if stats.aborted {
+			return stats.err
 		}
 		return nil
 	}
@@ -405,8 +475,8 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 	// Container move failed — but stayed under --max-errors — those folders are
 	// still in the shared drive, and every Stash item bound for them would fail
 	// too (a shared drive cannot hold third-party items).
-	if failed > 0 {
-		log.Printf("WARN Container restore left %d item(s) in the shared drive; skipping the Stash restore because stashed items' destination folders may still be in the shared drive. Fix the cause and re-run unpack to finish.", failed)
+	if n := stats.failedCount(); n > 0 {
+		log.Printf("WARN Container restore left %d item(s) in the shared drive; skipping the Stash restore because stashed items' destination folders may still be in the shared drive. Fix the cause and re-run unpack to finish.", n)
 	} else if err := restoreChildren(stashF, "Stash", false); err != nil {
 		return err
 	}
@@ -502,12 +572,12 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 	if dryRun {
 		verb = "would restore"
 	}
-	log.Printf("done: %d item(s) %s, %d quarantined, %d failed", restored, verb, quarantined, failed)
-	if quarantined > 0 {
+	log.Printf("done: %d item(s) %s, %d quarantined, %d failed", stats.restoredCount(), verb, stats.quarantinedCount(), stats.failedCount())
+	if stats.quarantinedCount() > 0 {
 		log.Printf("NOTE quarantined items are under the %s folder; each subfolder is named after the Drive ID of the folder the item belongs in (\"unknown\" if never crawled)", errorsFolderName)
 	}
-	if failed > 0 {
-		return fmt.Errorf("%d item(s) failed; re-run unpack to retry", failed)
+	if n := stats.failedCount(); n > 0 {
+		return fmt.Errorf("%d item(s) failed; re-run unpack to retry", n)
 	}
 	if !dryRun {
 		if err := markUnpacked(db, account); err != nil {

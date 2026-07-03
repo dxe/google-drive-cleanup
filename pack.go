@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/time/rate"
@@ -69,15 +71,25 @@ read-only access, the tool re-runs consent automatically to obtain it.`,
 		maxErrors, _ := cmd.Flags().GetInt("max-errors")
 		subfolder, _ := cmd.Flags().GetString("folder")
 		skipUnmovable, _ := cmd.Flags().GetBool("skip-unmovable")
-		return runPack(dbPath, cfgPath, args[0], subfolder, dryRun, maxErrors, skipUnmovable)
+		concurrency, _ := cmd.Flags().GetInt("concurrency")
+		return runPack(dbPath, cfgPath, args[0], subfolder, dryRun, maxErrors, skipUnmovable, concurrency)
 	},
 }
+
+// defaultMoveConcurrency is how many moves pack and unpack run in flight by
+// default. Each files.update has hundreds of ms of latency, so a single worker
+// only reaches a few per second regardless of the rate limit; a handful of
+// workers keeps enough requests in flight to reach the shared limiter's ceiling.
+// The limiter (not the worker count) is the quota safety cap, so this stays
+// modest.
+const defaultMoveConcurrency = 8
 
 func init() {
 	packCmd.Flags().Bool("dry-run", false, "report what would move without changing anything (read-only scope)")
 	packCmd.Flags().Int("max-errors", 5, "abort once more than this many items fail to move")
 	packCmd.Flags().String("folder", "", "Google Drive folder ID to scope the pack to (must be crawled into the database); packs only the user's items within that subfolder of the crawl root")
 	packCmd.Flags().Bool("skip-unmovable", false, "skip crawled items the crawling account cannot edit (they cannot be moved) and pack the rest, instead of aborting (equivalent to migration.skip-unmovable in config.json)")
+	packCmd.Flags().Int("concurrency", defaultMoveConcurrency, "how many file moves to run in parallel (all still share the global rate limiter)")
 }
 
 // subtreeRelativePath returns the path of driveID relative to the crawl root,
@@ -95,7 +107,27 @@ func subtreeRelativePath(db *sql.DB, driveID string) (string, error) {
 	return "", nil
 }
 
-func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors int, skipUnmovable bool) error {
+// moveStats holds a pack run's running tallies. The move phases update it from
+// their worker pool, so the counters are guarded by mu; the shared error budget
+// (embedded) carries the failure count and abort logic.
+type moveStats struct {
+	*errorBudget
+	mu               sync.Mutex
+	movedToContainer int
+	sweptToStash     int
+	alreadyPacked    int
+	skipped          int
+}
+
+func (s *moveStats) moved()   { s.mu.Lock(); s.movedToContainer++; s.mu.Unlock() }
+func (s *moveStats) swept()   { s.mu.Lock(); s.sweptToStash++; s.mu.Unlock() }
+func (s *moveStats) already() { s.mu.Lock(); s.alreadyPacked++; s.mu.Unlock() }
+func (s *moveStats) skip()    { s.mu.Lock(); s.skipped++; s.mu.Unlock() }
+
+func (s *moveStats) movedCount() int { s.mu.Lock(); defer s.mu.Unlock(); return s.movedToContainer }
+func (s *moveStats) sweptCount() int { s.mu.Lock(); defer s.mu.Unlock(); return s.sweptToStash }
+
+func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors int, skipUnmovable bool, concurrency int) error {
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
 		return err
@@ -279,7 +311,11 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 		return fmt.Errorf("dropoff folder %s is not in a shared drive; dragging the Container there would not transfer ownership to the org", dropoff.Id)
 	}
 
-	limiter := rate.NewLimiter(rate.Limit(3), 3)
+	// The moves below run concurrently (see --concurrency), but every call still
+	// passes through this one shared limiter, so it — not the worker count — is
+	// the quota safety cap. 20/sec is far under Drive's per-user ceiling
+	// (~12k/min); backoff-on-429/403 self-throttles if we ever overshoot.
+	limiter := rate.NewLimiter(rate.Limit(20), 20)
 
 	// Resolve (or create) the per-user scaffolding: <packing>/<account>/ with
 	// Stash inside. Find-before-create keeps re-runs and crash recovery safe.
@@ -388,22 +424,31 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 		}
 	}
 
-	var movedToContainer, sweptToStash, alreadyPacked, skipped, failed int
-	// fail logs one item failure and aborts the run once the error budget is
-	// spent — a burst of failures means something systemic (wrong account,
-	// wrong config, revoked access), not per-item drift.
-	fail := func(format string, args ...any) error {
-		log.Printf(format, args...)
-		failed++
-		if failed > maxErrors {
-			return fmt.Errorf("aborting after %d failures (--max-errors %d); fix the cause and re-run pack", failed, maxErrors)
-		}
-		return nil
+	// The moves run through a bounded worker pool sharing one context: when the
+	// error budget is spent, stats.fail cancels it so in-flight workers stop and
+	// the later phases short-circuit. A dry run only logs, so keep it single-file
+	// for deterministic output.
+	moveCtx, moveCancel := context.WithCancel(ctx)
+	defer moveCancel()
+	stats := &moveStats{errorBudget: &errorBudget{cmd: "pack", maxErrors: maxErrors, cancel: moveCancel}}
+	workers := concurrency
+	if dryRun {
+		workers = 1
 	}
 	warnExtraParents := func(id, name string) {
 		if extraParents[id] {
 			log.Printf("WARN %q (%s) has extra parents recorded in the database; the round trip keeps only the traversal parent (see the extra_parents table)", name, id)
 		}
+	}
+	// interrupted reports (and logs) whether the run was cancelled by a signal, as
+	// opposed to finishing a phase normally or hitting the error budget. Safe to
+	// read stats directly here — every worker has drained before it is called.
+	interrupted := func() bool {
+		if ctx.Err() == nil {
+			return false
+		}
+		log.Printf("interrupted: %d moved to Container, %d swept to Stash, %d failed", stats.movedToContainer, stats.sweptToStash, stats.failed)
+		return true
 	}
 
 	// Phase A: move each owned root into the Container. Moves are optimistic —
@@ -411,65 +456,72 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 	// that parent is stale the update fails loudly (Drive items have a single
 	// parent), and only then do we fetch the item's live state to diagnose.
 	prog := newProgress()
-	for _, r := range roots {
-		if err := ctx.Err(); err != nil {
-			log.Printf("interrupted: %d moved to Container, %d swept to Stash, %d failed", movedToContainer, sweptToStash, failed)
-			return err
-		}
-		prog.tick("progress: %d/%d moved to Container", movedToContainer, len(roots))
+	forEachConcurrent(moveCtx, workers, roots, func(r ownedRoot) {
+		prog.tick("progress: %d/%d moved to Container", stats.movedCount(), len(roots))
 		warnExtraParents(r.driveID, r.name)
 		if unmovable[r.driveID] {
 			log.Printf("SKIP %s %q (%s): not editable by the crawling account; cannot move it", r.typ, r.name, r.driveID)
-			skipped++
-			continue
+			stats.skip()
+			return
 		}
 		if dryRun {
 			log.Printf("WOULD move %s %q (%s) from %s into the Container", r.typ, r.name, r.driveID, r.parentDriveID)
-			movedToContainer++
-			continue
+			stats.moved()
+			return
 		}
-		err := moveFile(ctx, svc, limiter, r.driveID, containerF.Id, r.parentDriveID)
+		err := moveFile(moveCtx, svc, limiter, r.driveID, containerF.Id, r.parentDriveID)
 		if err == nil {
 			detailf("OK %s %q (%s) -> Container", r.typ, r.name, r.driveID)
-			movedToContainer++
-			continue
+			stats.moved()
+			return
 		}
-		if ctx.Err() != nil {
-			return ctx.Err()
+		if moveCtx.Err() != nil {
+			return
 		}
 		// Diagnose this one item: gone, trashed, already packed, ownership
-		// changed, or just a stale parent to retry from the live one.
-		f, gerr := getFileState(ctx, svc, limiter, r.driveID)
+		// changed, or just a stale parent to retry from the live one. A cancelled
+		// context (error budget spent elsewhere, or SIGINT) makes these calls fail
+		// with context.Canceled; that is not a failure of this item, so bail before
+		// counting anything.
+		f, gerr := getFileState(moveCtx, svc, limiter, r.driveID)
+		if moveCtx.Err() != nil {
+			return
+		}
 		switch {
 		case isNotFound(gerr):
 			log.Printf("SKIP %q (%s): no longer exists", r.name, r.driveID)
-			skipped++
+			stats.skip()
 		case gerr != nil:
-			if err := fail("ERROR %q (%s): move failed (%v) and live lookup failed (%v)", r.name, r.driveID, err, gerr); err != nil {
-				return err
-			}
+			stats.fail("ERROR %q (%s): move failed (%v) and live lookup failed (%v)", r.name, r.driveID, err, gerr)
 		case f.Trashed:
 			log.Printf("SKIP %q (%s): trashed since the crawl", r.name, r.driveID)
-			skipped++
+			stats.skip()
 		case hasParent(f, containerF.Id):
 			detailf("OK %s %q (%s): already in the Container", r.typ, r.name, r.driveID)
-			alreadyPacked++
+			stats.already()
 		case !ownedByAccount(f, account):
 			log.Printf("SKIP %q (%s): no longer owned by %s; leaving it in place", r.name, r.driveID, account)
-			skipped++
+			stats.skip()
 		default:
-			if merr := moveFile(ctx, svc, limiter, r.driveID, containerF.Id, strings.Join(f.Parents, ",")); merr != nil {
-				if err := fail("ERROR moving %q (%s) into the Container: %v", r.name, r.driveID, merr); err != nil {
-					return err
+			if merr := moveFile(moveCtx, svc, limiter, r.driveID, containerF.Id, strings.Join(f.Parents, ",")); merr != nil {
+				if moveCtx.Err() != nil {
+					return
 				}
+				stats.fail("ERROR moving %q (%s) into the Container: %v", r.name, r.driveID, merr)
 			} else {
 				// Its recorded parent was stale — expected, since packing moves
 				// roots out from under one another. Retrying from the live parent
 				// (above) is the normal path, so this is not worth a warning.
 				detailf("OK %s %q (%s) -> Container (from live parent %v)", r.typ, r.name, r.driveID, f.Parents)
-				movedToContainer++
+				stats.moved()
 			}
 		}
+	})
+	if interrupted() {
+		return ctx.Err()
+	}
+	if stats.aborted {
+		return stats.err
 	}
 
 	// Phase B: sweep the live Container tree. Everything the user does not own
@@ -487,19 +539,25 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 		for _, s := range preview {
 			if unmovable[s.driveID] {
 				log.Printf("WOULD skip %q (%s): not editable by the crawling account; cannot sweep it to the Stash", s.name, s.driveID)
-				skipped++
+				stats.skip()
 				continue
 			}
 			log.Printf("WOULD move %q (%s) out of owned folder %s into the Stash", s.name, s.driveID, s.parentDriveID)
-			sweptToStash++
+			stats.swept()
 		}
 		log.Printf("NOTE the real sweep works from live Drive listings, so it also catches items the crawl never saw")
 	} else {
+		// First walk the tree (listing only, on this goroutine) to enumerate the
+		// items to sweep — the database bookkeeping (orphan recording) and the
+		// owned/unowned classification stay single-threaded, so the DB and the
+		// seen map need no locking. Moving unowned items to the Stash never
+		// changes which folders are owned, so enumerating before moving is safe.
+		type stashTarget struct{ id, name, parent string }
+		var toStash []stashTarget
 		queue := []string{containerF.Id}
 		for len(queue) > 0 {
-			if err := ctx.Err(); err != nil {
-				log.Printf("interrupted: %d moved to Container, %d swept to Stash, %d failed", movedToContainer, sweptToStash, failed)
-				return err
+			if interrupted() {
+				return ctx.Err()
 			}
 			folderID := queue[0]
 			queue = queue[1:]
@@ -518,7 +576,7 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 				}
 				if unmovable[c.Id] {
 					log.Printf("SKIP %q (%s): not editable by the crawling account; cannot sweep it to the Stash (it will block the drag until handled manually)", c.Name, c.Id)
-					skipped++
+					stats.skip()
 					continue
 				}
 				if _, derr := nodeTypeByDriveID(db, c.Id); derr == sql.ErrNoRows {
@@ -531,64 +589,81 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 					return derr
 				}
 				warnExtraParents(c.Id, c.Name)
-				if merr := moveFile(ctx, svc, limiter, c.Id, stashF.Id, folderID); merr != nil {
-					if ctx.Err() != nil {
-						return ctx.Err()
-					}
-					if err := fail("ERROR sweeping %q (%s) into the Stash: %v", c.Name, c.Id, merr); err != nil {
-						return err
-					}
-					continue
-				}
-				detailf("OK swept %q (%s) -> Stash", c.Name, c.Id)
-				sweptToStash++
+				toStash = append(toStash, stashTarget{c.Id, c.Name, folderID})
 			}
+		}
+		// Then sweep them all to the Stash concurrently.
+		forEachConcurrent(moveCtx, workers, toStash, func(t stashTarget) {
+			prog.tick("progress: %d/%d swept to Stash", stats.sweptCount(), len(toStash))
+			if merr := moveFile(moveCtx, svc, limiter, t.id, stashF.Id, t.parent); merr != nil {
+				if moveCtx.Err() != nil {
+					return
+				}
+				stats.fail("ERROR sweeping %q (%s) into the Stash: %v", t.name, t.id, merr)
+				return
+			}
+			detailf("OK swept %q (%s) -> Stash", t.name, t.id)
+			stats.swept()
+		})
+		if interrupted() {
+			return ctx.Err()
+		}
+		if stats.aborted {
+			return stats.err
 		}
 	}
 
 	// Phase C: stragglers — items the database says the user owns that never
 	// showed up inside the Container tree (usually items that moved since the
 	// crawl, so their owned ancestor no longer carries them). Costs no API
-	// calls unless something is actually missing.
+	// calls unless something is actually missing. seen is read-only here, so the
+	// workers can share it without locking.
 	if !dryRun {
-		for _, n := range owned {
+		forEachConcurrent(moveCtx, workers, owned, func(n ownedNode) {
 			if seen[n.driveID] || n.driveID == crawlRoot {
-				continue
+				return
 			}
 			if unmovable[n.driveID] {
 				detailf("SKIP straggler %q (%s): not editable by the crawling account; cannot move it", n.name, n.driveID)
-				skipped++
-				continue
+				stats.skip()
+				return
 			}
-			if err := ctx.Err(); err != nil {
-				log.Printf("interrupted: %d moved to Container, %d swept to Stash, %d failed", movedToContainer, sweptToStash, failed)
-				return err
+			if moveCtx.Err() != nil {
+				return
 			}
-			f, gerr := getFileState(ctx, svc, limiter, n.driveID)
+			f, gerr := getFileState(moveCtx, svc, limiter, n.driveID)
+			if moveCtx.Err() != nil {
+				return
+			}
 			switch {
 			case isNotFound(gerr):
 				detailf("SKIP straggler check %q (%s): no longer exists", n.name, n.driveID)
 			case gerr != nil:
-				if err := fail("ERROR straggler check %q (%s): %v", n.name, n.driveID, gerr); err != nil {
-					return err
-				}
+				stats.fail("ERROR straggler check %q (%s): %v", n.name, n.driveID, gerr)
 			case f.Trashed, hasParent(f, containerF.Id), hasParent(f, stashF.Id):
 				// Trashed, or already handled this run (Phase A skips land here too).
 			case !ownedByAccount(f, account):
 				// Ownership changed since the crawl; nothing of the user's to move.
 			default:
-				if merr := moveFile(ctx, svc, limiter, n.driveID, containerF.Id, strings.Join(f.Parents, ",")); merr != nil {
-					if err := fail("ERROR moving straggler %q (%s) into the Container: %v", n.name, n.driveID, merr); err != nil {
-						return err
+				if merr := moveFile(moveCtx, svc, limiter, n.driveID, containerF.Id, strings.Join(f.Parents, ",")); merr != nil {
+					if moveCtx.Err() != nil {
+						return
 					}
+					stats.fail("ERROR moving straggler %q (%s) into the Container: %v", n.name, n.driveID, merr)
 				} else {
 					log.Printf("WARN straggler %q (%s) was outside the packed tree (live parent %v); moved flat into the Container", n.name, n.driveID, f.Parents)
-					movedToContainer++
+					stats.moved()
 					if f.MimeType == folderMimeType {
 						log.Printf("WARN straggler %q (%s) is a folder; re-run pack to sweep any third-party items inside it", n.name, n.driveID)
 					}
 				}
 			}
+		})
+		if interrupted() {
+			return ctx.Err()
+		}
+		if stats.aborted {
+			return stats.err
 		}
 	}
 
@@ -597,9 +672,9 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 		verb = "would move"
 	}
 	log.Printf("done: %d item(s) %s to Container (%d already there), %d swept to Stash, %d skipped, %d failed",
-		movedToContainer, verb, alreadyPacked, sweptToStash, skipped, failed)
-	if failed > 0 {
-		return fmt.Errorf("%d item(s) failed; re-run pack to retry", failed)
+		stats.movedToContainer, verb, stats.alreadyPacked, stats.sweptToStash, stats.skipped, stats.failed)
+	if stats.failed > 0 {
+		return fmt.Errorf("%d item(s) failed; re-run pack to retry", stats.failed)
 	}
 	if !dryRun {
 		if err := markPacked(db, account); err != nil {

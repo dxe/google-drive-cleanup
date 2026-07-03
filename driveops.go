@@ -5,15 +5,81 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 
 	"golang.org/x/time/rate"
 	"google.golang.org/api/drive/v3"
 	"google.golang.org/api/googleapi"
 )
+
+// errorBudget bounds how many item failures a concurrent move phase tolerates
+// before giving up. fail logs one failure and, once more than maxErrors items
+// have failed, records an abort error and cancels the shared context so
+// in-flight workers stop and later phases short-circuit — a burst of failures
+// means something systemic (wrong account, wrong config, revoked access), not
+// per-item drift. fail is safe to call from many worker goroutines; the summary
+// fields (aborted, err, failed) may be read directly once the workers have
+// drained (a WaitGroup provides the happens-before).
+type errorBudget struct {
+	mu        sync.Mutex
+	cmd       string // "pack" or "unpack", named in the abort message
+	maxErrors int
+	cancel    context.CancelFunc
+	failed    int
+	aborted   bool
+	err       error
+}
+
+func (b *errorBudget) fail(format string, args ...any) {
+	log.Printf(format, args...)
+	b.mu.Lock()
+	b.failed++
+	over := b.failed > b.maxErrors && !b.aborted
+	if over {
+		b.aborted = true
+		b.err = fmt.Errorf("aborting after %d failures (--max-errors %d); fix the cause and re-run %s", b.failed, b.maxErrors, b.cmd)
+	}
+	b.mu.Unlock()
+	if over {
+		b.cancel()
+	}
+}
+
+func (b *errorBudget) failedCount() int { b.mu.Lock(); defer b.mu.Unlock(); return b.failed }
+
+// forEachConcurrent runs work on each item using up to `concurrency` goroutines,
+// all sharing the caller's rate limiter (so the aggregate request rate stays
+// capped no matter how many workers run). It stops launching new work as soon as
+// ctx is cancelled — the SIGINT context or a move phase that has spent its error
+// budget — and waits for in-flight work to drain before returning. work must
+// mutate shared state only through synchronized helpers (see moveStats).
+func forEachConcurrent[T any](ctx context.Context, concurrency int, items []T, work func(T)) {
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	for _, it := range items {
+		select {
+		case <-ctx.Done():
+			wg.Wait()
+			return
+		case sem <- struct{}{}:
+		}
+		wg.Add(1)
+		go func(it T) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			work(it)
+		}(it)
+	}
+	wg.Wait()
+}
 
 // cancelOnSignal returns a context cancelled on the first SIGINT/SIGTERM, so a
 // run stops cleanly between Drive calls. A second signal kills the process the

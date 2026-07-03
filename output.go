@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"sync"
 	"time"
 )
 
@@ -18,7 +19,11 @@ const progressInterval = 5 * time.Second
 // loop and call tick after each item; it prints at most once per
 // progressInterval. Heartbeats are suppressed under --verbose, where the
 // per-item detailf lines already show progress.
+//
+// tick is safe to call from multiple goroutines, so a concurrent move phase can
+// share one progress across its worker pool.
 type progress struct {
+	mu   sync.Mutex
 	last time.Time
 }
 
@@ -27,10 +32,16 @@ func newProgress() *progress {
 }
 
 func (p *progress) tick(format string, args ...any) {
-	if verbose || time.Since(p.last) < progressInterval {
+	if verbose {
+		return
+	}
+	p.mu.Lock()
+	if time.Since(p.last) < progressInterval {
+		p.mu.Unlock()
 		return
 	}
 	p.last = time.Now()
+	p.mu.Unlock()
 	log.Printf(format, args...)
 }
 
