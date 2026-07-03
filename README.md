@@ -235,6 +235,14 @@ as the account being migrated, and warns when moving an item that has extra
 parents recorded (`extra_parents`): the round trip collapses multi-parent
 items to the single traversal parent.
 
+`pack` also **refuses to run if `crawl.root.id` no longer matches the root the
+database was crawled for**: it moves live files based on the snapshot's recorded
+original parents, so a config pointed at a different tree would make every
+placement decision suspect. Re-run `crawl` (which rebuilds the snapshot for the
+new root) before packing. `unpack` deliberately skips this check — it finishes
+an in-flight migration from the per-user state recorded at pack time, not from
+the crawl root.
+
 `pack` ends by printing the manual steps: transfer Container ownership to the
 user (invite + accept), then have them drag the Container into the Dropoff
 folder — one drag, and the org owns everything inside.
@@ -315,6 +323,30 @@ cheap no-op.
 A folder that repeatedly errors (e.g. deleted from Drive mid-crawl) is logged
 and skipped for the run; it stays `children_done = 0` and is retried on the
 next run.
+
+## Stale-row cleanup
+
+Each crawl session is stamped with a start time (recorded in a single-row
+`crawl_meta` table alongside the root it is snapshotting). Every node upsert
+refreshes its `crawled_at`, so when a crawl **completes cleanly** any row whose
+`crawled_at` predates the session start was not re-observed — the item was
+deleted from Drive (or moved out of the tree) since the previous crawl — and is
+removed, along with the `folder_permissions` and `extra_parents` rows that
+referenced it. The snapshot therefore reflects the tree as it is now rather than
+accumulating ghosts of deleted files.
+
+The cutoff is persisted so an interrupted crawl **resumes the same session**
+instead of resetting it (which would delete everything written before the
+interruption). Cleanup runs only on a fully successful completion — never after
+an interruption or a folder error, when some live nodes have not been re-listed
+yet. A `--refresh` or a fresh database begins a new session; a plain resume
+keeps the recorded one.
+
+If `crawl.root.id` **changes** between crawls, the existing snapshot describes a
+different tree, so `crawl` discards it entirely (nodes, permissions, extra
+parents) and starts fresh for the new root. Per-user migration state
+(`user_migrations`, `pack_orphans`) is left untouched; note that `pack` refuses
+to run when the config root no longer matches the crawled root (see below).
 
 ## Database schema
 

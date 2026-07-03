@@ -86,6 +86,15 @@ func runPack(dbPath, cfgPath, account string, dryRun bool, maxErrors int) error 
 	if err != nil {
 		return err
 	}
+	// The snapshot must describe the tree the config now points at: pack moves
+	// live files based on it, so a config root that no longer matches what was
+	// crawled means every original-parent decision could be wrong. Refuse and
+	// make the operator re-crawl. (unpack deliberately skips this check — it
+	// finishes an in-flight migration from recorded per-user state, not the root.)
+	if crawlRoot != cfg.Crawl.Root.ID {
+		return fmt.Errorf("crawl root in config (%s, %q) does not match the root in the database (%s); crawl.root.id changed since the last crawl — re-run `drive-cleanup crawl` to rebuild the snapshot before packing",
+			cfg.Crawl.Root.ID, cfg.Crawl.Root.Name, crawlRoot)
+	}
 
 	owned, err := nodesOwnedBy(db, account)
 	if err != nil {

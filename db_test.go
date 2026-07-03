@@ -526,3 +526,172 @@ func TestNodePath(t *testing.T) {
 		t.Error("expected error for unknown drive id")
 	}
 }
+
+// setCrawledAt overrides a node's crawled_at so tests can place it on either
+// side of a session cutoff without depending on wall-clock timing.
+func setCrawledAt(t *testing.T, db *sql.DB, driveID, ts string) {
+	t.Helper()
+	if _, err := db.Exec(`UPDATE nodes SET crawled_at = ? WHERE drive_id = ?`, ts, driveID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCrawlMeta(t *testing.T) {
+	db := testDB(t)
+
+	if _, _, ok, err := getCrawlMeta(db); err != nil || ok {
+		t.Fatalf("fresh db: ok=%v err=%v, want false, nil", ok, err)
+	}
+	if err := setCrawlMeta(db, "rootA", "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	root, start, ok, err := getCrawlMeta(db)
+	if err != nil || !ok || root != "rootA" || start != "2026-01-01T00:00:00Z" {
+		t.Fatalf("after set: root=%q start=%q ok=%v err=%v", root, start, ok, err)
+	}
+	// A later session overwrites the single row rather than accumulating.
+	if err := setCrawlMeta(db, "rootB", "2026-02-02T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	root, start, _, _ = getCrawlMeta(db)
+	if root != "rootB" || start != "2026-02-02T00:00:00Z" {
+		t.Fatalf("after re-set: root=%q start=%q", root, start)
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM crawl_meta`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Errorf("crawl_meta rows = %d, want 1", count)
+	}
+}
+
+func TestDeleteStaleNodes(t *testing.T) {
+	db := testDB(t)
+	const cutoff = "2026-06-01T00:00:00Z"
+	old, fresh := "2026-05-01T00:00:00Z", "2026-06-01T00:00:00Z"
+
+	rootID, _, _, _ := mustUpsert(t, db, node{driveID: "root", name: "Root", typ: typeFolder, mimeType: folderMimeType})
+	// A stale folder (not re-seen) with a stale child beneath it.
+	staleDirID, _, _, _ := mustUpsert(t, db, node{driveID: "staleDir", name: "Gone", typ: typeFolder, mimeType: folderMimeType,
+		parentID: sql.NullInt64{Int64: rootID, Valid: true}})
+	mustUpsert(t, db, node{driveID: "staleChild", name: "gone.txt", typ: typeBinary, mimeType: "application/x",
+		parentID: sql.NullInt64{Int64: staleDirID, Valid: true}})
+	// A current folder that survives.
+	mustUpsert(t, db, node{driveID: "keep", name: "kept.txt", typ: typeBinary, mimeType: "application/x",
+		parentID: sql.NullInt64{Int64: rootID, Valid: true}})
+
+	// Record aux rows tied to the stale folder and a surviving one.
+	tx, _ := db.Begin()
+	if err := replacePermissions(tx, "staleDir", []permission{{permissionID: "p1", typ: "user", role: "writer"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := replacePermissions(tx, "root", []permission{{permissionID: "p2", typ: "user", role: "owner"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordExtraParent(tx, "staleChild", "root"); err != nil {
+		t.Fatal(err)
+	}
+	tx.Commit()
+
+	setCrawledAt(t, db, "root", fresh)
+	setCrawledAt(t, db, "keep", fresh)
+	setCrawledAt(t, db, "staleDir", old)
+	setCrawledAt(t, db, "staleChild", old)
+
+	removed, err := deleteStaleNodes(db, cutoff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 2 {
+		t.Errorf("removed = %d, want 2", removed)
+	}
+	for _, id := range []string{"root", "keep"} {
+		if _, err := nodeTypeByDriveID(db, id); err != nil {
+			t.Errorf("%q should have survived: %v", id, err)
+		}
+	}
+	for _, id := range []string{"staleDir", "staleChild"} {
+		if _, err := nodeTypeByDriveID(db, id); err != sql.ErrNoRows {
+			t.Errorf("%q should have been deleted, err=%v", id, err)
+		}
+	}
+	// Aux rows for the deleted node are pruned; the surviving folder's stay.
+	if perms, _ := folderPermissionsFor(db, "staleDir"); len(perms) != 0 {
+		t.Errorf("stale folder permissions not pruned: %d rows", len(perms))
+	}
+	if perms, _ := folderPermissionsFor(db, "root"); len(perms) != 1 {
+		t.Errorf("surviving folder permissions = %d, want 1", len(perms))
+	}
+	var extra int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM extra_parents`).Scan(&extra); err != nil {
+		t.Fatal(err)
+	}
+	if extra != 0 {
+		t.Errorf("extra_parents referencing a deleted node not pruned: %d rows", extra)
+	}
+}
+
+// A surviving node whose first-discovered parent goes stale is detached to a
+// root rather than left dangling (or blocking the delete on the foreign key).
+func TestDeleteStaleNodesReparentsSurvivor(t *testing.T) {
+	db := testDB(t)
+	const cutoff = "2026-06-01T00:00:00Z"
+
+	staleParentID, _, _, _ := mustUpsert(t, db, node{driveID: "staleParent", name: "Gone", typ: typeFolder, mimeType: folderMimeType})
+	mustUpsert(t, db, node{driveID: "survivor", name: "moved.txt", typ: typeBinary, mimeType: "application/x",
+		parentID: sql.NullInt64{Int64: staleParentID, Valid: true}})
+
+	setCrawledAt(t, db, "staleParent", "2026-05-01T00:00:00Z")
+	setCrawledAt(t, db, "survivor", "2026-06-15T00:00:00Z")
+
+	if _, err := deleteStaleNodes(db, cutoff); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := nodeTypeByDriveID(db, "staleParent"); err != sql.ErrNoRows {
+		t.Errorf("stale parent should be gone, err=%v", err)
+	}
+	var parent sql.NullInt64
+	if err := db.QueryRow(`SELECT parent_id FROM nodes WHERE drive_id = 'survivor'`).Scan(&parent); err != nil {
+		t.Fatal(err)
+	}
+	if parent.Valid {
+		t.Errorf("survivor parent_id = %v, want NULL after its parent was removed", parent)
+	}
+}
+
+func TestWipeCrawlSnapshot(t *testing.T) {
+	db := testDB(t)
+	rootID, _, _, _ := mustUpsert(t, db, node{driveID: "root", name: "Root", typ: typeFolder, mimeType: folderMimeType})
+	mustUpsert(t, db, node{driveID: "child", name: "c", typ: typeBinary, mimeType: "application/x",
+		parentID: sql.NullInt64{Int64: rootID, Valid: true}})
+	tx, _ := db.Begin()
+	if err := replacePermissions(tx, "root", []permission{{permissionID: "p1", typ: "user", role: "owner"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordExtraParent(tx, "child", "root"); err != nil {
+		t.Fatal(err)
+	}
+	tx.Commit()
+	// Migration state must survive a snapshot wipe.
+	if err := upsertUserMigration(db, "alice@example.com", "uf", "cont", "stash"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := wipeCrawlSnapshot(db); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tbl := range []string{"nodes", "folder_permissions", "extra_parents"} {
+		var n int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM ` + tbl).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Errorf("%s not wiped: %d rows", tbl, n)
+		}
+	}
+	if m, err := getUserMigration(db, "alice@example.com"); err != nil || m == nil {
+		t.Errorf("migration state should survive wipe: m=%v err=%v", m, err)
+	}
+}

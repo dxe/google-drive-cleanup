@@ -101,6 +101,19 @@ CREATE TABLE IF NOT EXISTS pack_orphans (
 	swept_at             TEXT NOT NULL,
 	PRIMARY KEY (account, item_drive_id)
 );
+
+-- Single-row bookkeeping for the crawl. root_drive_id is the root the current
+-- snapshot was built for -- a change in the configured root means the snapshot
+-- belongs to a different tree. session_started_at marks when the in-progress
+-- crawl session began; it is the cutoff for stale-row cleanup (any node not
+-- re-observed since then is deleted when the crawl completes) and is persisted
+-- so an interrupted crawl resumes the same session instead of resetting the
+-- cutoff and deleting rows written before the interruption.
+CREATE TABLE IF NOT EXISTS crawl_meta (
+	id                 INTEGER PRIMARY KEY CHECK (id = 1),
+	root_drive_id      TEXT NOT NULL,
+	session_started_at TEXT NOT NULL
+);
 `, sqlQuoteList(nodeTypes))
 
 func openDB(path string) (*sql.DB, error) {
@@ -837,6 +850,107 @@ func crawlRootDriveID(db *sql.DB) (string, error) {
 	var id string
 	err := db.QueryRow(`SELECT drive_id FROM nodes WHERE parent_id IS NULL LIMIT 1`).Scan(&id)
 	return id, err
+}
+
+// getCrawlMeta returns the recorded crawl root and session start. ok is false
+// when no crawl has ever recorded metadata (a fresh or pre-crawl_meta database).
+func getCrawlMeta(db *sql.DB) (rootDriveID, sessionStart string, ok bool, err error) {
+	err = db.QueryRow(`SELECT root_drive_id, session_started_at FROM crawl_meta WHERE id = 1`).
+		Scan(&rootDriveID, &sessionStart)
+	if err == sql.ErrNoRows {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, err
+	}
+	return rootDriveID, sessionStart, true, nil
+}
+
+// setCrawlMeta records the root a crawl is snapshotting and when the session
+// began, so a resume reuses the same stale-row cutoff.
+func setCrawlMeta(db *sql.DB, rootDriveID, sessionStart string) error {
+	_, err := db.Exec(`
+		INSERT INTO crawl_meta (id, root_drive_id, session_started_at)
+		VALUES (1, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			root_drive_id      = excluded.root_drive_id,
+			session_started_at = excluded.session_started_at`,
+		rootDriveID, sessionStart)
+	return err
+}
+
+// wipeCrawlSnapshot deletes the entire crawl snapshot: every node and the
+// per-folder auxiliary rows (permissions, extra parents). Migration state
+// (user_migrations, pack_orphans) is left untouched. Used when the configured
+// root changes and the existing snapshot describes a different tree.
+func wipeCrawlSnapshot(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// nodes.parent_id self-references nodes; defer the check so deleting every
+	// row at once does not trip on parent-before-child ordering.
+	if _, err := tx.Exec(`PRAGMA defer_foreign_keys = ON`); err != nil {
+		return err
+	}
+	for _, stmt := range []string{
+		`DELETE FROM nodes`,
+		`DELETE FROM folder_permissions`,
+		`DELETE FROM extra_parents`,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// deleteStaleNodes removes every node not re-observed since sessionStart (its
+// crawled_at predates the current crawl session), i.e. items that no longer
+// exist under the root, together with the auxiliary rows that referenced them.
+// It is only safe to call after a crawl completes fully: a partial crawl has
+// not re-observed every live node yet. Returns the number of nodes removed.
+func deleteStaleNodes(db *sql.DB, sessionStart string) (int64, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`PRAGMA defer_foreign_keys = ON`); err != nil {
+		return 0, err
+	}
+	// A surviving node whose first-discovered parent is going away (a
+	// re-discovered multi-parent item whose original parent vanished) would
+	// dangle; detach it to a root rather than block the delete.
+	if _, err := tx.Exec(`
+		UPDATE nodes SET parent_id = NULL
+		WHERE crawled_at >= ?
+		  AND parent_id IN (SELECT id FROM nodes WHERE crawled_at < ?)`,
+		sessionStart, sessionStart); err != nil {
+		return 0, err
+	}
+	res, err := tx.Exec(`DELETE FROM nodes WHERE crawled_at < ?`, sessionStart)
+	if err != nil {
+		return 0, err
+	}
+	removed, _ := res.RowsAffected()
+	// The auxiliary tables key on drive_id with no foreign key, so prune the
+	// rows whose node is now gone by hand.
+	if _, err := tx.Exec(
+		`DELETE FROM folder_permissions WHERE node_drive_id NOT IN (SELECT drive_id FROM nodes)`); err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(`
+		DELETE FROM extra_parents
+		WHERE node_drive_id NOT IN (SELECT drive_id FROM nodes)
+		   OR parent_drive_id NOT IN (SELECT drive_id FROM nodes)`); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return removed, nil
 }
 
 // updateNodeOwner overwrites the owner fields for the node with the given driveID.

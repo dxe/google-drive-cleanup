@@ -98,6 +98,32 @@ func runCrawl(dbPath, cfgPath string, refresh bool) error {
 		log.Print("refresh: reset children_done=0 on all folders")
 	}
 
+	// Establish the crawl session. sessionStart is the cutoff for the stale-row
+	// sweep run once the crawl completes: any node not re-observed since then no
+	// longer exists under the root and is removed. It is persisted so an
+	// interrupted crawl resumes the same session rather than resetting the
+	// cutoff (which would delete rows written before the interruption). A fresh
+	// database, a --refresh, or a change of the configured root each begin a new
+	// session; a plain resume keeps the recorded one.
+	storedRoot, sessionStart, haveMeta, err := getCrawlMeta(db)
+	if err != nil {
+		return err
+	}
+	if haveMeta && storedRoot != cfg.Crawl.Root.ID {
+		log.Printf("crawl root changed since the last crawl (%s -> %s); discarding the previous snapshot",
+			storedRoot, cfg.Crawl.Root.ID)
+		if err := wipeCrawlSnapshot(db); err != nil {
+			return err
+		}
+		haveMeta = false
+	}
+	if !haveMeta || refresh {
+		sessionStart = now()
+		if err := setCrawlMeta(db, cfg.Crawl.Root.ID, sessionStart); err != nil {
+			return err
+		}
+	}
+
 	// Cancel the context on the first SIGINT/SIGTERM so the crawl stops
 	// cleanly between API pages/folders; transactions in flight always run to
 	// completion because they don't use this context. A second signal kills
@@ -181,6 +207,18 @@ func runCrawl(dbPath, cfgPath string, refresh bool) error {
 	case failed > 0:
 		return fmt.Errorf("crawl finished with %d folder errors; %d folders remaining — re-run to retry", failed, remaining)
 	default:
+		// The crawl finished cleanly, so every live node was re-observed this
+		// session: drop the rows that were not (deleted from Drive since the
+		// previous crawl) so the snapshot reflects the tree as it is now.
+		if remaining == 0 {
+			removed, err := deleteStaleNodes(db, sessionStart)
+			if err != nil {
+				return fmt.Errorf("removing stale rows from the previous crawl: %w", err)
+			}
+			if removed > 0 {
+				log.Printf("removed %d stale node(s) not seen in this crawl", removed)
+			}
+		}
 		log.Printf("crawl complete: %d folders remaining (children_done=0), %d files seen this run", remaining, c.fileCount)
 	}
 	return nil
