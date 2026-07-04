@@ -51,7 +51,9 @@ If the user became unavailable and never dragged the Container into the shared
 drive, pass --allow-not-moved to abort the migration: files are restored to
 their original locations straight from the packing folder so they are usable
 again, and pack can be re-run later to retry. Ownership never transferred in
-that case, so the database owner columns are left unchanged.`,
+that case, so the database owner columns are left unchanged. The user's dropoff
+access is still revoked once the Stash is clear (a re-pack re-grants it), so they
+cannot see the next user's files migrating through the same folder.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dbPath, _ := cmd.Flags().GetString("db")
@@ -512,13 +514,49 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 			}
 			return del(f, label)
 		}
+		// revokeDropoff removes the Manager access pack granted the user on the
+		// dropoff folder (the shared drive): the round trip is done, so they no
+		// longer need it, and leaving it would let them see the next user's files
+		// migrating through the same folder. pack re-grants it if the migration is
+		// retried. Needs their email; an owner-id-only account must be revoked
+		// manually.
+		revokeDropoff := func() error {
+			if !strings.Contains(account, "@") {
+				log.Printf("WARN %q is not an email address; cannot revoke dropoff access automatically — remove its access on %q manually", account, dropoff.Name)
+				return nil
+			}
+			perm, err := findUserPermission(ctx, svc, limiter, dropoff.Id, account)
+			if err != nil {
+				return fmt.Errorf("checking dropoff access for %s: %w", account, err)
+			}
+			if perm != nil {
+				if err := revokePermission(ctx, svc, limiter, dropoff.Id, perm.Id); err != nil {
+					return fmt.Errorf("revoking %s access on the dropoff folder: %w", account, err)
+				}
+				log.Printf("revoked %s access on the dropoff folder %q", account, dropoff.Name)
+			}
+			return nil
+		}
 
 		if !containerInSharedDrive {
 			// Migration aborted (--allow-not-moved): the Container stays in the
 			// user's My Drive, owned by them, for a later re-pack; only the emptied
-			// Stash is cleaned up here.
-			if err := deleteIfEmpty(stashF, "Stash"); err != nil {
+			// Stash is cleaned up here. Revoke the user's dropoff access anyway once
+			// the Stash is clear — the round trip is over, and leaving it would
+			// expose the next user's files; a re-pack re-grants it.
+			stashEmpty, err := isEmpty(stashF, "Stash")
+			if err != nil {
 				return err
+			}
+			if !stashEmpty {
+				log.Printf("WARN migration abort for %s is unfinished; leaving the Stash and the user's dropoff access in place — re-run unpack to finish", account)
+			} else {
+				if err := del(stashF, "Stash"); err != nil {
+					return err
+				}
+				if err := revokeDropoff(); err != nil {
+					return err
+				}
 			}
 		} else {
 			// Post-drag cleanup is all-or-nothing: delete the Stash and Container,
@@ -545,19 +583,8 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 				if err := del(container, "Container"); err != nil {
 					return err
 				}
-				// Revoke the Manager access pack granted the user on the dropoff
-				// folder (the shared drive): the round trip is done, so they no
-				// longer need it. Needs their email; an owner-id-only account must be
-				// revoked manually.
-				if !strings.Contains(account, "@") {
-					log.Printf("WARN %q is not an email address; cannot revoke dropoff access automatically — remove its access on %q manually", account, dropoff.Name)
-				} else if perm, err := findUserPermission(ctx, svc, limiter, dropoff.Id, account); err != nil {
-					return fmt.Errorf("checking dropoff access for %s: %w", account, err)
-				} else if perm != nil {
-					if err := revokePermission(ctx, svc, limiter, dropoff.Id, perm.Id); err != nil {
-						return fmt.Errorf("revoking %s access on the dropoff folder: %w", account, err)
-					}
-					log.Printf("revoked %s access on the dropoff folder %q", account, dropoff.Name)
+				if err := revokeDropoff(); err != nil {
+					return err
 				}
 				// The per-user folder goes too, unless something remains in it — e.g.
 				// a non-empty Errors folder.
