@@ -210,7 +210,7 @@ const exploreHTML = `<!DOCTYPE html>
   ul[role=tree] { padding-left: 0; }
   li { margin: 0; }
   .row { display: flex; align-items: center; gap: .35rem; padding: .1rem .35rem;
-         border-radius: .3rem; cursor: default; outline: none; }
+         border-radius: .3rem; cursor: pointer; outline: none; }
   .row:hover { background: #00000010; }
   /* focus-within so the row stays highlighted when its link has focus too */
   .row:focus, .row:focus-within { background: #1a73e8; color: #fff; }
