@@ -90,6 +90,27 @@ func (c *crawler) isVisited(driveID string) bool {
 	return c.visited[driveID]
 }
 
+// unvisitedInQueue counts the distinct folders in queue that still need
+// listing, i.e. excluding entries that duplicate an already-visited folder (a
+// folder reachable via multiple parents is enqueued once per sighting). This is
+// the real work remaining, unlike len(queue), which also counts stale
+// duplicates that get discarded as no-ops the moment a worker pops them — the
+// source of the queue "collapsing" to 0 in one step near the end of a crawl.
+func (c *crawler) unvisitedInQueue(queue []folderRef) int {
+	c.visitedMu.Lock()
+	defer c.visitedMu.Unlock()
+	seen := make(map[string]bool, len(queue))
+	n := 0
+	for _, f := range queue {
+		if c.visited[f.driveID] || seen[f.driveID] {
+			continue
+		}
+		seen[f.driveID] = true
+		n++
+	}
+	return n
+}
+
 var crawlCmd = &cobra.Command{
 	Use:   "crawl",
 	Short: "Recursively crawl the configured root folder into the database",
@@ -434,7 +455,7 @@ func (c *crawler) drainQueue(ctx context.Context, seed []folderRef) int {
 			// Without --verbose the per-folder line above is suppressed; emit a
 			// periodic heartbeat so a long crawl still shows it is making progress.
 			if !verbose && processed%3 == 0 {
-				log.Printf("progress: %d folders listed, %d queued, %d files so far", processed, len(queue), c.fileCount.Load())
+				log.Printf("progress: %d folders listed, %d queued, %d files so far", processed, c.unvisitedInQueue(queue), c.fileCount.Load())
 			}
 			// A cancelled listing returns ctx.Err(); that is an interruption, not a
 			// folder error, so don't count it (children_done stays 0 regardless).
