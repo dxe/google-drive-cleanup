@@ -14,11 +14,17 @@ import (
 	"google.golang.org/api/drive/v3"
 )
 
-// Per-user folder layout inside the packing folder. The Container must be
-// created manually by the admin's PERSONAL Gmail account — only personal
-// accounts can transfer ownership to other personal accounts, and the user
-// must own the Container to drag it into the shared drive. The CLI creates
-// everything else.
+// Per-user folder layout inside the packing folder:
+//
+//	<packing>/<account>/           org-owned; the user has NO access
+//	  pickup-<account>/            user is granted read access (see pickupFolderName)
+//	    <account>-Container/       created manually by the admin's personal Gmail
+//	  Stash/                       third-party items, hidden from the user
+//
+// The Container must be created manually by the admin's PERSONAL Gmail account
+// — only personal accounts can transfer ownership to other personal accounts,
+// and the user must own the Container to drag it into the shared drive. The
+// CLI creates everything else.
 const (
 	stashFolderName  = "Stash"
 	errorsFolderName = "Errors"
@@ -35,12 +41,28 @@ func containerFolderName(account string) string {
 	return account + "-Container"
 }
 
+// pickupFolderName is the name of a user's Pickup folder — the Container's
+// parent, and the only part of the packing scaffolding the user can see (pack
+// grants them read access). Without it, accepting Container ownership would
+// relocate the Container to the user's My Drive root: Drive does that when the
+// new owner cannot see the item's parent, and the Container would then be
+// missing from where a pack re-run or unpack looks for it. The per-user folder
+// itself cannot be shared instead — the Stash inside it holds third-party
+// files the user must not access. Scoped by account so the folder is
+// recognizable in the user's "Shared with me".
+func pickupFolderName(account string) string {
+	return "pickup-" + account
+}
+
 var packCmd = &cobra.Command{
 	Use:   "pack <user>",
 	Short: "Move everything <user> owns into their Container folder, ready for a single drag into the shared drive",
 	Long: `Gather everything <user> (email or owner id) owns into one Container folder
-under <packing-folder>/<user>/, so the user can transfer it all to the org with
-a single drag of the Container into the shared-drive dropoff folder.
+under <packing-folder>/<user>/pickup-<user>/, so the user can transfer it all to
+the org with a single drag of the Container into the shared-drive dropoff
+folder. The user is granted read access to the Pickup folder (and nothing else
+in the scaffolding) so the Container stays in place when they accept ownership
+of it — without that, Drive would relocate it to their My Drive root.
 
 Pass --folder <id> (a Drive folder ID that was crawled into the database) to
 pack only the user's items within that subfolder of the crawl root, instead of
@@ -55,11 +77,11 @@ a shared drive cannot hold third-party-owned items, so leaving them in place
 would block the drag. unpack later returns everything to the original parents
 recorded in the database.
 
-The Container itself must already exist: create it inside the per-user folder
+The Container itself must already exist: create it inside the Pickup folder
 with the admin's PERSONAL Gmail account (only personal accounts can transfer
 ownership to other personal accounts), so its ownership can be transferred to
-the user before they drag it. On a first run pack creates the per-user folder
-and Stash, then stops with instructions to create the Container.
+the user before they drag it. On a first run pack creates the per-user folder,
+Stash, and Pickup folder, then stops with instructions to create the Container.
 
 This command requires the full Drive scope. If the cached token.json only has
 read-only access, the tool re-runs consent automatically to obtain it.`,
@@ -330,7 +352,7 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 			return fmt.Errorf("creating the per-user folder: %w", err)
 		}
 	}
-	var stashF, containerF *drive.File
+	var stashF, pickupF, containerF *drive.File
 	if userFolder != nil {
 		stashF, err = findChildFolder(ctx, svc, limiter, userFolder.Id, stashFolderName)
 		if err != nil {
@@ -343,7 +365,20 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 				return fmt.Errorf("creating the Stash folder: %w", err)
 			}
 		}
-		containerF, err = findChildFolder(ctx, svc, limiter, userFolder.Id, containerFolderName(account))
+		pickupF, err = findChildFolder(ctx, svc, limiter, userFolder.Id, pickupFolderName(account))
+		if err != nil {
+			return fmt.Errorf("looking up the Pickup folder: %w", err)
+		}
+		if pickupF == nil {
+			if dryRun {
+				log.Printf("WOULD create %q under %s/%s", pickupFolderName(account), packing.Name, account)
+			} else if pickupF, err = createFolder(ctx, svc, limiter, userFolder.Id, pickupFolderName(account)); err != nil {
+				return fmt.Errorf("creating the Pickup folder: %w", err)
+			}
+		}
+	}
+	if pickupF != nil {
+		containerF, err = findChildFolder(ctx, svc, limiter, pickupF.Id, containerFolderName(account))
 		if err != nil {
 			return fmt.Errorf("looking up the Container folder: %w", err)
 		}
@@ -375,11 +410,35 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 		}
 	}
 
+	// Give the migrating user read access to the Pickup folder — see
+	// pickupFolderName for why (it keeps the Container in place when they accept
+	// ownership). Idempotent like the dropoff grant above; unpack removes the
+	// access by deleting the Pickup folder during cleanup.
+	switch {
+	case !strings.Contains(account, "@"):
+		log.Printf("WARN %q is not an email address; cannot grant Pickup access automatically — grant it read access on %q manually", account, pickupFolderName(account))
+	case dryRun:
+		log.Printf("WOULD grant %q read access on the Pickup folder %q", account, pickupFolderName(account))
+	default:
+		existing, err := findUserPermission(ctx, svc, limiter, pickupF.Id, account)
+		if err != nil {
+			return fmt.Errorf("checking Pickup access for %s: %w", account, err)
+		}
+		if existing == nil {
+			if err := grantPermission(ctx, svc, limiter, pickupF.Id, account, "reader"); err != nil {
+				return fmt.Errorf("granting %s read access on the Pickup folder: %w", account, err)
+			}
+			fmt.Fprintf(os.Stderr, "Granted %s read access on %s.\n", account, pickupFolderName(account))
+		} else {
+			fmt.Fprintf(os.Stderr, "Pickup access: %s already has %q on %s.\n", account, existing.Role, pickupFolderName(account))
+		}
+	}
+
 	containerInstructions := fmt.Sprintf(
-		"create a folder named %q inside %s/%s with the admin's PERSONAL Gmail account (only personal accounts can transfer ownership to other personal accounts; the packing folder must be shared with that account as editor), then re-run pack",
-		containerFolderName(account), packing.Name, account)
+		"create a folder named %q inside %s/%s/%s with the admin's PERSONAL Gmail account (only personal accounts can transfer ownership to other personal accounts; the packing folder must be shared with that account as editor), then re-run pack",
+		containerFolderName(account), packing.Name, account, pickupFolderName(account))
 	if containerF == nil && !dryRun {
-		parentLink := "https://drive.google.com/drive/folders/" + userFolder.Id
+		parentLink := "https://drive.google.com/drive/folders/" + pickupF.Id
 		return fmt.Errorf("no %q folder yet: %s\nParent folder to create it in: %s", containerFolderName(account), containerInstructions, parentLink)
 	}
 
@@ -402,7 +461,7 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 			}
 			fmt.Fprintf(os.Stderr, "Container ownership: currently %s — transfer it to %s (invite + accept, via the Drive UI) before the drag.\n", owner, account)
 		}
-		if err := upsertUserMigration(db, account, userFolder.Id, containerF.Id, stashF.Id); err != nil {
+		if err := upsertUserMigration(db, account, userFolder.Id, pickupF.Id, containerF.Id, stashF.Id); err != nil {
 			return fmt.Errorf("recording the migration: %w", err)
 		}
 	}
@@ -416,8 +475,8 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 	if dryRun {
 		fmt.Fprintf(os.Stderr, "DRY RUN: no changes will be made. Would pack %d item(s) owned by %q%s (%d owned subtree root(s)).\n", len(owned), account, scopeNote, len(roots))
 	} else {
-		fmt.Fprintf(os.Stderr, "About to pack %d item(s) owned by %q%s (%d owned subtree root(s)) into %s/%s/%s.\n",
-			len(owned), account, scopeNote, len(roots), packing.Name, account, containerFolderName(account))
+		fmt.Fprintf(os.Stderr, "About to pack %d item(s) owned by %q%s (%d owned subtree root(s)) into %s/%s/%s/%s.\n",
+			len(owned), account, scopeNote, len(roots), packing.Name, account, pickupFolderName(account), containerFolderName(account))
 		if !promptYesNo("Continue? [y/N] ") {
 			fmt.Fprintln(os.Stderr, "Aborted.")
 			return nil
@@ -681,10 +740,10 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 			return fmt.Errorf("recording pack completion: %w", err)
 		}
 		fmt.Fprintf(os.Stderr, `Pack complete. Next steps:
-  1. Transfer ownership of the Container to %[1]s via the Drive UI (invite + accept).
-  2. Ask %[1]s to drag the Container into the %[2]q folder, where they now have Manager access (one drag; this flips ownership of everything inside to the org).
+  1. Transfer ownership of the Container to %[1]s via the Drive UI (invite + accept). They have read access to its parent folder %[3]q, so the Container stays put when they accept.
+  2. Ask %[1]s to drag the Container from %[3]q into the %[2]q folder, where they now have Manager access (one drag; this flips ownership of everything inside to the org).
   3. Run: drive-cleanup unpack %[1]s
-`, account, dropoff.Name)
+`, account, dropoff.Name, pickupFolderName(account))
 	}
 	return nil
 }

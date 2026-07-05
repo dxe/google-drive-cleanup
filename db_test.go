@@ -570,7 +570,7 @@ func TestUserMigrationLifecycle(t *testing.T) {
 		t.Fatalf("before pack: migration = %v, err = %v; want nil, nil", m, err)
 	}
 
-	if err := upsertUserMigration(db, "alice@example.com", "uf", "cont", "stash"); err != nil {
+	if err := upsertUserMigration(db, "alice@example.com", "uf", "pick", "cont", "stash"); err != nil {
 		t.Fatal(err)
 	}
 	if err := markPacked(db, "alice@example.com"); err != nil {
@@ -580,7 +580,7 @@ func TestUserMigrationLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.containerID != "cont" || m.stashID != "stash" || m.userFolderID != "uf" {
+	if m.containerID != "cont" || m.stashID != "stash" || m.userFolderID != "uf" || m.pickupID != "pick" {
 		t.Errorf("migration ids = %+v", m)
 	}
 	if !m.packedAt.Valid || m.unpackedAt.Valid {
@@ -595,11 +595,11 @@ func TestUserMigrationLifecycle(t *testing.T) {
 	}
 
 	// Re-running pack re-records the scaffolding and restarts the cycle.
-	if err := upsertUserMigration(db, "alice@example.com", "uf2", "cont2", "stash2"); err != nil {
+	if err := upsertUserMigration(db, "alice@example.com", "uf2", "pick2", "cont2", "stash2"); err != nil {
 		t.Fatal(err)
 	}
 	m, _ = getUserMigration(db, "alice@example.com")
-	if m.containerID != "cont2" || m.packedAt.Valid || m.unpackedAt.Valid {
+	if m.containerID != "cont2" || m.pickupID != "pick2" || m.packedAt.Valid || m.unpackedAt.Valid {
 		t.Errorf("after re-upsert: %+v, want new ids and cleared timestamps", m)
 	}
 }
@@ -1031,7 +1031,7 @@ func TestWipeCrawlSnapshot(t *testing.T) {
 	}
 	tx.Commit()
 	// Migration state must survive a snapshot wipe.
-	if err := upsertUserMigration(db, "alice@example.com", "uf", "cont", "stash"); err != nil {
+	if err := upsertUserMigration(db, "alice@example.com", "uf", "pick", "cont", "stash"); err != nil {
 		t.Fatal(err)
 	}
 

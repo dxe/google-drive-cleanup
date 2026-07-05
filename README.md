@@ -26,10 +26,11 @@ Then, per user being migrated:
 ```
                (1) pack                            (3) user drags Container
   original  ─────────────▶  Packing/<user>/  ───────────────────────────▶  Dropoff (shared drive)
-  locations                  ├─ Container         (2) admin transfers       (user is granted Manager
-      ▲                      │   owned subtrees,      Container ownership    access; ownership of
-      │                      │   moved intact         to the user first      everything inside flips
-      │                      └─ Stash                 (Drive UI)             to the org)
+  locations                  ├─ pickup-<user>     (2) admin transfers       (user is granted Manager
+      ▲                      │   └─ Container         Container ownership    access; ownership of
+      │                      │       owned subtrees,  to the user first      everything inside flips
+      │                      │       moved intact     (Drive UI)             to the org)
+      │                      └─ Stash                                             │
       │                          third-party items,                               │
       │                          flat                                             │
       │                             │                                             │
@@ -197,8 +198,9 @@ Inside the packing folder, each user gets:
 
 ```
 Packing/
-  someone@gmail.com/                     created by pack, org-owned
-    someone@gmail.com-Container/         created MANUALLY by the admin's personal Gmail
+  someone@gmail.com/                     created by pack, org-owned; user has NO access
+    pickup-someone@gmail.com/            created by pack, org-owned; user gets READ access
+      someone@gmail.com-Container/       created MANUALLY by the admin's personal Gmail
     Stash/                               created by pack, org-owned
 ```
 
@@ -206,6 +208,17 @@ The Container must be named exactly `<user>-Container` (e.g.
 `someone@gmail.com-Container`) — `pack` looks it up by that name and refuses to
 proceed until it exists. Scoping the name by account keeps each user's Container
 distinguishable once several have been dragged into the same shared drive.
+
+**Why the Pickup folder:** when a user accepts ownership of an item whose
+parent folder they cannot see, Drive relocates the item to their My Drive root
+— the Container would then be missing from where a `pack` re-run or `unpack`
+looks for it. The user cannot simply be given access to the per-user folder,
+because the Stash inside it holds third-party files they must not see. So the
+Container lives in a `pickup-<user>` folder in between, and `pack` grants the
+user read access to it (idempotently, like the dropoff grant): the Container
+stays put when they accept ownership, and the Pickup folder — named for its
+counterpart, the Dropoff folder — is where they grab it for the drag. `unpack`
+deletes it with the rest of the scaffolding, which also removes the access.
 
 **Why the Container is created manually:** the user must *own* the Container
 to drag it into the shared drive, and Google only allows ownership transfers
@@ -262,8 +275,10 @@ The confirmation message shows the subfolder's path relative to the crawl root.
 
 Before scaffolding the pack, `pack` also grants the migrating user **Manager**
 access on the dropoff folder (the shared drive) so they can drag their Container
-in (idempotent — a re-run does not re-notify them). This needs the user's email;
-an owner-id-only account is warned about and must be granted access manually.
+in, and **read** access on their Pickup folder so the Container stays in place
+when they accept ownership of it (both idempotent — a re-run does not re-notify
+them). This needs the user's email; an owner-id-only account is warned about
+and must be granted access manually.
 
 Note Manager access is required to move folders into a Shared Drive.
 "Content manager" access only allows creating files, not folders.
@@ -298,10 +313,12 @@ on the shared drive), then:
    where it belongs — from `pack_orphans` for never-crawled items, `unknown`
    when even that is missing) instead of blocking cleanup.
 4. **Cleans up.** Once live listings confirm they are empty, the Stash, the
-   Container, and the per-user packing folder are deleted, and the **Manager**
+   Container, the Pickup folder (which also removes the user's read access on
+   it), and the per-user packing folder are deleted, and the **Manager**
    access `pack` granted the user on the dropoff folder is revoked. The Container
    is only deleted, and the access only revoked, when the Container was dragged
-   into the shared drive (a `--allow-not-moved` abort leaves them in place).
+   into the shared drive (a `--allow-not-moved` abort leaves them in place,
+   including the Pickup folder still holding the un-dragged Container).
    Anything left over — a non-empty Errors folder, or items that failed to move
    — is reported and left in place.
 
@@ -323,7 +340,8 @@ records the org account as the new owner). Cleanup runs as usual, and re-running
 2. **`drive-cleanup check-edit-access`** — confirm the running account can edit
    everything that will move.
 3. **`drive-cleanup pack <user>`** — first run scaffolds and asks for the
-   Container; create it with the admin's personal Gmail and re-run.
+   Container; create it inside the Pickup folder with the admin's personal
+   Gmail and re-run.
 4. **Transfer Container ownership** to the user's personal account (Drive UI;
    the user must accept the invite).
 5. **User drags the Container into the Dropoff folder** (the shared drive, where
@@ -426,8 +444,9 @@ SELECT * FROM extra_parents;
 ```
 
 **Migration state:** `pack` records each user's scaffolding in a
-`user_migrations` table (one row per account: the per-user folder, Container,
-and Stash Drive IDs, plus `packed_at`/`unpacked_at` timestamps set when each
+`user_migrations` table (one row per account: the per-user folder, Pickup
+folder, Container, and Stash Drive IDs, plus `packed_at`/`unpacked_at`
+timestamps set when each
 half finishes with zero failures) — `unpack` needs the Container's ID because
 by then the user has dragged it away from the packing folder. Swept items with
 no `nodes` row land in `pack_orphans` with the live parent they were taken

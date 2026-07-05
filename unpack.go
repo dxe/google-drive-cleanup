@@ -23,8 +23,8 @@ dropoff folder (which flips ownership of everything inside to the org).
 The Container is located live as the child named <user>-Container, not by the
 ID recorded at pack time, in case it is manually re-created by the admin.
 Normally it is found in the dropoff folder (the shared drive); with
---allow-not-moved it is found in the per-user packing folder instead (where it
-still sits, un-dragged).
+--allow-not-moved it is found in the Pickup folder inside the per-user packing
+folder instead (where it still sits, un-dragged).
 If what is found differs from the recorded ID, unpack asks for confirmation
 before proceeding. If no such folder is found in the expected place, unpack
 errors out (the Container is in the wrong location or missing) rather than
@@ -40,9 +40,10 @@ shared drive before they can follow.
 Items that cannot be placed — not in the database, or their original parent is
 gone — are quarantined under <packing-folder>/<user>/Errors/<original parent
 id>/ for manual restore instead of blocking cleanup. Once the Stash and
-Container are verified empty they are deleted, along with the per-user folder
-if nothing (such as a non-empty Errors folder) remains in it. The Manager
-access pack granted the user on the dropoff folder is then revoked.
+Container are verified empty they are deleted, along with the Pickup folder
+(which also removes the user's read access on it) and the per-user folder if
+nothing (such as a non-empty Errors folder) remains in it. The Manager access
+pack granted the user on the dropoff folder is then revoked.
 
 This command requires the full Drive scope and, to move items out of the shared
 drive, manager access on it.
@@ -199,16 +200,16 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 		containerID = id
 	case allowNotMoved:
 		// Migration abort: the Container was never dragged, so it still lives in
-		// the per-user packing folder. Find it there instead of trusting the
-		// recorded ID.
-		packingChild, err := findChildFolder(ctx, svc, limiter, m.userFolderID, containerFolderName(account))
+		// the Pickup folder inside the per-user packing folder. Find it there
+		// instead of trusting the recorded ID.
+		pickupChild, err := findChildFolder(ctx, svc, limiter, m.pickupID, containerFolderName(account))
 		if err != nil {
-			return fmt.Errorf("looking for the Container in the packing folder %s: %w", m.userFolderID, err)
+			return fmt.Errorf("looking for the Container in the Pickup folder %s: %w", m.pickupID, err)
 		}
-		if packingChild == nil {
-			return fmt.Errorf("no %q folder found in the dropoff folder %q or the per-user packing folder %s; the Container recorded at pack time (%s) is missing from both", containerFolderName(account), dropoff.Name, m.userFolderID, m.containerID)
+		if pickupChild == nil {
+			return fmt.Errorf("no %q folder found in the dropoff folder %q or the Pickup folder %s; the Container recorded at pack time (%s) is missing from both", containerFolderName(account), dropoff.Name, m.pickupID, m.containerID)
 		}
-		id, ok := resolveContainer(packingChild, "per-user packing folder")
+		id, ok := resolveContainer(pickupChild, "Pickup folder")
 		if !ok {
 			return nil
 		}
@@ -540,7 +541,8 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 
 		if !containerInSharedDrive {
 			// Migration aborted (--allow-not-moved): the Container stays in the
-			// user's My Drive, owned by them, for a later re-pack; only the emptied
+			// Pickup folder for a later re-pack (along with the user's read access
+			// on it — it only ever shows them their own Container); only the emptied
 			// Stash is cleaned up here. Revoke the user's dropoff access anyway once
 			// the Stash is clear — the round trip is over, and leaving it would
 			// expose the next user's files; a re-pack re-grants it.
@@ -584,6 +586,12 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 					return err
 				}
 				if err := revokeDropoff(); err != nil {
+					return err
+				}
+				// The Pickup folder held only the Container, which the drag took
+				// away; deleting it also removes the user's read access. It must go
+				// before the per-user folder, which can only be deleted once empty.
+				if err := deleteIfEmpty(&drive.File{Id: m.pickupID}, "Pickup folder"); err != nil {
 					return err
 				}
 				// The per-user folder goes too, unless something remains in it — e.g.

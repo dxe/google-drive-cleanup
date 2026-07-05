@@ -78,13 +78,14 @@ CREATE TABLE IF NOT EXISTS folder_permissions (
 );
 CREATE INDEX IF NOT EXISTS idx_folder_permissions_node ON folder_permissions(node_drive_id);
 
--- One row per user migration: where that user's Container and Stash live and
--- how far the pack/unpack cycle has progressed. Written by pack, read by
--- unpack -- the Container must be findable by ID after the user drags it out
--- of the packing folder into the shared drive.
+-- One row per user migration: where that user's Pickup folder, Container, and
+-- Stash live and how far the pack/unpack cycle has progressed. Written by
+-- pack, read by unpack -- the Container must be findable by ID after the user
+-- drags it out of the packing folder into the shared drive.
 CREATE TABLE IF NOT EXISTS user_migrations (
 	account        TEXT PRIMARY KEY,   -- as passed to pack (email or owner id)
 	user_folder_id TEXT NOT NULL,
+	pickup_id      TEXT NOT NULL,
 	container_id   TEXT NOT NULL,
 	stash_id       TEXT NOT NULL,
 	packed_at      TEXT,               -- set once pack finishes with zero failures
@@ -655,6 +656,7 @@ func extraParentNodeIDs(db *sql.DB) (map[string]bool, error) {
 type userMigration struct {
 	account      string
 	userFolderID string
+	pickupID     string
 	containerID  string
 	stashID      string
 	packedAt     sql.NullString
@@ -666,9 +668,9 @@ type userMigration struct {
 func getUserMigration(db *sql.DB, account string) (*userMigration, error) {
 	m := userMigration{account: account}
 	err := db.QueryRow(`
-		SELECT user_folder_id, container_id, stash_id, packed_at, unpacked_at
+		SELECT user_folder_id, pickup_id, container_id, stash_id, packed_at, unpacked_at
 		FROM user_migrations WHERE account = ?`, account).
-		Scan(&m.userFolderID, &m.containerID, &m.stashID, &m.packedAt, &m.unpackedAt)
+		Scan(&m.userFolderID, &m.pickupID, &m.containerID, &m.stashID, &m.packedAt, &m.unpackedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -678,20 +680,22 @@ func getUserMigration(db *sql.DB, account string) (*userMigration, error) {
 	return &m, nil
 }
 
-// upsertUserMigration records where account's Container and Stash live. It
-// clears the packed/unpacked timestamps: a (re-)running pack means the cycle
-// is in progress again, and markPacked/markUnpacked re-set them on success.
-func upsertUserMigration(db *sql.DB, account, userFolderID, containerID, stashID string) error {
+// upsertUserMigration records where account's Pickup folder, Container, and
+// Stash live. It clears the packed/unpacked timestamps: a (re-)running pack
+// means the cycle is in progress again, and markPacked/markUnpacked re-set
+// them on success.
+func upsertUserMigration(db *sql.DB, account, userFolderID, pickupID, containerID, stashID string) error {
 	_, err := db.Exec(`
-		INSERT INTO user_migrations (account, user_folder_id, container_id, stash_id)
-		VALUES (?, ?, ?, ?)
+		INSERT INTO user_migrations (account, user_folder_id, pickup_id, container_id, stash_id)
+		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(account) DO UPDATE SET
 			user_folder_id = excluded.user_folder_id,
+			pickup_id      = excluded.pickup_id,
 			container_id   = excluded.container_id,
 			stash_id       = excluded.stash_id,
 			packed_at      = NULL,
 			unpacked_at    = NULL`,
-		account, userFolderID, containerID, stashID)
+		account, userFolderID, pickupID, containerID, stashID)
 	return err
 }
 
