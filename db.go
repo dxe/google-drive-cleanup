@@ -103,6 +103,32 @@ CREATE TABLE IF NOT EXISTS pack_orphans (
 	PRIMARY KEY (account, item_drive_id)
 );
 
+-- Append-only audit log of every Google Drive write the tool performs (folder
+-- creates, moves, deletes, permission grants/revokes). One row per operation,
+-- tied to the migration (account) and command (pack/unpack) that issued it, with
+-- the before/after parents and the outcome. Never read by the tool's own logic;
+-- it exists purely for debugging and for manually restoring items that a move
+-- left in the wrong place -- from_parent/to_parent record where an item was and
+-- where it was headed, so a failed move can be reversed or completed by hand.
+CREATE TABLE IF NOT EXISTS drive_ops (
+	id          INTEGER PRIMARY KEY AUTOINCREMENT,
+	account     TEXT NOT NULL,          -- the migration this belongs to (user_migrations.account)
+	command     TEXT NOT NULL,          -- 'pack' or 'unpack'
+	operation   TEXT NOT NULL,          -- create_folder, move, move_verified, delete, grant_permission, revoke_permission
+	item_id     TEXT,                   -- Drive id acted on (created folder, moved/deleted file, folder whose permissions changed)
+	item_name   TEXT,                   -- human label when known (folder name on create); recover others via nodes.drive_id
+	from_parent TEXT,                   -- parent(s) removed by a move (comma-separated), else NULL
+	to_parent   TEXT,                   -- parent added by a move, or the containing folder on create, else NULL
+	detail      TEXT,                   -- freeform extra context (permission email/role/id)
+	status      TEXT NOT NULL,          -- 'ok' or 'error'
+	error       TEXT,                   -- error message when status = 'error'
+	started_at  TEXT NOT NULL,          -- RFC3339 UTC, just before the Drive call
+	finished_at TEXT NOT NULL           -- RFC3339 UTC, just after it returned
+);
+CREATE INDEX IF NOT EXISTS idx_drive_ops_account ON drive_ops(account);
+CREATE INDEX IF NOT EXISTS idx_drive_ops_item    ON drive_ops(item_id);
+CREATE INDEX IF NOT EXISTS idx_drive_ops_status  ON drive_ops(status);
+
 -- Single-row bookkeeping for the crawl. root_drive_id is the root the current
 -- snapshot was built for -- a change in the configured root means the snapshot
 -- belongs to a different tree. session_started_at marks when the in-progress

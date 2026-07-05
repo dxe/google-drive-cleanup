@@ -169,6 +169,10 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 	}
 	defer db.Close()
 
+	// rec logs every Drive write below into drive_ops, tagged as this account's
+	// pack run (see opLog).
+	rec := &opLog{db: db, account: account, command: "pack"}
+
 	crawlRoot, err := crawlRootDriveID(db)
 	if err == sql.ErrNoRows {
 		return fmt.Errorf("database is empty; run crawl first")
@@ -348,7 +352,7 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 	if userFolder == nil {
 		if dryRun {
 			log.Printf("WOULD create per-user folder %q under %q", account, packing.Name)
-		} else if userFolder, err = createFolder(ctx, svc, limiter, packing.Id, account); err != nil {
+		} else if userFolder, err = rec.createFolder(ctx, svc, limiter, packing.Id, account); err != nil {
 			return fmt.Errorf("creating the per-user folder: %w", err)
 		}
 	}
@@ -361,7 +365,7 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 		if stashF == nil {
 			if dryRun {
 				log.Printf("WOULD create %q under %s/%s", stashFolderName, packing.Name, account)
-			} else if stashF, err = createFolder(ctx, svc, limiter, userFolder.Id, stashFolderName); err != nil {
+			} else if stashF, err = rec.createFolder(ctx, svc, limiter, userFolder.Id, stashFolderName); err != nil {
 				return fmt.Errorf("creating the Stash folder: %w", err)
 			}
 		}
@@ -372,7 +376,7 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 		if pickupF == nil {
 			if dryRun {
 				log.Printf("WOULD create %q under %s/%s", pickupFolderName(account), packing.Name, account)
-			} else if pickupF, err = createFolder(ctx, svc, limiter, userFolder.Id, pickupFolderName(account)); err != nil {
+			} else if pickupF, err = rec.createFolder(ctx, svc, limiter, userFolder.Id, pickupFolderName(account)); err != nil {
 				return fmt.Errorf("creating the Pickup folder: %w", err)
 			}
 		}
@@ -401,7 +405,7 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 			return fmt.Errorf("checking dropoff access for %s: %w", account, err)
 		}
 		if existing == nil {
-			if err := grantPermission(ctx, svc, limiter, dropoff.Id, account, dropoffRole); err != nil {
+			if err := rec.grantPermission(ctx, svc, limiter, dropoff.Id, account, dropoffRole); err != nil {
 				return fmt.Errorf("granting %s Manager access on the dropoff folder: %w", account, err)
 			}
 			fmt.Fprintf(os.Stderr, "Granted %s Manager access on %s.\n", account, dropoff.Name)
@@ -425,7 +429,7 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 			return fmt.Errorf("checking Pickup access for %s: %w", account, err)
 		}
 		if existing == nil {
-			if err := grantPermission(ctx, svc, limiter, pickupF.Id, account, "reader"); err != nil {
+			if err := rec.grantPermission(ctx, svc, limiter, pickupF.Id, account, "reader"); err != nil {
 				return fmt.Errorf("granting %s read access on the Pickup folder: %w", account, err)
 			}
 			fmt.Fprintf(os.Stderr, "Granted %s read access on %s.\n", account, pickupFolderName(account))
@@ -530,7 +534,7 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 			stats.moved()
 			return
 		}
-		err := moveFile(moveCtx, svc, limiter, r.driveID, containerF.Id, r.parentDriveID)
+		err := rec.moveFile(moveCtx, svc, limiter, r.driveID, containerF.Id, r.parentDriveID)
 		if err == nil {
 			detailf("OK %s %q (%s) -> Container", r.typ, r.name, r.driveID)
 			stats.moved()
@@ -564,7 +568,7 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 			log.Printf("SKIP %q (%s): no longer owned by %s; leaving it in place", r.name, r.driveID, account)
 			stats.skip()
 		default:
-			if merr := moveFile(moveCtx, svc, limiter, r.driveID, containerF.Id, strings.Join(f.Parents, ",")); merr != nil {
+			if merr := rec.moveFile(moveCtx, svc, limiter, r.driveID, containerF.Id, strings.Join(f.Parents, ",")); merr != nil {
 				if moveCtx.Err() != nil {
 					return
 				}
@@ -656,7 +660,7 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 		// Then sweep them all to the Stash concurrently.
 		forEachConcurrent(moveCtx, workers, toStash, func(t stashTarget) {
 			prog.tick("progress: %d/%d swept to Stash", stats.sweptCount(), len(toStash))
-			if merr := moveFile(moveCtx, svc, limiter, t.id, stashF.Id, t.parent); merr != nil {
+			if merr := rec.moveFile(moveCtx, svc, limiter, t.id, stashF.Id, t.parent); merr != nil {
 				if moveCtx.Err() != nil {
 					return
 				}
@@ -726,7 +730,7 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 					detailf("OK straggler %q (%s): already nested inside the Container; leaving it in place", n.name, n.driveID)
 					return
 				}
-				if merr := moveFile(moveCtx, svc, limiter, n.driveID, containerF.Id, strings.Join(f.Parents, ",")); merr != nil {
+				if merr := rec.moveFile(moveCtx, svc, limiter, n.driveID, containerF.Id, strings.Join(f.Parents, ",")); merr != nil {
 					if moveCtx.Err() != nil {
 						return
 					}

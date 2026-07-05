@@ -162,6 +162,10 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 	}
 	defer db.Close()
 
+	// rec logs every Drive write below into drive_ops, tagged as this account's
+	// unpack run (see opLog).
+	rec := &opLog{db: db, account: account, command: "unpack"}
+
 	m, err := getUserMigration(db, account)
 	if err != nil {
 		return err
@@ -401,7 +405,7 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 				return nil, err
 			}
 			if ef == nil {
-				if ef, err = createFolder(moveCtx, svc, limiter, m.userFolderID, errorsFolderName); err != nil {
+				if ef, err = rec.createFolder(moveCtx, svc, limiter, m.userFolderID, errorsFolderName); err != nil {
 					return nil, err
 				}
 			}
@@ -414,7 +418,7 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 				return nil, err
 			}
 			if s == nil {
-				if s, err = createFolder(moveCtx, svc, limiter, errorsFolder.Id, parentLabel); err != nil {
+				if s, err = rec.createFolder(moveCtx, svc, limiter, errorsFolder.Id, parentLabel); err != nil {
 					return nil, err
 				}
 			}
@@ -431,7 +435,7 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 		if err != nil {
 			return err
 		}
-		return moveFileVerified(moveCtx, svc, limiter, itemID, sub.Id, fromParent)
+		return rec.moveFileVerified(moveCtx, svc, limiter, itemID, sub.Id, fromParent)
 	}
 
 	// orphanLabel names the Errors subfolder for an item with no database row:
@@ -503,7 +507,7 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 				stats.incRestored()
 				return
 			}
-			merr := moveFileVerified(moveCtx, svc, limiter, t.id, t.dest, source.Id)
+			merr := rec.moveFileVerified(moveCtx, svc, limiter, t.id, t.dest, source.Id)
 			if merr == nil {
 				detailf("OK %q (%s) -> parent %s", t.name, t.id, t.dest)
 				if flipOwner {
@@ -592,7 +596,7 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 			return true, nil
 		}
 		del := func(f *drive.File, label string) error {
-			if err := deleteFile(ctx, svc, limiter, f.Id); err != nil {
+			if err := rec.deleteFile(ctx, svc, limiter, f.Id); err != nil {
 				return fmt.Errorf("deleting empty %s: %w", label, err)
 			}
 			log.Printf("deleted empty %s", label)
@@ -621,7 +625,7 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 				return fmt.Errorf("checking dropoff access for %s: %w", account, err)
 			}
 			if perm != nil {
-				if err := revokePermission(ctx, svc, limiter, dropoff.Id, perm.Id); err != nil {
+				if err := rec.revokePermission(ctx, svc, limiter, dropoff.Id, perm.Id); err != nil {
 					return fmt.Errorf("revoking %s access on the dropoff folder: %w", account, err)
 				}
 				log.Printf("revoked %s access on the dropoff folder %q", account, dropoff.Name)
