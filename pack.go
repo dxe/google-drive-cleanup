@@ -434,12 +434,14 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 		}
 	}
 
-	containerInstructions := fmt.Sprintf(
-		"create a folder named %q inside %s/%s/%s with the admin's PERSONAL Gmail account (only personal accounts can transfer ownership to other personal accounts; the packing folder must be shared with that account as editor), then re-run pack",
-		containerFolderName(account), packing.Name, account, pickupFolderName(account))
 	if containerF == nil && !dryRun {
 		parentLink := "https://drive.google.com/drive/folders/" + pickupF.Id
-		return fmt.Errorf("no %q folder yet: %s\nParent folder to create it in: %s", containerFolderName(account), containerInstructions, parentLink)
+		return fmt.Errorf("no %q folder yet.\n\nPlease create the container:\n\n"+
+			"1. Log into Google Drive with admin's PERSONAL Gmail account (only personal accounts can transfer ownership to other personal accounts; the packing folder must be shared with that account as editor)\n"+
+			"2. Open pickup folder: %s\n"+
+			"3. Create a new folder inside called %q\n"+
+			"4. Re-run pack",
+			containerFolderName(account), parentLink, containerFolderName(account))
 	}
 
 	if !dryRun {
