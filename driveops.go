@@ -242,6 +242,65 @@ func moveFile(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, fi
 	})
 }
 
+// errParentNotConfirmed signals that a move reported success but a follow-up read
+// showed the requested parent was not attached. confirmParent re-issues the move
+// and returns this so withRetry backs off and re-verifies; retryable treats it as
+// transient. If it survives every retry attempt it surfaces to the caller as a
+// real failure, so a silently misplaced item fails loudly instead of vanishing.
+var errParentNotConfirmed = errors.New("move reported success but the requested parent was not attached")
+
+// confirmParent verifies that addParent is among fileID's live parents after a
+// move, repairing it if not. Drive can return success on a files.update that
+// removed the old parent — and, for a move out of a shared drive, flipped
+// ownership to the mover — yet did NOT attach the requested new parent: the item
+// silently lands at the mover's My Drive root, no error returned. This was seen
+// during unpack when a file was restored into a destination folder that was
+// itself being moved out of the shared drive concurrently. A plain files.get is
+// strongly consistent for an item's own parents (unlike the files.list the sweep
+// and restore walks use), so it reliably detects the drop; the repair re-moves
+// the item from whatever parents it currently has, retrying with backoff until
+// addParent sticks or the attempts run out.
+func confirmParent(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, fileID, addParent string) error {
+	return withRetry(ctx, limiter, "confirm parent of "+fileID, func() error {
+		f, err := svc.Files.Get(fileID).
+			Fields("id, parents").
+			SupportsAllDrives(true).
+			Context(ctx).Do()
+		if err != nil {
+			return err
+		}
+		if hasParent(f, addParent) {
+			return nil
+		}
+		log.Printf("WARN move of %s reported success but parent %s did not attach (item is under %v); re-moving", fileID, addParent, f.Parents)
+		if err := limiter.Wait(ctx); err != nil {
+			return err
+		}
+		if _, err := svc.Files.Update(fileID, nil).
+			AddParents(addParent).
+			RemoveParents(strings.Join(f.Parents, ",")).
+			SupportsAllDrives(true).
+			Fields("id").
+			Context(ctx).Do(); err != nil {
+			return err
+		}
+		return errParentNotConfirmed
+	})
+}
+
+// moveFileVerified reparents an item like moveFile, then confirms the new parent
+// actually attached (see confirmParent). unpack uses it for restores and
+// quarantines: those move items out of the shared drive, the one operation
+// observed to occasionally report success while silently dropping the item at the
+// mover's My Drive root. pack's moves stay within My Drive, so they use plain
+// moveFile.
+func moveFileVerified(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, fileID, addParent, removeParent string) error {
+	if err := moveFile(ctx, svc, limiter, fileID, addParent, removeParent); err != nil {
+		return err
+	}
+	return confirmParent(ctx, svc, limiter, fileID, addParent)
+}
+
 // findUserPermission returns email's existing permission on fileID
 // (case-insensitive), or nil if none. Used to make granting idempotent so a
 // re-run does not re-notify the user.

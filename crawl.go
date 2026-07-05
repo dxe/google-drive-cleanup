@@ -776,6 +776,12 @@ func withRetry(ctx context.Context, limiter *rate.Limiter, op string, fn func() 
 }
 
 func retryable(err error) bool {
+	// A move that reported success but did not attach the requested parent:
+	// confirmParent has re-issued it and wants withRetry to back off and verify
+	// again. See confirmParent.
+	if errors.Is(err, errParentNotConfirmed) {
+		return true
+	}
 	var gerr *googleapi.Error
 	if !errors.As(err, &gerr) {
 		return false

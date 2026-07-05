@@ -342,7 +342,7 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 		if err != nil {
 			return err
 		}
-		return moveFile(moveCtx, svc, limiter, itemID, sub.Id, fromParent)
+		return moveFileVerified(moveCtx, svc, limiter, itemID, sub.Id, fromParent)
 	}
 
 	// orphanLabel names the Errors subfolder for an item with no database row:
@@ -414,7 +414,7 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 				stats.incRestored()
 				return
 			}
-			merr := moveFile(moveCtx, svc, limiter, t.id, t.dest, source.Id)
+			merr := moveFileVerified(moveCtx, svc, limiter, t.id, t.dest, source.Id)
 			if merr == nil {
 				detailf("OK %q (%s) -> parent %s", t.name, t.id, t.dest)
 				if flipOwner {
