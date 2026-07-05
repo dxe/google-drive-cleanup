@@ -768,63 +768,6 @@ func nodeTypeByDriveID(db *sql.DB, driveID string) (string, error) {
 	return typ, err
 }
 
-type ownerCount struct {
-	email       sql.NullString
-	ownerID     sql.NullString
-	displayName sql.NullString
-	folderCount int64
-	fileCount   int64
-	total       int64
-}
-
-// ownersReport counts nodes per owner, split into folders and files, grouped by
-// owner_email, falling back to owner_id when the email is missing, and to a
-// single "(unknown)" bucket when both are NULL. Rows are ordered by file count
-// descending.
-//
-// If parentDriveID is non-empty, only the folder with that Drive ID and its
-// descendants are counted (walking parent_id downwards); an empty string counts
-// the whole database.
-func ownersReport(db *sql.DB, parentDriveID string) ([]ownerCount, error) {
-	scope := "nodes"
-	var args []any
-	if parentDriveID != "" {
-		// Restrict to the folder and everything beneath it. The recursive CTE
-		// seeds on the folder's row and walks parent_id downwards; we then count
-		// over just those rows instead of the whole table.
-		scope = `(
-			WITH RECURSIVE subtree(id) AS (
-				SELECT id FROM nodes WHERE drive_id = ?
-				UNION ALL
-				SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
-			)
-			SELECT nodes.* FROM nodes JOIN subtree ON nodes.id = subtree.id
-		)`
-		args = append(args, parentDriveID)
-	}
-	rows, err := db.Query(fmt.Sprintf(`
-		SELECT MAX(owner_email) AS email, MAX(owner_id) AS oid, MAX(owner_display_name),
-			SUM(type = '%[1]s') AS folders,
-			SUM(type <> '%[1]s') AS files,
-			COUNT(*) AS total
-		FROM %[2]s
-		GROUP BY COALESCE(owner_email, owner_id, '(unknown)')
-		ORDER BY files DESC, total DESC, (email IS NULL AND oid IS NULL), COALESCE(email, oid)`, typeFolder, scope), args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var counts []ownerCount
-	for rows.Next() {
-		var oc ownerCount
-		if err := rows.Scan(&oc.email, &oc.ownerID, &oc.displayName, &oc.folderCount, &oc.fileCount, &oc.total); err != nil {
-			return nil, err
-		}
-		counts = append(counts, oc)
-	}
-	return counts, rows.Err()
-}
-
 // exploreNode is one node in the ownership tree built by ownedAndAncestors:
 // every item the target account owns, plus the ancestor folders that hold them.
 type exploreNode struct {

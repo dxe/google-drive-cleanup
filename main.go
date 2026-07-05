@@ -6,7 +6,6 @@
 package main
 
 import (
-	"database/sql"
 	"fmt"
 	"log"
 	"os"
@@ -37,24 +36,6 @@ shared drives for ownership transfer and later restored to their original
 parents.`,
 	SilenceErrors: true,
 	SilenceUsage:  true,
-}
-
-var ownersCmd = &cobra.Command{
-	Use:   "owners",
-	Short: "Print each owner and how many files (non-folders) they own",
-	Long: `Print each owner and how many files (non-folders) they own, sorted
-descending by count — this drives outreach priority.
-
-With --folder, counts are limited to that Google Drive folder and its
-descendants (the folder must be one crawled into the database); without it, the
-whole database is counted.`,
-	Args: cobra.NoArgs,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		dbPath, _ := cmd.Flags().GetString("db")
-		cfgPath, _ := cmd.Flags().GetString("config")
-		folderID, _ := cmd.Flags().GetString("folder")
-		return runOwners(dbPath, cfgPath, folderID)
-	},
 }
 
 var pathCmd = &cobra.Command{
@@ -92,86 +73,7 @@ func init() {
 	rootCmd.PersistentFlags().String("config", "config.json", "path to the config JSON")
 	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "log every item touched, not just progress summaries and errors")
 
-	ownersCmd.Flags().String("folder", "", "Google Drive folder ID to scope the report to (must be crawled into the database)")
-
 	rootCmd.AddCommand(initCmd, crawlCmd, ownersCmd, pathCmd, checkEditAccessCmd, exploreCmd, packCmd, unpackCmd)
-}
-
-func runOwners(dbPath, cfgPath, parentID string) error {
-	cfg, err := loadConfig(cfgPath)
-	if err != nil {
-		return err
-	}
-
-	db, err := openDB(dbPath)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-
-	if parentID != "" {
-		typ, err := nodeTypeByDriveID(db, parentID)
-		if err == sql.ErrNoRows {
-			return fmt.Errorf("parent folder %s not found in the database; crawl it first", parentID)
-		}
-		if err != nil {
-			return err
-		}
-		if typ != typeFolder {
-			return fmt.Errorf("%s is a %s, not a folder", parentID, typ)
-		}
-	}
-
-	counts, err := ownersReport(db, parentID)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("%10s %10s %10s  %s\n", "FOLDERS", "FILES", "TOTAL", "OWNER")
-	for _, oc := range counts {
-		if cfg.Owners.IgnoreInternalDomains && isInternalEmail(oc.email, cfg.InternalDomains) {
-			continue
-		}
-		fmt.Printf("%10d %10d %10d  %s\n", oc.folderCount, oc.fileCount, oc.total, ownerLabel(oc))
-	}
-	return nil
-}
-
-// isInternalEmail reports whether email is non-null and ends with "@" followed
-// by one of the internal domains (case-insensitive).
-func isInternalEmail(email sql.NullString, internalDomains []string) bool {
-	if !email.Valid {
-		return false
-	}
-	at := strings.LastIndex(email.String, "@")
-	if at < 0 {
-		return false
-	}
-	domain := strings.ToLower(email.String[at+1:])
-	for _, d := range internalDomains {
-		if domain == strings.ToLower(d) {
-			return true
-		}
-	}
-	return false
-}
-
-func ownerLabel(oc ownerCount) string {
-	switch {
-	case oc.email.Valid:
-		if oc.displayName.Valid {
-			return fmt.Sprintf("%s (%s)", oc.email.String, oc.displayName.String)
-		}
-		return oc.email.String
-	case oc.ownerID.Valid:
-		// No email on these rows; the stable Drive user id is all we have, so
-		// include the display name to make it human-readable.
-		if oc.displayName.Valid {
-			return fmt.Sprintf("id:%s (%s)", oc.ownerID.String, oc.displayName.String)
-		}
-		return "id:" + oc.ownerID.String
-	default:
-		return "(unknown)"
-	}
 }
 
 func runPath(dbPath, driveID string) error {
