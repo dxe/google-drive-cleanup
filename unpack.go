@@ -24,7 +24,7 @@ dropoff folder (which flips ownership of everything inside to the org).
 The Container is located live as the child named <user>-Container, not by the
 ID recorded at pack time, in case it is manually re-created by the admin.
 Normally it is found in the dropoff folder (the shared drive); with
---allow-not-moved it is found in the Pickup folder inside the per-user packing
+--allow-not-moved it is found in the Pickup folder inside the user's Packing
 folder instead (where it still sits, un-dragged).
 If what is found differs from the recorded ID, unpack asks for confirmation
 before proceeding. If no such folder is found in the expected place, unpack
@@ -48,7 +48,7 @@ Items that cannot be placed — not in the database, or their original parent is
 gone — are quarantined under <packing-folder>/<user>/Errors/<original parent
 id>/ for manual restore instead of blocking cleanup. Once the Stash and
 Container are verified empty they are deleted, along with the Pickup folder
-(which also removes the user's read access on it) and the per-user folder if
+(which also removes the user's read access on it) and the user's Packing folder if
 nothing (such as a non-empty Errors folder) remains in it. The Manager access
 pack granted the user on the dropoff folder is then revoked.
 
@@ -254,7 +254,7 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 		containerID = id
 	case allowNotMoved:
 		// Migration abort: the Container was never dragged, so it still lives in
-		// the Pickup folder inside the per-user packing folder. Find it there
+		// the Pickup folder inside the user's Packing folder. Find it there
 		// instead of trusting the recorded ID.
 		pickupChild, err := findChildFolder(ctx, svc, limiter, m.pickupID, containerFolderName(account))
 		if err != nil {
@@ -581,7 +581,7 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 	// Cleanup: delete the scaffolding only once live listings confirm it is
 	// genuinely empty, so nothing that failed to move is silently lost.
 	if dryRun {
-		log.Printf("NOTE cleanup (deleting the emptied Stash, Container, and per-user folder, and revoking the user's dropoff access) is skipped in a dry run")
+		log.Printf("NOTE cleanup (deleting the emptied Stash, Container, and the user's Packing folder, and revoking the user's dropoff access) is skipped in a dry run")
 	} else {
 		// isEmpty reports whether a live listing shows f has no remaining children.
 		isEmpty := func(f *drive.File, label string) (bool, error) {
@@ -656,7 +656,7 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 			}
 		} else {
 			// Post-drag cleanup is all-or-nothing: delete the Stash and Container,
-			// revoke the user's dropoff access, and delete the per-user folder only
+			// revoke the user's dropoff access, and delete the user's Packing folder only
 			// once BOTH the Container and the Stash are confirmed empty. If either
 			// still has items — a restore error left some behind — the migration is
 			// unfinished and must be re-run, and that re-run needs the Container
@@ -671,7 +671,7 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 				return err
 			}
 			if !containerEmpty || !stashEmpty {
-				log.Printf("WARN migration for %s is unfinished; leaving the Container, Stash, per-user folder, and the user's dropoff access in place — re-run unpack to finish", account)
+				log.Printf("WARN migration for %s is unfinished; leaving the Container, Stash, Packing folder, and the user's dropoff access in place — re-run unpack to finish", account)
 			} else {
 				if err := del(stashF, "Stash"); err != nil {
 					return err
@@ -684,13 +684,13 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 				}
 				// The Pickup folder held only the Container, which the drag took
 				// away; deleting it also removes the user's read access. It must go
-				// before the per-user folder, which can only be deleted once empty.
+				// before the user's Packing folder, which can only be deleted once empty.
 				if err := deleteIfEmpty(&drive.File{Id: m.pickupID}, "Pickup folder"); err != nil {
 					return err
 				}
-				// The per-user folder goes too, unless something remains in it — e.g.
+				// The user's Packing folder goes too, unless something remains in it — e.g.
 				// a non-empty Errors folder.
-				if err := deleteIfEmpty(&drive.File{Id: m.userFolderID}, fmt.Sprintf("per-user folder for %s", account)); err != nil {
+				if err := deleteIfEmpty(&drive.File{Id: m.userFolderID}, fmt.Sprintf("Packing folder for %s", account)); err != nil {
 					return err
 				}
 			}

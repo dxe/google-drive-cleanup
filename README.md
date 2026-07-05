@@ -212,7 +212,7 @@ distinguishable once several have been dragged into the same shared drive.
 **Why the Pickup folder:** when a user accepts ownership of an item whose
 parent folder they cannot see, Drive relocates the item to their My Drive root
 — the Container would then be missing from where a `pack` re-run or `unpack`
-looks for it. The user cannot simply be given access to the per-user folder,
+looks for it. The user cannot simply be given access to their Packing folder,
 because the Stash inside it holds third-party files they must not see. So the
 Container lives in a `pickup-<user>` folder in between, and `pack` grants the
 user read access to it (idempotently, like the dropoff grant): the Container
@@ -225,7 +225,7 @@ to drag it into the shared drive, and Google only allows ownership transfers
 between two personal accounts (or two accounts of the same Workspace). So the
 admin creates the Container with a personal Gmail account and transfers its
 ownership to the user's personal account via the Drive UI (an invite the user
-must accept). On a first run, `pack` creates the per-user folder and Stash,
+must accept). On a first run, `pack` creates the user's Packing folder and Stash,
 then stops with instructions to create the Container.
 
 ### `pack <user>`
@@ -314,7 +314,7 @@ on the shared drive), then:
    when even that is missing) instead of blocking cleanup.
 4. **Cleans up.** Once live listings confirm they are empty, the Stash, the
    Container, the Pickup folder (which also removes the user's read access on
-   it), and the per-user packing folder are deleted, and the **Manager**
+   it), and the user's Packing folder are deleted, and the **Manager**
    access `pack` granted the user on the dropoff folder is revoked. The Container
    is only deleted, and the access only revoked, when the Container was dragged
    into the shared drive (a `--allow-not-moved` abort leaves them in place,
@@ -444,7 +444,7 @@ SELECT * FROM extra_parents;
 ```
 
 **Migration state:** `pack` records each user's scaffolding in a
-`user_migrations` table (one row per account: the per-user folder, Pickup
+`user_migrations` table (one row per account: the user's Packing folder, Pickup
 folder, Container, and Stash Drive IDs, plus `packed_at`/`unpacked_at`
 timestamps set when each
 half finishes with zero failures) — `unpack` needs the Container's ID because

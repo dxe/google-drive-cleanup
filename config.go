@@ -63,7 +63,7 @@ type migrationConfig struct {
 	// never in a shared drive (a user's Stash parks third-party-owned files,
 	// which a shared drive cannot hold), and MUST NOT be inside the crawl root
 	// (a re-crawl would ingest mid-migration scaffolding).
-	PackingFolder rootConfig `json:"packing-folder" doc:"a My-Drive folder outside the crawl root holding per-user packing folders"`
+	PackingFolder rootConfig `json:"packing-folder" doc:"a My-Drive folder outside the crawl root holding users' Packing folders"`
 	// DropoffFolder is the shared-drive folder a user drags their Container
 	// into; the drag flips ownership of the container's whole tree to the org.
 	DropoffFolder rootConfig `json:"dropoff-folder" doc:"the shared-drive folder users drag their Container into"`
