@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/time/rate"
@@ -29,6 +30,12 @@ If what is found differs from the recorded ID, unpack asks for confirmation
 before proceeding. If no such folder is found in the expected place, unpack
 errors out (the Container is in the wrong location or missing) rather than
 falling back to the recorded ID.
+
+Before restoring anything, unpack verifies that the drag's ownership transfer
+— which Drive applies asynchronously, item by item — has reached everything
+inside the Container, and waits for stragglers to flip. Restoring too early
+would move an item back out of the shared drive before its ownership flipped,
+silently leaving it owned by the migrating user in the middle of the org tree.
 
 Each direct child of the Container is moved back to the original parent
 recorded in the database (owned items nested deeper ride along with their
@@ -62,8 +69,9 @@ cannot see the next user's files migrating through the same folder.`,
 		dryRun, _ := cmd.Flags().GetBool("dry-run")
 		maxErrors, _ := cmd.Flags().GetInt("max-errors")
 		allowNotMoved, _ := cmd.Flags().GetBool("allow-not-moved")
+		ignoreUnflipped, _ := cmd.Flags().GetBool("ignore-unflipped")
 		concurrency, _ := cmd.Flags().GetInt("concurrency")
-		return runUnpack(dbPath, cfgPath, args[0], dryRun, maxErrors, allowNotMoved, concurrency)
+		return runUnpack(dbPath, cfgPath, args[0], dryRun, maxErrors, allowNotMoved, ignoreUnflipped, concurrency)
 	},
 }
 
@@ -71,6 +79,7 @@ func init() {
 	unpackCmd.Flags().Bool("dry-run", false, "report what would move without changing anything (read-only scope)")
 	unpackCmd.Flags().Int("max-errors", 5, "abort once more than this many items fail to move")
 	unpackCmd.Flags().Bool("allow-not-moved", false, "abort the migration: restore files even if the Container was never dragged into the shared drive (ownership never flipped, so the database owner columns are left unchanged)")
+	unpackCmd.Flags().Bool("ignore-unflipped", false, "unpack even if some items in the Container never had their ownership flipped to the org (restores them still owned by the migrating user; they are recorded as migrated anyway)")
 	unpackCmd.Flags().Int("concurrency", defaultMoveConcurrency, "how many file moves to run in parallel (all still share the global rate limiter)")
 }
 
@@ -97,7 +106,48 @@ func (s *restoreStats) processed() int {
 	return s.restored + s.quarantined
 }
 
-func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allowNotMoved bool, concurrency int) error {
+// Dragging the Container into the shared drive flips ownership of everything
+// inside to the org, but Drive applies the flip asynchronously, item by item —
+// a tree dragged moments ago can be only partially transferred (seen live:
+// five files deep in a dragged Container still owned by the migrating user
+// minutes later, while their siblings had flipped). Unpack polls until the
+// tree is clean before restoring; these bound the wait.
+const (
+	flipPollInterval = 15 * time.Second
+	flipWaitTimeout  = 5 * time.Minute
+)
+
+// unflippedItems walks the Container tree in the shared drive and returns
+// every item still owned by account, i.e. items the drag's asynchronous
+// ownership transfer has not reached yet. Items the flip has processed report
+// no owners at all (shared-drive items have none), so any item still naming
+// the migrating user is pending. files.list can lag reality, but only ever
+// toward the OLD state — it cannot report a flip that has not happened — so a
+// clean walk is trustworthy, and a stale positive merely waits a little longer.
+func unflippedItems(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, rootID, account string) ([]*drive.File, error) {
+	var unflipped []*drive.File
+	queue := []string{rootID}
+	for len(queue) > 0 {
+		folderID := queue[0]
+		queue = queue[1:]
+		children, err := listChildren(ctx, svc, limiter, folderID,
+			"nextPageToken, files(id, name, mimeType, owners(emailAddress, permissionId))")
+		if err != nil {
+			return nil, fmt.Errorf("listing %s: %w", folderID, err)
+		}
+		for _, c := range children {
+			if ownedByAccount(c, account) {
+				unflipped = append(unflipped, c)
+			}
+			if c.MimeType == folderMimeType {
+				queue = append(queue, c.Id)
+			}
+		}
+	}
+	return unflipped, nil
+}
+
+func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allowNotMoved, ignoreUnflipped bool, concurrency int) error {
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
 		return err
@@ -284,6 +334,45 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 		}
 	}
 
+	// Verify the drag's ownership transfer actually reached everything inside
+	// the Container before moving anything back out (see unflippedItems).
+	// Restoring an unflipped item would pull it out of the shared drive still
+	// owned by the migrating user — and updateSubtreeOwner below would record
+	// it as migrated anyway, hiding the miss until the next crawl. Runs after
+	// the confirmation prompt so the poll can wait unattended. A dry run
+	// reports the pending items but does not wait.
+	if containerInSharedDrive {
+		for start := time.Now(); ; {
+			unflipped, err := unflippedItems(ctx, svc, limiter, containerID, account)
+			if err != nil {
+				return fmt.Errorf("verifying the drag's ownership transfer: %w", err)
+			}
+			if len(unflipped) == 0 {
+				break
+			}
+			for _, f := range unflipped {
+				log.Printf("WARN still owned by %s: %q (%s)", account, f.Name, f.Id)
+			}
+			if dryRun {
+				log.Printf("WARN %d item(s) in the Container are still owned by %s; the drag's ownership transfer has not finished propagating", len(unflipped), account)
+				break
+			}
+			if ignoreUnflipped {
+				log.Printf("WARN %d item(s) in the Container are still owned by %s; --ignore-unflipped set: unpacking anyway. These items will be restored still owned by %s but recorded as migrated in the database.", len(unflipped), account, account)
+				break
+			}
+			if time.Since(start) > flipWaitTimeout {
+				return fmt.Errorf("%d item(s) in the Container are still owned by %s after %v; the drag's ownership transfer has not finished propagating — wait a few minutes and re-run unpack", len(unflipped), account, flipWaitTimeout)
+			}
+			log.Printf("%d item(s) in the Container are still owned by %s; the drag's ownership transfer is still propagating — rechecking in %v", len(unflipped), account, flipPollInterval)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(flipPollInterval):
+			}
+		}
+	}
+
 	// The restores run through a bounded worker pool sharing one context: when the
 	// error budget is spent, stats.fail cancels it so in-flight workers stop and
 	// the Stash restore short-circuits. A dry run only logs, so keep it
@@ -419,7 +508,8 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 				detailf("OK %q (%s) -> parent %s", t.name, t.id, t.dest)
 				if flipOwner {
 					// The drag flipped ownership of everything inside the Container
-					// to the org, so this child and every item that rode along
+					// to the org — verified by the unflippedItems poll before the
+					// restore started — so this child and every item that rode along
 					// inside it (an owned subtree moves as one item) is now owned by
 					// the running account. Record that for the whole subtree without
 					// a per-file Drive lookup; the update only touches rows the DB
