@@ -704,6 +704,26 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 			case !ownedByAccount(f, account):
 				// Ownership changed since the crawl; nothing of the user's to move.
 			default:
+				// Not in the live sweep's `seen` set and not a direct child of the
+				// Container or Stash — but it may still sit *inside* the Container,
+				// nested under an owned folder that moved in Phase A, if the sweep's
+				// listing hadn't caught up with that move yet (Drive files.list is
+				// eventually consistent and lags just-completed moves). Walk the live
+				// parent chain up to the Container before flattening: re-moving an item
+				// that already rode in would strip its nesting for nothing and log a
+				// misleading "outside the packed tree" warning.
+				inside, ierr := insideAncestor(moveCtx, svc, limiter, f.Parents, containerF.Id)
+				if moveCtx.Err() != nil {
+					return
+				}
+				if ierr != nil {
+					stats.fail("ERROR straggler check %q (%s): walking its parent chain: %v", n.name, n.driveID, ierr)
+					return
+				}
+				if inside {
+					detailf("OK straggler %q (%s): already nested inside the Container; leaving it in place", n.name, n.driveID)
+					return
+				}
 				if merr := moveFile(moveCtx, svc, limiter, n.driveID, containerF.Id, strings.Join(f.Parents, ",")); merr != nil {
 					if moveCtx.Err() != nil {
 						return

@@ -329,6 +329,36 @@ func hasParent(f *drive.File, parentID string) bool {
 	return false
 }
 
+// insideAncestor reports whether an item whose live parents are `parents` sits
+// anywhere inside ancestorID, following the live parent chain upward.
+func insideAncestor(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, parents []string, ancestorID string) (bool, error) {
+	const maxHops = 200
+	visited := make(map[string]bool)
+	queue := append([]string(nil), parents...)
+	hops := 0
+	for len(queue) > 0 {
+		p := queue[0]
+		queue = queue[1:]
+		if p == ancestorID {
+			return true, nil
+		}
+		if visited[p] || hops >= maxHops {
+			continue
+		}
+		visited[p] = true
+		hops++
+		f, err := getFileState(ctx, svc, limiter, p)
+		if err != nil {
+			if isNotFound(err) {
+				continue
+			}
+			return false, err
+		}
+		queue = append(queue, f.Parents...)
+	}
+	return false, nil
+}
+
 // ownedByAccount reports whether the file's listed owner matches account
 // (email, case-insensitive, or Drive permission id). Shared-drive items have
 // no owners and never match.
