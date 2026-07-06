@@ -808,10 +808,24 @@ type exploreNode struct {
 	parentID sql.NullInt64
 	owned    bool // owned by the target account
 	children []*exploreNode
+	// The node's recorded owner, used to build per-owner breakdowns.
+	ownerEmail, ownerID, ownerDisplay sql.NullString
 	// ownedFolders/ownedFiles count owned descendants in this node's subtree
 	// (excluding the node itself), split by type. Only meaningful for folders.
 	ownedFolders int
 	ownedFiles   int
+	// breakdown, when set (currently only for the all-external report), is the
+	// per-owner count of owned items in this folder's subtree, excluding the
+	// folder itself — the same population as ownedFolders/ownedFiles.
+	breakdown []personCount
+}
+
+// personCount is one row of a folder's per-owner breakdown: how many folders and
+// files a single owner owns within that folder's subtree.
+type personCount struct {
+	Label   string `json:"label"`
+	Folders int    `json:"folders"`
+	Files   int    `json:"files"`
 }
 
 // ownerMatcher decides, for a node's recorded owner, whether the node counts as
@@ -878,6 +892,7 @@ func ownedAndAncestorsMatching(db *sql.DB, match ownerMatcher) (roots []*explore
 		if err := rows.Scan(&n.rowID, &n.driveID, &n.name, &n.typ, &n.parentID, &email, &oid, &display); err != nil {
 			return nil, "", err
 		}
+		n.ownerEmail, n.ownerID, n.ownerDisplay = email, oid, display
 		var dn string
 		n.owned, dn = match(email, oid, display)
 		if n.owned && displayName == "" && dn != "" {
@@ -968,6 +983,99 @@ func countOwned(n *exploreNode) (folders, files int) {
 	n.ownedFolders = folders
 	n.ownedFiles = files
 	return folders, files
+}
+
+// buildOwnerBreakdowns fills each folder node's breakdown with the per-owner
+// counts of the owned items in its subtree (excluding the folder itself),
+// mirroring what `owners --folder <that folder>` reports but restricted to the
+// owned set the tree was built from (external accounts, for the all-external
+// report). Rows are ordered files-desc, then total-desc, then label, matching
+// the owners report.
+func buildOwnerBreakdowns(roots []*exploreNode) {
+	for _, r := range roots {
+		accumulateOwners(r)
+	}
+}
+
+// accumulateOwners returns the per-owner counts for the subtree rooted at n,
+// including n's own owned contribution, and — for folders — records the
+// descendants-only breakdown on n.breakdown along the way.
+func accumulateOwners(n *exploreNode) map[string]*personCount {
+	agg := make(map[string]*personCount)
+	add := func(key, label string, folder bool) {
+		e := agg[key]
+		if e == nil {
+			e = &personCount{Label: label}
+			agg[key] = e
+		}
+		if folder {
+			e.Folders++
+		} else {
+			e.Files++
+		}
+	}
+	for _, c := range n.children {
+		for key, v := range accumulateOwners(c) {
+			e := agg[key]
+			if e == nil {
+				e = &personCount{Label: v.Label}
+				agg[key] = e
+			}
+			e.Folders += v.Folders
+			e.Files += v.Files
+		}
+	}
+	// At this point agg holds descendants only, which is exactly the folder's
+	// breakdown (excluding itself).
+	if n.typ == typeFolder && len(agg) > 0 {
+		n.breakdown = sortedBreakdown(agg)
+	}
+	if n.owned {
+		key, label := ownerKeyLabel(n)
+		add(key, label, n.typ == typeFolder)
+	}
+	return agg
+}
+
+// ownerKeyLabel returns a stable grouping key and a human-readable label for a
+// node's owner, matching ownerLabel's formatting (email, else id, with the
+// display name in parentheses when present).
+func ownerKeyLabel(n *exploreNode) (key, label string) {
+	switch {
+	case n.ownerEmail.Valid:
+		key = n.ownerEmail.String
+		label = n.ownerEmail.String
+		if n.ownerDisplay.Valid {
+			label = fmt.Sprintf("%s (%s)", n.ownerEmail.String, n.ownerDisplay.String)
+		}
+	case n.ownerID.Valid:
+		key = "id:" + n.ownerID.String
+		label = "id:" + n.ownerID.String
+		if n.ownerDisplay.Valid {
+			label = fmt.Sprintf("id:%s (%s)", n.ownerID.String, n.ownerDisplay.String)
+		}
+	}
+	return key, label
+}
+
+// sortedBreakdown flattens an owner-count map into the owners-report order:
+// files desc, then total desc, then label ascending.
+func sortedBreakdown(agg map[string]*personCount) []personCount {
+	out := make([]personCount, 0, len(agg))
+	for _, v := range agg {
+		out = append(out, *v)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.Files != b.Files {
+			return a.Files > b.Files
+		}
+		if a.Folders+a.Files != b.Folders+b.Files {
+			return a.Folders+a.Files > b.Folders+b.Files
+		}
+		return a.Label < b.Label
+	})
+	return out
 }
 
 // subtreeDriveIDs returns the set of Drive IDs of every node within the subtree

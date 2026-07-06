@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"os"
@@ -82,6 +83,9 @@ func runExploreAllExternal(dbPath, cfgPath, outDir string) error {
 	if len(roots) == 0 {
 		return fmt.Errorf("no files or folders owned by an external account in the database")
 	}
+	// Per-folder owner breakdowns power the popover button on each folder; only
+	// the all-external report shows them.
+	buildOwnerBreakdowns(roots)
 
 	outPath := filepath.Join(outDir, "_all-external.html")
 	if err := renderOwnedFilesHTML(outPath, "all external accounts", "", crawlRoot, roots); err != nil {
@@ -184,6 +188,11 @@ func renderOwnedFilesHTML(outPath, account, displayName, crawlRoot string, roots
 		}
 	}
 
+	breakdowns, err := ownerBreakdownJSON(roots)
+	if err != nil {
+		return fmt.Errorf("encoding owner breakdowns: %w", err)
+	}
+
 	if err := exploreTemplate.Execute(f, exploreData{
 		Account:      account,
 		DisplayName:  displayName,
@@ -191,6 +200,7 @@ func renderOwnedFilesHTML(outPath, account, displayName, crawlRoot string, roots
 		TotalFiles:   totalFiles,
 		CrawlRoot:    crawlRoot,
 		Roots:        roots,
+		Breakdowns:   breakdowns,
 	}); err != nil {
 		return fmt.Errorf("rendering HTML: %w", err)
 	}
@@ -225,6 +235,10 @@ type exploreData struct {
 	TotalFiles   int
 	CrawlRoot    string
 	Roots        []*exploreNode
+	// Breakdowns is a JSON object mapping a folder's Drive ID to its per-owner
+	// count rows, consumed by the inline popover script. It is "{}" for reports
+	// that don't compute breakdowns (the per-account files).
+	Breakdowns template.JS
 }
 
 // Exported accessors for html/template, which cannot read unexported fields.
@@ -233,6 +247,34 @@ func (n *exploreNode) Children() []*exploreNode { return n.children }
 func (n *exploreNode) OwnedFolders() int        { return n.ownedFolders }
 func (n *exploreNode) OwnedFiles() int          { return n.ownedFiles }
 func (n *exploreNode) Owned() bool              { return n.owned }
+func (n *exploreNode) DriveID() string          { return n.driveID }
+func (n *exploreNode) HasBreakdown() bool       { return len(n.breakdown) > 0 }
+
+// ownerBreakdownJSON encodes every folder's per-owner breakdown into a JSON
+// object keyed by Drive ID, for the inline popover script. Folders without a
+// breakdown (e.g. every folder in a per-account report) are omitted, so the
+// result is "{}" when the feature is off. json.Marshal escapes <, > and & so the
+// blob is safe to inline inside a <script> element.
+func ownerBreakdownJSON(roots []*exploreNode) (template.JS, error) {
+	byID := make(map[string][]personCount)
+	var walk func(n *exploreNode)
+	walk = func(n *exploreNode) {
+		if len(n.breakdown) > 0 {
+			byID[n.driveID] = n.breakdown
+		}
+		for _, c := range n.children {
+			walk(c)
+		}
+	}
+	for _, r := range roots {
+		walk(r)
+	}
+	b, err := json.Marshal(byID)
+	if err != nil {
+		return "", err
+	}
+	return template.JS(b), nil
+}
 
 // driveURL returns the Drive web URL for a node so each row links to the live
 // item: folders open the folder view, everything else opens by id.
@@ -291,9 +333,23 @@ const exploreHTML = `<!DOCTYPE html>
   .ext-link:hover { opacity: 1; }
   .row:focus .ext-link, .row:focus-within .ext-link { color: #d6e4ff; opacity: .75; }
   .counts { color: #777; font-size: .8rem; margin-left: .4rem; white-space: nowrap; }
+  .owners-btn { color: #888; background: none; border: none; padding: 0 .15rem; margin-left: .1rem;
+                display: inline-flex; align-items: center; opacity: .55; flex: none; cursor: pointer; }
+  .owners-btn:hover { opacity: 1; }
+  .row:focus .owners-btn, .row:focus-within .owners-btn { color: #d6e4ff; opacity: .75; }
   /* collapsed by default: hide child lists unless the li is expanded */
   li > ul { display: none; }
   li[aria-expanded=true] > ul { display: block; }
+  /* per-owner breakdown popover, positioned in JS */
+  #owner-popover { position: fixed; z-index: 10; max-width: min(90vw, 30rem); max-height: 60vh; overflow: auto;
+                   background: Canvas; color: CanvasText; border: 1px solid #8888; border-radius: .4rem;
+                   box-shadow: 0 4px 16px #0004; padding: .5rem .6rem; font-size: .85rem; }
+  #owner-popover[hidden] { display: none; }
+  #owner-popover h2 { font-size: .8rem; margin: 0 0 .35rem; font-weight: 600; }
+  #owner-popover table { border-collapse: collapse; width: 100%; }
+  #owner-popover th, #owner-popover td { text-align: left; padding: .1rem .5rem .1rem 0; white-space: nowrap; }
+  #owner-popover td.num, #owner-popover th.num { text-align: right; padding-right: 0; padding-left: 1rem; font-variant-numeric: tabular-nums; }
+  #owner-popover thead th { color: #888; font-weight: 500; border-bottom: 1px solid #8884; }
 </style>
 </head>
 <body>
@@ -308,6 +364,9 @@ const exploreHTML = `<!DOCTYPE html>
   {{range .Roots}}{{template "node" .}}{{end}}
 </ul>
 
+<div id="owner-popover" hidden role="dialog" aria-label="Owners of items in this folder"></div>
+<script>var OWNER_BREAKDOWNS = {{.Breakdowns}};</script>
+
 {{define "node"}}
 <li role="treeitem"{{if .Owned}} class="owned"{{end}}{{if .Children}} aria-expanded="false"{{end}}>
   <div class="row" tabindex="-1">
@@ -315,6 +374,7 @@ const exploreHTML = `<!DOCTYPE html>
     <span class="icon">{{if isFolder .}}📁{{else}}📄{{end}}</span>
     {{if isFolder .}}<span class="name">{{.Name}}</span><a class="ext-link" href="{{driveURL .}}" target="_blank" rel="noopener" title="Open in Google Drive" tabindex="-1"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg></a>{{else}}<a class="name" href="{{driveURL .}}" target="_blank" rel="noopener">{{.Name}}</a>{{end}}
     {{if isFolder .}}<span class="counts">📁 {{.OwnedFolders}} &nbsp; 📄 {{.OwnedFiles}}</span>{{end}}
+    {{if .HasBreakdown}}<button type="button" class="owners-btn" data-node="{{.DriveID}}" title="Show owners of items in this folder" aria-label="Show owners" tabindex="-1"><svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></button>{{end}}
   </div>
   {{if .Children}}
   <ul role="group">
@@ -367,6 +427,8 @@ const exploreHTML = `<!DOCTYPE html>
   tree.addEventListener('click', function (e) {
     var row = e.target.closest('.row');
     if (!row) return;
+    var ownersBtn = e.target.closest('.owners-btn');
+    if (ownersBtn) { toggleOwnerPopover(ownersBtn); focusRow(row); return; }
     if (e.target.closest('.ext-link')) { focusRow(row); return; }
     if (isExpandable(row)) {
       setOpen(row, !isOpen(row));
@@ -411,6 +473,91 @@ const exploreHTML = `<!DOCTYPE html>
     }
     e.preventDefault();
   });
+
+  // --- Per-owner breakdown popover ---
+  var popover = document.getElementById('owner-popover');
+  var popBtn = null; // the button that opened the popover, if any
+
+  function buildOwnerPopover(rowsData) {
+    popover.textContent = '';
+    var h = document.createElement('h2');
+    h.textContent = rowsData.length + (rowsData.length === 1 ? ' external owner' : ' external owners') + ' in this folder';
+    popover.appendChild(h);
+
+    var table = document.createElement('table');
+    var thead = document.createElement('thead');
+    var htr = document.createElement('tr');
+    ['Owner', '📁', '📄'].forEach(function (label, i) {
+      var th = document.createElement('th');
+      th.textContent = label;
+      if (i > 0) th.className = 'num';
+      htr.appendChild(th);
+    });
+    thead.appendChild(htr);
+    table.appendChild(thead);
+
+    var tbody = document.createElement('tbody');
+    rowsData.forEach(function (r) {
+      var tr = document.createElement('tr');
+      var name = document.createElement('td');
+      name.textContent = r.label;
+      var folders = document.createElement('td');
+      folders.className = 'num';
+      folders.textContent = r.folders;
+      var files = document.createElement('td');
+      files.className = 'num';
+      files.textContent = r.files;
+      tr.appendChild(name);
+      tr.appendChild(folders);
+      tr.appendChild(files);
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    popover.appendChild(table);
+  }
+
+  function positionOwnerPopover(btn) {
+    var r = btn.getBoundingClientRect();
+    // Measure while shown but invisible so offsetWidth/Height are real.
+    popover.style.visibility = 'hidden';
+    popover.hidden = false;
+    var pw = popover.offsetWidth, ph = popover.offsetHeight;
+    var left = Math.max(8, Math.min(r.left, window.innerWidth - pw - 8));
+    var top = r.bottom + 6;
+    if (top + ph > window.innerHeight - 8) top = Math.max(8, r.top - ph - 6);
+    popover.style.left = left + 'px';
+    popover.style.top = top + 'px';
+    popover.style.visibility = '';
+  }
+
+  function hideOwnerPopover() {
+    popover.hidden = true;
+    popBtn = null;
+  }
+
+  function toggleOwnerPopover(btn) {
+    if (popBtn === btn && !popover.hidden) { hideOwnerPopover(); return; }
+    var data = OWNER_BREAKDOWNS[btn.getAttribute('data-node')] || [];
+    buildOwnerPopover(data);
+    popBtn = btn;
+    positionOwnerPopover(btn);
+  }
+
+  document.addEventListener('click', function (e) {
+    if (popover.hidden) return;
+    if (e.target.closest('.owners-btn')) return;  // the tree handler toggles these
+    if (!e.target.closest('#owner-popover')) hideOwnerPopover();
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && !popover.hidden) {
+      var btn = popBtn;
+      hideOwnerPopover();
+      if (btn) btn.closest('.row').focus();
+    }
+  });
+  // Keep the popover pinned to its button as the tree scrolls or the window resizes.
+  window.addEventListener('scroll', function () { if (popBtn) positionOwnerPopover(popBtn); }, true);
+  window.addEventListener('resize', function () { if (popBtn) positionOwnerPopover(popBtn); });
 
   // Make the first root focusable to start.
   var first = tree.querySelector('.row');

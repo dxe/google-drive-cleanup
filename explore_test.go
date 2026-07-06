@@ -211,6 +211,81 @@ func TestExternalOwnedAndAncestors(t *testing.T) {
 	}
 }
 
+func TestBuildOwnerBreakdowns(t *testing.T) {
+	db := testDB(t)
+	// Root(internal) > sub(external alice folder) > a.pdf(alice), b.doc(bob);
+	// plus c.txt(id:999) directly under root.
+	rootID, _, _, _ := mustUpsert(t, db, node{driveID: "root", name: "Root", typ: typeFolder,
+		mimeType: folderMimeType, ownerEmail: nullString("staff@example.com")})
+	subID, _, _, _ := mustUpsert(t, db, node{driveID: "sub", name: "Sub", typ: typeFolder,
+		mimeType: folderMimeType, ownerEmail: nullString("alice@partner.org"), ownerDisplay: nullString("Alice"),
+		parentID: sql.NullInt64{Int64: rootID, Valid: true}})
+	mustUpsert(t, db, node{driveID: "a", name: "a.pdf", typ: typeBinary, mimeType: "application/pdf",
+		ownerEmail: nullString("alice@partner.org"), ownerDisplay: nullString("Alice"),
+		parentID:   sql.NullInt64{Int64: subID, Valid: true}})
+	mustUpsert(t, db, node{driveID: "b", name: "b.doc", typ: typeGoogleDoc, mimeType: "application/vnd.google-apps.document",
+		ownerEmail: nullString("bob@vendor.io"),
+		parentID:   sql.NullInt64{Int64: subID, Valid: true}})
+	mustUpsert(t, db, node{driveID: "c", name: "c.txt", typ: typeBinary, mimeType: "text/plain",
+		ownerID:  nullString("999"),
+		parentID: sql.NullInt64{Int64: rootID, Valid: true}})
+
+	roots, err := externalOwnedAndAncestors(db, []string{"example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	buildOwnerBreakdowns(roots)
+	byID := flatten(roots)
+
+	// Sub's breakdown: alice owns 1 file (a.pdf) here, bob owns 1 file. Sub
+	// itself (an alice-owned folder) is excluded from its own breakdown.
+	sub := breakdownMap(byID["sub"].breakdown)
+	if got := sub["alice@partner.org (Alice)"]; got.Folders != 0 || got.Files != 1 {
+		t.Errorf("sub alice = %+v, want 0 folders / 1 file", got)
+	}
+	if got := sub["bob@vendor.io"]; got.Files != 1 {
+		t.Errorf("sub bob files = %d, want 1", got.Files)
+	}
+
+	// Root's breakdown pools descendants: alice owns Sub (folder) + a.pdf, bob
+	// owns b.doc, id:999 owns c.txt.
+	root := breakdownMap(byID["root"].breakdown)
+	if got := root["alice@partner.org (Alice)"]; got.Folders != 1 || got.Files != 1 {
+		t.Errorf("root alice = %+v, want 1 folder / 1 file", got)
+	}
+	if got := root["id:999"]; got.Files != 1 {
+		t.Errorf("root id:999 files = %d, want 1", got.Files)
+	}
+	if len(byID["root"].breakdown) != 3 {
+		t.Errorf("root breakdown has %d owners, want 3", len(byID["root"].breakdown))
+	}
+
+	// Breakdown rows are ordered files-desc: alice and bob both have 1 file at
+	// root, tie broken by total (alice has 2) then label.
+	if byID["root"].breakdown[0].Label != "alice@partner.org (Alice)" {
+		t.Errorf("root breakdown[0] = %q, want alice first", byID["root"].breakdown[0].Label)
+	}
+
+	// A per-account tree never computes breakdowns.
+	acct, _, err := ownedAndAncestors(db, "alice@partner.org")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for id, n := range flatten(acct) {
+		if n.breakdown != nil {
+			t.Errorf("per-account node %q unexpectedly has a breakdown", id)
+		}
+	}
+}
+
+func breakdownMap(rows []personCount) map[string]personCount {
+	m := make(map[string]personCount, len(rows))
+	for _, r := range rows {
+		m[r.Label] = r
+	}
+	return m
+}
+
 func TestRunExploreOwnedFiles(t *testing.T) {
 	db := testDB(t)
 	buildExploreTree(t, db)
