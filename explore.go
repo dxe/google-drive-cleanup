@@ -22,14 +22,26 @@ the owned items beneath it. The tree is collapsible (collapsed by default) and
 keyboard-navigable. All CSS/JS is inlined so the file can be emailed as-is.
 
 With no account argument, one HTML file is written per owner found in the
-database (skipping owners with neither an email nor an owner id).`,
+database (skipping owners with neither an email nor an owner id).
+
+With --all-external (and no account argument), a single _all-external.html is
+written instead, combining every account whose owner is not on a configured
+internal domain into one tree with pooled file/folder counts.`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dbPath, _ := cmd.Flags().GetString("db")
+		cfgPath, _ := cmd.Flags().GetString("config")
 		outDir, _ := cmd.Flags().GetString("out")
+		allExternal, _ := cmd.Flags().GetBool("all-external")
 		var account string
 		if len(args) == 1 {
 			account = args[0]
+		}
+		if allExternal && account != "" {
+			return fmt.Errorf("--all-external combines every external account; do not also pass an account argument")
+		}
+		if allExternal {
+			return runExploreAllExternal(dbPath, cfgPath, outDir)
 		}
 		return runExploreOwnedFiles(dbPath, account, outDir)
 	},
@@ -37,6 +49,46 @@ database (skipping owners with neither an email nor an owner id).`,
 
 func init() {
 	exploreCmd.Flags().String("out", "out/explore-owned-files", "output directory for the generated HTML")
+	exploreCmd.Flags().Bool("all-external", false, "write a single _all-external.html combining every account not on an internal domain")
+}
+
+// runExploreAllExternal writes one HTML file, _all-external.html, whose tree
+// combines every account whose owner is not on a configured internal domain,
+// with file/folder counts pooled across all of them.
+func runExploreAllExternal(dbPath, cfgPath, outDir string) error {
+	cfg, err := loadConfig(cfgPath)
+	if err != nil {
+		return err
+	}
+
+	db, err := openDB(dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	crawlRoot, err := crawlRootDriveID(db)
+	if err != nil {
+		return fmt.Errorf("fetching crawl root: %w", err)
+	}
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return fmt.Errorf("creating %s: %w", outDir, err)
+	}
+
+	roots, err := externalOwnedAndAncestors(db, cfg.InternalDomains)
+	if err != nil {
+		return err
+	}
+	if len(roots) == 0 {
+		return fmt.Errorf("no files or folders owned by an external account in the database")
+	}
+
+	outPath := filepath.Join(outDir, "_all-external.html")
+	if err := renderOwnedFilesHTML(outPath, "all external accounts", "", crawlRoot, roots); err != nil {
+		return err
+	}
+	fmt.Println(outPath)
+	return nil
 }
 
 func runExploreOwnedFiles(dbPath, account, outDir string) error {
@@ -103,9 +155,19 @@ func writeOwnedFilesHTML(db *sql.DB, account, outDir, crawlRoot string) (string,
 	}
 
 	outPath := filepath.Join(outDir, sanitizeFilename(account)+".html")
+	if err := renderOwnedFilesHTML(outPath, account, displayName, crawlRoot, roots); err != nil {
+		return "", err
+	}
+	return outPath, nil
+}
+
+// renderOwnedFilesHTML writes the ownership tree in roots to outPath, tallying
+// the pooled owned file/folder counts across every root. account and
+// displayName populate the report header.
+func renderOwnedFilesHTML(outPath, account, displayName, crawlRoot string, roots []*exploreNode) error {
 	f, err := os.Create(outPath)
 	if err != nil {
-		return "", fmt.Errorf("creating %s: %w", outPath, err)
+		return fmt.Errorf("creating %s: %w", outPath, err)
 	}
 	defer f.Close()
 
@@ -130,12 +192,12 @@ func writeOwnedFilesHTML(db *sql.DB, account, outDir, crawlRoot string) (string,
 		CrawlRoot:    crawlRoot,
 		Roots:        roots,
 	}); err != nil {
-		return "", fmt.Errorf("rendering HTML: %w", err)
+		return fmt.Errorf("rendering HTML: %w", err)
 	}
 	if err := f.Close(); err != nil {
-		return "", err
+		return err
 	}
-	return outPath, nil
+	return nil
 }
 
 // sanitizeFilename makes account safe as a single path component, keeping the

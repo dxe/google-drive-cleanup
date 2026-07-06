@@ -137,6 +137,80 @@ func TestOwnedAndAncestorsNoneOwned(t *testing.T) {
 	}
 }
 
+func TestExternalOwnedAndAncestors(t *testing.T) {
+	db := testDB(t)
+	// Root/Finance are owned by an internal account; the two leaf files below
+	// are owned by external accounts on two different domains, plus one node
+	// owned only by an owner id (no email — treated external).
+	rootID, _, _, _ := mustUpsert(t, db, node{driveID: "root", name: "Root", typ: typeFolder,
+		mimeType: folderMimeType, ownerEmail: nullString("staff@example.com")})
+	finID, _, _, _ := mustUpsert(t, db, node{driveID: "fin", name: "Finance", typ: typeFolder,
+		mimeType: folderMimeType, ownerEmail: nullString("staff@example.com"),
+		parentID: sql.NullInt64{Int64: rootID, Valid: true}})
+	mustUpsert(t, db, node{driveID: "a", name: "a.pdf", typ: typeBinary, mimeType: "application/pdf",
+		ownerEmail: nullString("alice@partner.org"),
+		parentID:   sql.NullInt64{Int64: finID, Valid: true}})
+	mustUpsert(t, db, node{driveID: "b", name: "b.doc", typ: typeGoogleDoc, mimeType: "application/vnd.google-apps.document",
+		ownerEmail: nullString("bob@vendor.io"),
+		parentID:   sql.NullInt64{Int64: finID, Valid: true}})
+	mustUpsert(t, db, node{driveID: "c", name: "c.txt", typ: typeBinary, mimeType: "text/plain",
+		ownerID:  nullString("999"),
+		parentID: sql.NullInt64{Int64: rootID, Valid: true}})
+
+	roots, err := externalOwnedAndAncestors(db, []string{"example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := flatten(roots)
+
+	// The two external files, the id-only node, and their ancestors are in;
+	// the internal-owned folders are included as ancestors but not marked owned.
+	for _, id := range []string{"a", "b", "c"} {
+		if byID[id] == nil || !byID[id].owned {
+			t.Errorf("external node %q should be included and owned", id)
+		}
+	}
+	if byID["root"] == nil || byID["fin"] == nil {
+		t.Fatal("ancestor folders should be included")
+	}
+	if byID["root"].owned || byID["fin"].owned {
+		t.Error("internal-owned folders should not be marked owned")
+	}
+	// Pooled counts across all external accounts: root has 3 external files and
+	// 0 external folders beneath it; Finance has 2.
+	if got := byID["root"]; got.ownedFiles != 3 || got.ownedFolders != 0 {
+		t.Errorf("root counts = %d files, %d folders, want 3, 0", got.ownedFiles, got.ownedFolders)
+	}
+	if got := byID["fin"]; got.ownedFiles != 2 {
+		t.Errorf("Finance files = %d, want 2", got.ownedFiles)
+	}
+
+	// With no internal domains configured, the internal accounts become
+	// external too, so every node is owned.
+	all, err := externalOwnedAndAncestors(db, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allByID := flatten(all)
+	if !allByID["root"].owned || !allByID["fin"].owned {
+		t.Error("with no internal domains, every owned node should be external")
+	}
+
+	// When every owner is internal, nothing is external.
+	empty, err := externalOwnedAndAncestors(db, []string{"example.com", "partner.org", "vendor.io"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The id-only node has no domain, so it remains external.
+	remaining := flatten(empty)
+	if remaining["c"] == nil {
+		t.Error("owner-id-only node should still count as external")
+	}
+	if remaining["a"] != nil || remaining["b"] != nil {
+		t.Error("email owners on internal domains should be excluded")
+	}
+}
+
 func TestRunExploreOwnedFiles(t *testing.T) {
 	db := testDB(t)
 	buildExploreTree(t, db)

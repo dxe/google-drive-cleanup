@@ -814,14 +814,55 @@ type exploreNode struct {
 	ownedFiles   int
 }
 
+// ownerMatcher decides, for a node's recorded owner, whether the node counts as
+// "owned" for an ownership tree. display is the node's owner_display_name; a
+// matcher may return a display name to surface in the report header.
+type ownerMatcher func(email, oid, display sql.NullString) (owned bool, displayName string)
+
 // ownedAndAncestors builds the forest of every node owned by account (matched
 // against owner_email OR owner_id) together with all of its ancestor folders,
-// so each owned item is shown in the context of where it lives. It loads the
-// whole nodes table into memory once — the dataset is a single Drive — and
-// returns the root nodes (those with no included parent), the owner's display
-// name, and per-folder owned-descendant counts. It errors if the account owns
-// nothing.
+// so each owned item is shown in the context of where it lives. It returns the
+// root nodes, the owner's display name, and per-folder owned-descendant counts,
+// and errors if the account owns nothing.
 func ownedAndAncestors(db *sql.DB, account string) (roots []*exploreNode, displayName string, err error) {
+	roots, displayName, err = ownedAndAncestorsMatching(db, func(email, oid, display sql.NullString) (bool, string) {
+		owned := (email.Valid && email.String == account) || (oid.Valid && oid.String == account)
+		if owned && display.Valid {
+			return true, display.String
+		}
+		return owned, ""
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	if len(roots) == 0 {
+		return nil, "", fmt.Errorf("no files or folders owned by %q in the database", account)
+	}
+	return roots, displayName, nil
+}
+
+// externalOwnedAndAncestors builds the ownership forest of every node whose
+// owner is external — has a recorded owner (email or id) that is not on one of
+// internalDomains — combining every external account into one tree. Nodes with
+// no recorded owner are excluded. Returns empty roots if nothing is externally
+// owned.
+func externalOwnedAndAncestors(db *sql.DB, internalDomains []string) (roots []*exploreNode, err error) {
+	roots, _, err = ownedAndAncestorsMatching(db, func(email, oid, display sql.NullString) (bool, string) {
+		if !email.Valid && !oid.Valid {
+			return false, "" // no recorded owner
+		}
+		return !isInternalEmail(email, internalDomains), ""
+	})
+	return roots, err
+}
+
+// ownedAndAncestorsMatching builds the forest of every node the matcher marks as
+// owned together with all of its ancestor folders, so each owned item is shown
+// in the context of where it lives. It loads the whole nodes table into memory
+// once — the dataset is a single Drive — and returns the root nodes (those with
+// no included parent), the first display name the matcher surfaces, and
+// per-folder owned-descendant counts. Roots is empty when nothing matches.
+func ownedAndAncestorsMatching(db *sql.DB, match ownerMatcher) (roots []*exploreNode, displayName string, err error) {
 	rows, err := db.Query(`SELECT id, drive_id, name, type, parent_id, owner_email, owner_id, owner_display_name FROM nodes`)
 	if err != nil {
 		return nil, "", err
@@ -837,9 +878,10 @@ func ownedAndAncestors(db *sql.DB, account string) (roots []*exploreNode, displa
 		if err := rows.Scan(&n.rowID, &n.driveID, &n.name, &n.typ, &n.parentID, &email, &oid, &display); err != nil {
 			return nil, "", err
 		}
-		n.owned = (email.Valid && email.String == account) || (oid.Valid && oid.String == account)
-		if n.owned && displayName == "" && display.Valid {
-			displayName = display.String
+		var dn string
+		n.owned, dn = match(email, oid, display)
+		if n.owned && displayName == "" && dn != "" {
+			displayName = dn
 		}
 		all[n.rowID] = &n
 	}
@@ -849,12 +891,10 @@ func ownedAndAncestors(db *sql.DB, account string) (roots []*exploreNode, displa
 
 	// Collect the included set: every owned node plus all of its ancestors.
 	included := make(map[int64]bool)
-	anyOwned := false
 	for _, n := range all {
 		if !n.owned {
 			continue
 		}
-		anyOwned = true
 		seen := make(map[int64]bool)
 		for cur := n; cur != nil; {
 			if included[cur.rowID] {
@@ -867,9 +907,6 @@ func ownedAndAncestors(db *sql.DB, account string) (roots []*exploreNode, displa
 			seen[cur.rowID] = true
 			cur = all[cur.parentID.Int64]
 		}
-	}
-	if !anyOwned {
-		return nil, "", fmt.Errorf("no files or folders owned by %q in the database", account)
 	}
 
 	// Wire children among included nodes and collect roots (included nodes
