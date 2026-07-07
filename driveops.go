@@ -338,15 +338,14 @@ func findUserPermission(ctx context.Context, svc *drive.Service, limiter *rate.L
 // API name — "organizer" is "Manager" in the Drive UI. A notification email is
 // sent so the user gets a link to the folder.
 func grantPermission(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, fileID, email, role string) error {
-	if err := limiter.Wait(ctx); err != nil {
+	return withRetry(ctx, limiter, "permissions.create "+email, func() error {
+		_, err := svc.Permissions.Create(fileID, &drive.Permission{
+			Type:         "user",
+			Role:         role,
+			EmailAddress: email,
+		}).SupportsAllDrives(true).SendNotificationEmail(false).Context(ctx).Do()
 		return err
-	}
-	_, err := svc.Permissions.Create(fileID, &drive.Permission{
-		Type:         "user",
-		Role:         role,
-		EmailAddress: email,
-	}).SupportsAllDrives(true).SendNotificationEmail(false).Context(ctx).Do()
-	return err
+	})
 }
 
 // revokePermission removes the permission with permissionID from fileID. Used
@@ -358,10 +357,9 @@ func revokePermission(ctx context.Context, svc *drive.Service, limiter *rate.Lim
 }
 
 func deleteFile(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, fileID string) error {
-	if err := limiter.Wait(ctx); err != nil {
-		return err
-	}
-	return svc.Files.Delete(fileID).SupportsAllDrives(true).Context(ctx).Do()
+	return withRetry(ctx, limiter, "files.delete "+fileID, func() error {
+		return svc.Files.Delete(fileID).SupportsAllDrives(true).Context(ctx).Do()
+	})
 }
 
 // getFileState fetches the live parents, owner, and trashed flag of one item.
