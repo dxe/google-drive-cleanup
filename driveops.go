@@ -352,10 +352,9 @@ func grantPermission(ctx context.Context, svc *drive.Service, limiter *rate.Limi
 // revokePermission removes the permission with permissionID from fileID. Used
 // by unpack to drop the migrating user's access once the round trip is done.
 func revokePermission(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, fileID, permissionID string) error {
-	if err := limiter.Wait(ctx); err != nil {
-		return err
-	}
-	return svc.Permissions.Delete(fileID, permissionID).SupportsAllDrives(true).Context(ctx).Do()
+	return withRetry(ctx, limiter, "permissions.delete "+permissionID, func() error {
+		return svc.Permissions.Delete(fileID, permissionID).SupportsAllDrives(true).Context(ctx).Do()
+	})
 }
 
 func deleteFile(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, fileID string) error {

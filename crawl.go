@@ -789,6 +789,16 @@ func retryable(err error) bool {
 	switch {
 	case gerr.Code == 429, gerr.Code >= 500:
 		return true
+	case gerr.Code == 409:
+		// Transient conflict. Seen on unpack's revokePermission: removing the
+		// migrating user's Manager (organizer) membership from the dropoff shared
+		// drive right after a burst of writes on it — reparenting every restored
+		// item out of the drive, then deleting the Container and Stash. Drive
+		// reconciles shared-drive ACLs/membership asynchronously, so the member
+		// removal collides with that in-flight backend churn. Google's guidance
+		// for 409 on Drive is to retry with backoff; a genuine, non-transient
+		// conflict just exhausts the retries and surfaces as before.
+		return true
 	case gerr.Code == 403:
 		for _, e := range gerr.Errors {
 			switch e.Reason {
