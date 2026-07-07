@@ -595,7 +595,9 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 			}
 			return true, nil
 		}
-		del := func(f *drive.File, label string) error {
+		// delEmpty deletes f, which the caller must have already confirmed empty
+		// (via isEmpty); the "empty" wording here rides on that precondition.
+		delEmpty := func(f *drive.File, label string) error {
 			if err := rec.deleteFile(ctx, svc, limiter, f.Id); err != nil {
 				return fmt.Errorf("deleting empty %s: %w", label, err)
 			}
@@ -607,7 +609,7 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 			if err != nil || !ok {
 				return err
 			}
-			return del(f, label)
+			return delEmpty(f, label)
 		}
 		// revokeDropoff removes the Manager access pack granted the user on the
 		// dropoff folder (the shared drive): the round trip is done, so they no
@@ -647,7 +649,7 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 			if !stashEmpty {
 				log.Printf("WARN migration abort for %s is unfinished; leaving the Stash and the user's dropoff access in place — re-run unpack to finish", account)
 			} else {
-				if err := del(stashF, "Stash"); err != nil {
+				if err := delEmpty(stashF, "Stash"); err != nil {
 					return err
 				}
 				if err := revokeDropoff(); err != nil {
@@ -673,10 +675,10 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 			if !containerEmpty || !stashEmpty {
 				log.Printf("WARN migration for %s is unfinished; leaving the Container, Stash, Packing folder, and the user's dropoff access in place — re-run unpack to finish", account)
 			} else {
-				if err := del(stashF, "Stash"); err != nil {
+				if err := delEmpty(stashF, "Stash"); err != nil {
 					return err
 				}
-				if err := del(container, "Container"); err != nil {
+				if err := delEmpty(container, "Container"); err != nil {
 					return err
 				}
 				if err := revokeDropoff(); err != nil {
