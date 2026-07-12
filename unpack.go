@@ -483,8 +483,13 @@ func runUnpack(dbPath, cfgPath, account string, dryRun bool, maxErrors int, allo
 		}
 
 		prog := newProgress()
+		// stats is shared across the whole unpack run (Container, then Stash), so
+		// its processed() count already includes the prior call's total by the
+		// time this one starts. Subtract that baseline to report this call's own
+		// progress instead of a cumulative count against a per-call denominator.
+		base := stats.processed()
 		forEachConcurrent(moveCtx, workers, tasks, func(t task) {
-			prog.tick("progress: restoring %s: %d/%d", sourceLabel, stats.processed(), len(tasks))
+			prog.tick("progress: restoring %s: %d/%d", sourceLabel, stats.processed()-base, len(tasks))
 			if t.orphan {
 				if dryRun {
 					log.Printf("WOULD quarantine %q (%s): not in database -> %s/%s", t.name, t.id, errorsFolderName, t.label)
