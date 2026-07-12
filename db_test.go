@@ -17,13 +17,17 @@ func testDB(t *testing.T) *sql.DB {
 	return db
 }
 
-func mustUpsert(t *testing.T, db *sql.DB, n node) (rowID int64, existed bool, prevParent sql.NullInt64, prevDone bool) {
+func mustUpsert(t *testing.T, db *sql.DB, n node, setParent ...bool) (rowID int64, existed bool, prevParent sql.NullInt64, prevDone bool) {
 	t.Helper()
+	sp := false
+	if len(setParent) > 0 {
+		sp = setParent[0]
+	}
 	tx, err := db.Begin()
 	if err != nil {
 		t.Fatal(err)
 	}
-	rowID, existed, prevParent, prevDone, err = upsertNode(tx, n)
+	rowID, existed, prevParent, prevDone, err = upsertNode(tx, n, sp)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,6 +113,49 @@ func TestUpsertIdempotentAndProgressPreserving(t *testing.T) {
 	}
 	if done != 1 {
 		t.Error("re-upsert regressed children_done on root")
+	}
+}
+
+// A node found under a single parent that differs from its stored parent has
+// moved since the last crawl; setParent reparents it to where it lives now.
+func TestUpsertReparentsMovedNode(t *testing.T) {
+	db := testDB(t)
+
+	rootID, _, _, _ := mustUpsert(t, db, node{driveID: "root", name: "Root", typ: typeFolder, mimeType: folderMimeType})
+	aID, _, _, _ := mustUpsert(t, db, node{driveID: "A", name: "A", typ: typeFolder, mimeType: folderMimeType,
+		parentID: sql.NullInt64{Int64: rootID, Valid: true}})
+	bID, _, _, _ := mustUpsert(t, db, node{driveID: "B", name: "B", typ: typeFolder, mimeType: folderMimeType,
+		parentID: sql.NullInt64{Int64: rootID, Valid: true}})
+
+	child := node{driveID: "child", name: "child.pdf", typ: typeBinary, mimeType: "application/pdf",
+		parentID: sql.NullInt64{Int64: aID, Valid: true}}
+	mustUpsert(t, db, child, true)
+
+	// Re-observed under B (a single-parent move). setParent=true reparents it.
+	moved := child
+	moved.parentID = sql.NullInt64{Int64: bID, Valid: true}
+	_, existed, prevParent, _ := mustUpsert(t, db, moved, true)
+	if !existed || !prevParent.Valid || prevParent.Int64 != aID {
+		t.Fatalf("re-upsert: existed=%v prevParent=%+v, want existed under A row %d", existed, prevParent, aID)
+	}
+
+	var parent int64
+	if err := db.QueryRow(`SELECT parent_id FROM nodes WHERE drive_id='child'`).Scan(&parent); err != nil {
+		t.Fatal(err)
+	}
+	if parent != bID {
+		t.Errorf("parent_id = %d after move, want reparented to B row %d", parent, bID)
+	}
+
+	// A null new parent must not wipe the existing one, even with setParent=true.
+	orphan := child
+	orphan.parentID = sql.NullInt64{}
+	mustUpsert(t, db, orphan, true)
+	if err := db.QueryRow(`SELECT parent_id FROM nodes WHERE drive_id='child'`).Scan(&parent); err != nil {
+		t.Fatal(err)
+	}
+	if parent != bID {
+		t.Errorf("parent_id = %d after null-parent upsert, want preserved B row %d", parent, bID)
 	}
 }
 

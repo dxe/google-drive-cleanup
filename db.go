@@ -186,13 +186,21 @@ type node struct {
 }
 
 // upsertNode inserts n or refreshes the existing row with the same drive_id.
-// The upsert never regresses progress: an existing non-NULL parent_id wins
-// over the new one (first-discovered parent is kept), and children_done can
-// only go up. Name, owner, mime_type and crawled_at are refreshed to the
-// latest values. It returns the row id plus what was stored before the call
-// (existed, prevParent, prevDone) so the caller can detect re-discovery under
-// a different parent and skip folders whose children are already listed.
-func upsertNode(tx *sql.Tx, n node) (rowID int64, existed bool, prevParent sql.NullInt64, prevDone bool, err error) {
+// children_done never regresses (it can only go up) and name, owner, mime_type
+// and crawled_at are refreshed to the latest values. It returns the row id plus
+// what was stored before the call (existed, prevParent, prevDone) so the caller
+// can detect re-discovery under a different parent and skip folders whose
+// children are already listed.
+//
+// setParent decides what happens to parent_id when the row already exists. When
+// true (a node Drive reports under exactly one parent — the folder we just
+// listed it under), parent_id is updated to n.parentID, so a node that moved
+// between crawls is reparented to where it lives now. When false the existing
+// parent_id is preserved (COALESCE): folders fetched directly (the crawl root, a
+// scoped re-index root) pass no parent and must keep the one they already have,
+// and a genuinely multi-parent node keeps its first-discovered parent while the
+// caller records the others in extra_parents.
+func upsertNode(tx *sql.Tx, n node, setParent bool) (rowID int64, existed bool, prevParent sql.NullInt64, prevDone bool, err error) {
 	var prevDoneInt int
 	err = tx.QueryRow(
 		`SELECT id, parent_id, children_done FROM nodes WHERE drive_id = ?`, n.driveID,
@@ -218,14 +226,15 @@ func upsertNode(tx *sql.Tx, n node) (rowID int64, existed bool, prevParent sql.N
 			owner_email        = excluded.owner_email,
 			owner_id           = excluded.owner_id,
 			owner_display_name = excluded.owner_display_name,
-			parent_id          = COALESCE(nodes.parent_id, excluded.parent_id),
+			parent_id          = CASE WHEN ? THEN COALESCE(excluded.parent_id, nodes.parent_id)
+			                          ELSE COALESCE(nodes.parent_id, excluded.parent_id) END,
 			shortcut_target_id = excluded.shortcut_target_id,
 			children_done      = MAX(nodes.children_done, excluded.children_done),
 			can_edit           = excluded.can_edit,
 			crawled_at         = excluded.crawled_at
 		RETURNING id`,
 		n.driveID, n.name, n.typ, n.mimeType, n.ownerEmail, n.ownerID,
-		n.ownerDisplay, n.parentID, n.shortcutTarget, n.canEdit, now(),
+		n.ownerDisplay, n.parentID, n.shortcutTarget, n.canEdit, now(), setParent,
 	).Scan(&rowID)
 	return rowID, existed, prevParent, prevDone, err
 }

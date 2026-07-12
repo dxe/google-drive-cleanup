@@ -500,9 +500,10 @@ func (c *crawler) fetchFolder(ctx context.Context, id string) (*drive.File, erro
 }
 
 // upsertFolder records a folder fetched directly (not via a parent listing) and
-// its permissions, refreshing its crawled_at. parent_id is left to the upsert's
-// COALESCE, which preserves the first-discovered parent (NULL for the crawl
-// root, the existing parent for a re-observed subfolder).
+// its permissions, refreshing its crawled_at. It passes setParent=false so the
+// upsert preserves whatever parent the row already has (NULL for the crawl root;
+// the existing parent for a scoped re-index root, whose real parent is outside
+// the scope and so never re-observed through a listing this run).
 func (c *crawler) upsertFolder(f *drive.File) error {
 	tx, err := c.db.Begin()
 	if err != nil {
@@ -519,7 +520,7 @@ func (c *crawler) upsertFolder(f *drive.File) error {
 		ownerID:      ownerID,
 		ownerDisplay: display,
 		canEdit:      canEditOf(f),
-	}); err != nil {
+	}, false); err != nil {
 		return fmt.Errorf("inserting %s: %w", f.Id, err)
 	}
 	if err := replacePermissions(tx, f.Id, permissionsOf(f)); err != nil {
@@ -615,7 +616,12 @@ func (c *crawler) commitPage(parent folderRef, files []*drive.File, last bool) (
 		if file.ShortcutDetails != nil {
 			n.shortcutTarget = nullString(file.ShortcutDetails.TargetId)
 		}
-		rowID, existed, prevParent, prevDone, err := upsertNode(tx, n)
+		// A node Drive reports under a single parent is definitively a child of
+		// the folder we just listed it under, so reparent it there (setParent):
+		// a node that moved between crawls follows the move. A multi-parent node
+		// instead keeps its first-discovered parent, and the extras are recorded
+		// below.
+		rowID, existed, prevParent, prevDone, err := upsertNode(tx, n, len(file.Parents) <= 1)
 		if err != nil {
 			return nil, fmt.Errorf("upserting %s (%q): %w", file.Id, file.Name, err)
 		}
@@ -628,10 +634,12 @@ func (c *crawler) commitPage(parent folderRef, files []*drive.File, last bool) (
 			}
 		}
 
-		// Multi-parent / re-discovery: parent_id keeps the first-discovered
-		// parent (the upsert never overwrites a non-NULL one); log every
-		// other sighting and persist it to extra_parents for manual review.
-		if existed && prevParent.Valid && prevParent.Int64 != parent.rowID {
+		// Multi-parent bookkeeping: a node Drive reports under more than one
+		// parent keeps its first-discovered parent in parent_id; log every other
+		// sighting and persist it to extra_parents for manual review. A
+		// single-parent node reached via a folder other than its stored parent
+		// has simply moved and was already reparented above — nothing to record.
+		if len(file.Parents) > 1 && existed && prevParent.Valid && prevParent.Int64 != parent.rowID {
 			log.Printf("warning: %s (%q) reached again via folder %q (%s); keeping first-discovered parent (row %d), recording extra parent",
 				file.Id, file.Name, parent.name, parent.driveID, prevParent.Int64)
 			if err := recordExtraParent(tx, file.Id, parent.driveID); err != nil {
