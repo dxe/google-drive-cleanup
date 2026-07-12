@@ -16,21 +16,26 @@ descending by count — this drives outreach priority.
 
 With --folder, counts are limited to that Google Drive folder and its
 descendants (the folder must be one crawled into the database); without it, the
-whole database is counted.`,
+whole database is counted.
+
+With --email, only the single owner with that email is reported (the internal
+domain filter is ignored so the account is always shown).`,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dbPath, _ := cmd.Flags().GetString("db")
 		cfgPath, _ := cmd.Flags().GetString("config")
 		folderID, _ := cmd.Flags().GetString("folder")
-		return runOwners(dbPath, cfgPath, folderID)
+		email, _ := cmd.Flags().GetString("email")
+		return runOwners(dbPath, cfgPath, folderID, email)
 	},
 }
 
 func init() {
 	ownersCmd.Flags().String("folder", "", "Google Drive folder ID to scope the report to (must be crawled into the database)")
+	ownersCmd.Flags().String("email", "", "report counts for only this single owner email")
 }
 
-func runOwners(dbPath, cfgPath, parentID string) error {
+func runOwners(dbPath, cfgPath, parentID, email string) error {
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
 		return err
@@ -60,6 +65,15 @@ func runOwners(dbPath, cfgPath, parentID string) error {
 		return err
 	}
 	fmt.Printf("%10s %10s %10s  %s\n", "FOLDERS", "FILES", "TOTAL", "OWNER")
+	if email != "" {
+		for _, oc := range counts {
+			if oc.email.Valid && strings.EqualFold(oc.email.String, email) {
+				fmt.Printf("%10d %10d %10d  %s\n", oc.folderCount, oc.fileCount, oc.total, ownerLabel(oc))
+				return nil
+			}
+		}
+		return fmt.Errorf("no owner with email %s found in the database", email)
+	}
 	for _, oc := range counts {
 		if cfg.Owners.IgnoreInternalDomains && isInternalEmail(oc.email, cfg.InternalDomains) {
 			continue
