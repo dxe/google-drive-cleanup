@@ -5,6 +5,7 @@
         "ghcr.io/devcontainers/features/go:1": {
             "version": "1.26.4"
         },
+        "ghcr.io/devcontainers/features/node:1": {},
         "ghcr.io/rocker-org/devcontainer-features/apt-packages:1": {
             // bash-completion is useful for entering git commands in the devcontainer
             //     and our .bashrc requires this.

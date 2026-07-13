@@ -52,3 +52,6 @@ out/explore-owned-files/
 # Backups
 **/*.bak.json
 **/*.bak
+
+# Playwright MCP
+.playwright-mcp
