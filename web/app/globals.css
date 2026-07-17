@@ -1,0 +1,161 @@
+:root {
+  color-scheme: light dark;
+  --red: #e53935;
+  --green: #43a047;
+  --yellow: #f9a825;
+  --accent: #1a73e8;
+  --border: light-dark(#ddd, #333);
+  --muted: light-dark(#777, #999);
+  --bg: light-dark(#fff, #1b1b1b);
+  --panel: light-dark(#fafafa, #222);
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  font-family: -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  font-size: 14px;
+  background: var(--bg);
+}
+
+.app { display: flex; flex-direction: column; height: 100vh; }
+
+/* ---- header ---- */
+.topbar {
+  display: flex; align-items: center; gap: 1rem;
+  padding: .5rem .9rem; border-bottom: 1px solid var(--border);
+  flex: none;
+}
+.topbar h1 { font-size: 1rem; margin: 0; white-space: nowrap; }
+.totals { color: var(--muted); font-size: .8rem; display: flex; gap: 1rem; white-space: nowrap; }
+.totals b.k { color: var(--green); }
+.totals b.d { color: var(--red); }
+.spacer { flex: 1; }
+.undo-btn {
+  border: 1px solid var(--border); background: var(--panel); border-radius: .35rem;
+  padding: .25rem .6rem; cursor: pointer; font: inherit; max-width: 22rem;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.undo-btn:disabled { opacity: .4; cursor: default; }
+.help { color: var(--muted); font-size: .75rem; white-space: nowrap; }
+
+/* ---- panes ---- */
+.main { display: flex; flex: 1; min-height: 0; }
+.pane { min-width: 0; overflow: auto; }
+.tree-pane { flex: 0 0 46%; border-right: 1px solid var(--border); padding: .4rem; }
+.file-pane { flex: 1; display: flex; flex-direction: column; }
+.pane-inactive { opacity: .92; }
+
+/* ---- rows (shared tree + files) ---- */
+.row {
+  display: flex; align-items: center; gap: .3rem;
+  padding: .12rem .35rem; border-radius: .3rem; cursor: pointer;
+  border: 1px solid transparent;
+  scroll-margin: 2.5rem;
+}
+.row:hover { filter: brightness(.96); }
+.row.focused { border-color: var(--accent); }
+.row.selected { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+.st-delete         { background: color-mix(in srgb, var(--red) 24%, transparent); }
+.st-partial-delete { background: color-mix(in srgb, var(--red) 9%, transparent); }
+.st-keep           { background: color-mix(in srgb, var(--green) 24%, transparent); }
+.st-partial-keep   { background: color-mix(in srgb, var(--green) 9%, transparent); }
+.st-mixed          { background: color-mix(in srgb, var(--yellow) 28%, transparent); }
+.st-todo           { background: transparent; }
+
+.twisty {
+  width: 1.05rem; flex: none; text-align: center; color: var(--muted);
+  user-select: none; font-size: .75rem;
+}
+.icon { flex: none; }
+.name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip {
+  flex: none; font-size: .62rem; font-weight: 700; border-radius: .25rem;
+  padding: 0 .28rem; color: #fff; letter-spacing: .02em;
+}
+.chip-keep { background: var(--green); }
+.chip-delete { background: var(--red); }
+.counts {
+  flex: none; color: var(--muted); font-size: .74rem; margin-left: .3rem;
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.counts .ck { color: var(--green); }
+.counts .cd { color: var(--red); }
+
+/* Mark buttons: always visible so thousands of marks need no hover hunting,
+   but subdued until hover/focus. */
+.actions { display: flex; gap: .15rem; margin-left: auto; flex: none; opacity: .45; }
+.row:hover .actions, .row.focused .actions { opacity: 1; }
+.actions button {
+  border: 1px solid var(--border); background: var(--panel); border-radius: .3rem;
+  font-size: .72rem; line-height: 1.25; width: 1.55rem; cursor: pointer; padding: .05rem 0;
+}
+.actions button.bk:hover { background: var(--green); color: #fff; border-color: var(--green); }
+.actions button.bd:hover { background: var(--red); color: #fff; border-color: var(--red); }
+.actions button.bc:hover { background: var(--muted); color: #fff; }
+
+/* The open-in-Drive link sits apart from the mark buttons and stays faint so
+   it is hard to hit by accident. */
+.ext {
+  flex: none; margin-left: .55rem; margin-right: .1rem; color: var(--muted);
+  opacity: .4; display: inline-flex; align-items: center;
+}
+.row:hover .ext, .row.focused .ext { opacity: .8; }
+.ext:hover { color: var(--accent); opacity: 1 !important; }
+
+/* ---- file pane ---- */
+.file-head {
+  padding: .55rem .8rem .5rem; border-bottom: 1px solid var(--border); flex: none;
+  display: flex; flex-direction: column; gap: .45rem;
+}
+.crumbs { font-size: .8rem; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.crumbs b { color: inherit; }
+.file-stats { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+.stat {
+  font-size: .76rem; border-radius: 1rem; padding: .1rem .6rem; font-weight: 600;
+  border: 1px solid var(--border);
+}
+.stat.k { color: var(--green); border-color: color-mix(in srgb, var(--green) 45%, transparent); background: color-mix(in srgb, var(--green) 12%, transparent); }
+.stat.d { color: var(--red); border-color: color-mix(in srgb, var(--red) 45%, transparent); background: color-mix(in srgb, var(--red) 12%, transparent); }
+.stat.u { color: var(--muted); }
+.bulk { display: flex; gap: .35rem; margin-left: auto; }
+.bulk button {
+  border: 1px solid var(--border); background: var(--panel); border-radius: .35rem;
+  font-size: .74rem; padding: .18rem .5rem; cursor: pointer;
+}
+.bulk button.bk:hover { background: var(--green); color: #fff; border-color: var(--green); }
+.bulk button.bd:hover { background: var(--red); color: #fff; border-color: var(--red); }
+
+.file-list { overflow: auto; padding: .4rem; flex: 1; }
+.file-empty { color: var(--muted); padding: 2rem; text-align: center; }
+
+/* ---- confirm dialog ---- */
+.overlay {
+  position: fixed; inset: 0; background: #0006; display: flex;
+  align-items: center; justify-content: center; z-index: 20;
+}
+.dialog {
+  background: var(--bg); border: 1px solid var(--border); border-radius: .5rem;
+  padding: 1rem 1.1rem; max-width: 26rem; box-shadow: 0 8px 30px #0005;
+}
+.dialog p { margin: 0 0 .9rem; }
+.dialog .btns { display: flex; gap: .5rem; justify-content: flex-end; flex-wrap: wrap; }
+.dialog button {
+  border: 1px solid var(--border); background: var(--panel); border-radius: .35rem;
+  padding: .3rem .7rem; cursor: pointer; font: inherit;
+}
+.dialog button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.dialog button.danger { background: var(--red); border-color: var(--red); color: #fff; }
+
+/* ---- toast ---- */
+.toast {
+  position: fixed; bottom: 1rem; right: 1rem; z-index: 30;
+  background: light-dark(#333, #eee); color: light-dark(#fff, #111);
+  border-radius: .4rem; padding: .5rem .8rem; font-size: .8rem; max-width: 24rem;
+  box-shadow: 0 4px 14px #0005;
+}
+
+.loading { color: var(--muted); padding: 2rem; text-align: center; }

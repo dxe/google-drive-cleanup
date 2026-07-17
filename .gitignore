@@ -48,6 +48,12 @@ config.json
 
 # Generated files
 out/explore-owned-files/
+out/review.html
+
+# Next.js review UI
+web/node_modules/
+web/.next/
+web/next-env.d.ts
 
 # Backups
 **/*.bak.json

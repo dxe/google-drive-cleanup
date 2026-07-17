@@ -152,6 +152,14 @@ drive-cleanup unpack someone@gmail.com
 # Abort a migration the user never completed the drag for: restore files to
 # their original locations from the packing folder, ownership unchanged
 drive-cleanup unpack someone@gmail.com --allow-not-moved
+
+# Serve the keep/delete review API locally (dev only, no auth), then run the
+# UI with `cd web && npm run dev` and open http://localhost:3000
+drive-cleanup review
+
+# Export the keep/delete decisions as one self-contained HTML file to send
+# to teammates (same red/green/yellow coloring as the review UI)
+drive-cleanup export-review --out out/review.html
 ```
 
 The two commands that move files — `pack` and `unpack` — accept `--dry-run`,
@@ -170,6 +178,46 @@ folders, per-folder counts of owned descendants, Drive links, and keyboard
 navigation — handy to attach when reaching out to an owner. Run it without an
 account argument to generate one such file per owner in the database (owners
 with neither an email nor an owner id are skipped).
+
+### Reviewing what to keep vs delete (`review` / `export-review`)
+
+`review` serves a local JSON API (default `127.0.0.1:8844`) over the crawled
+database, and the Next.js app in `web/` is its UI: folder tree on the left,
+the selected folder's files on the right, with per-row Keep (✓) / Delete (✕) /
+Clear (–) buttons, bulk file actions, and keyboard triage (↑/↓ move, →/←
+expand/collapse, Enter opens a folder, `k` keep, `d` delete, `u` clear, Tab
+switches panes, ⌘Z undo). Decisions land in the `nodes.decision` column.
+
+```sh
+drive-cleanup review          # terminal 1: the API
+cd web && npm install && npm run dev   # terminal 2: the UI on :3000
+```
+
+Rules the server maintains:
+
+- Marking a folder propagates to its whole subtree. A folder marked **delete**
+  must have every descendant deleted too (no kept item may be orphaned inside
+  a deleted subtree) — deleting over kept descendants asks for confirmation.
+- Marking a folder **keep** marks undecided descendants keep; if some
+  descendants are already delete, it asks whether to keep them as delete
+  (subtree shows yellow/mixed) or overwrite everything to keep. Descendants
+  can still be flipped to delete afterwards.
+- Marking something keep (or clearing it) *inside* a delete subtree un-marks
+  the delete ancestors and re-decides them from their children.
+- Once every child of a folder is decided, the folder auto-decides: delete if
+  all children are delete subtrees, keep otherwise.
+- Undo (in-memory, last 200 actions) reverses whole actions while the server
+  is running.
+
+Colors: red = delete subtree, green = keep, yellow = contains both, pale
+red/green = partially decided, no color = undecided. Each row has a small ↗
+icon that opens the item in Google Drive.
+
+`export-review` writes the same tree, coloring, and per-folder tallies into a
+single self-contained HTML file (default `out/review.html`) that can be sent
+to teammates for review. Note it includes every crawled node, so the file is
+large (tens of MB for tens of thousands of nodes); it opens fine locally and
+compresses well for sending.
 
 `check-edit-access` reads only the database and prints every node whose
 `can_edit` flag (Drive's `capabilities.canEdit`, captured during the crawl for
