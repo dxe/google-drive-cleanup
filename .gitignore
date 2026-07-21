@@ -57,6 +57,7 @@ web/next-env.d.ts
 # Backups
 **/*.bak.json
 **/*.bak
+db-backups/**
 
 # Playwright MCP
 .playwright-mcp
