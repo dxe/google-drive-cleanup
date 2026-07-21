@@ -73,12 +73,17 @@ type migrationConfig struct {
 	// the behavior.
 	SkipUnmovable bool `json:"skip-unmovable" doc:"set true to skip uneditable items and pack the rest instead of aborting (same as pack's --skip-unmovable)"`
 	// OwnershipTransferAccounts lists the email addresses that files may be
-	// transferred to during the migration. When `crawl --update-last-modified`
-	// finds a file owned by one of these accounts, its top-level modifiedTime
-	// most likely reflects that transfer rather than a content edit, so the
-	// crawl consults the Revisions API and records the second-to-last revision's
-	// time instead as a better estimate of the last real content change.
-	OwnershipTransferAccounts []string `json:"ownership-transfer-accounts" doc:"emails files may be transferred to; crawl --update-last-modified uses revisions to skip the transfer when estimating last edit"`
+	// transferred to during the migration. The crawl keeps a node's
+	// original_owner_* pointed at the most recent owner that is NOT one of these,
+	// so once a file is handed to a transfer account the original owner stays
+	// frozen at the last real owner.
+	OwnershipTransferAccounts []string `json:"ownership-transfer-accounts" doc:"emails files may be transferred to; crawl freezes original_owner at the last owner that is not one of these"`
+	// ManualOwnershipTransferAccounts is the subset of OwnershipTransferAccounts
+	// whose transfers are performed by hand. A manual transfer permanently bumps
+	// the file's modifiedTime, so a file crawled while owned by one of these is
+	// flagged manual_transfer_performed, and `crawl --update-last-modified` reads
+	// its last real edit from the penultimate revision rather than modifiedTime.
+	ManualOwnershipTransferAccounts []string `json:"manual-ownership-transfer-accounts" doc:"subset of ownership-transfer-accounts whose transfers bump modifiedTime; crawl --update-last-modified uses the penultimate revision for their files"`
 }
 
 func loadConfig(path string) (config, error) {
@@ -114,10 +119,11 @@ func configTemplate() (string, error) {
 		InternalDomains: []string{"example.com"},
 		Owners:          ownersConfig{IgnoreInternalDomains: false},
 		Migration: migrationConfig{
-			PackingFolder:             folder("PACKING"),
-			DropoffFolder:             folder("DROPOFF"),
-			SkipUnmovable:             false,
-			OwnershipTransferAccounts: []string{},
+			PackingFolder:                   folder("PACKING"),
+			DropoffFolder:                   folder("DROPOFF"),
+			SkipUnmovable:                   false,
+			OwnershipTransferAccounts:       []string{},
+			ManualOwnershipTransferAccounts: []string{},
 		},
 	}
 	b, err := json.MarshalIndent(cfg, "", "  ")

@@ -116,6 +116,79 @@ func TestUpsertIdempotentAndProgressPreserving(t *testing.T) {
 	}
 }
 
+// TestUpsertOriginalOwnerAndManualTransfer covers how upsertNode maintains the
+// original_owner_* columns and the manual_transfer_performed flag across crawls.
+func TestUpsertOriginalOwnerAndManualTransfer(t *testing.T) {
+	db := testDB(t)
+
+	readOrig := func(driveID string) (origEmail, origID, origDisplay sql.NullString, manual int) {
+		t.Helper()
+		if err := db.QueryRow(
+			`SELECT original_owner_email, original_owner_id, original_owner_display_name, manual_transfer_performed
+			 FROM nodes WHERE drive_id = ?`, driveID).Scan(&origEmail, &origID, &origDisplay, &manual); err != nil {
+			t.Fatal(err)
+		}
+		return origEmail, origID, origDisplay, manual
+	}
+
+	// First crawl: owned by a real person. Original owner seeds to that person.
+	real := node{
+		driveID: "f", name: "f.pdf", typ: typeBinary, mimeType: "application/pdf",
+		ownerEmail: nullString("alice@example.com"), ownerID: nullString("alice-id"),
+		ownerDisplay: nullString("Alice"),
+	}
+	mustUpsert(t, db, real)
+	if email, id, disp, manual := readOrig("f"); email.String != "alice@example.com" || id.String != "alice-id" || disp.String != "Alice" || manual != 0 {
+		t.Fatalf("after real-owner insert: orig=(%q,%q,%q) manual=%d, want (alice@example.com,alice-id,Alice) 0", email.String, id.String, disp.String, manual)
+	}
+
+	// Ownership transferred to a transfer account: original owner must freeze at
+	// the last real owner, and (this being a manual transfer account) the flag sets.
+	transferred := node{
+		driveID: "f", name: "f.pdf", typ: typeBinary, mimeType: "application/pdf",
+		ownerEmail: nullString("drive.transfer@gmail.com"), ownerID: nullString("xfer-id"),
+		ownerDisplay:          nullString("Drive Transfer"),
+		ownerIsTransfer:       true,
+		ownerIsManualTransfer: true,
+	}
+	mustUpsert(t, db, transferred)
+	if email, id, disp, manual := readOrig("f"); email.String != "alice@example.com" || id.String != "alice-id" || disp.String != "Alice" || manual != 1 {
+		t.Fatalf("after transfer: orig=(%q,%q,%q) manual=%d, want frozen (alice@example.com,alice-id,Alice) 1", email.String, id.String, disp.String, manual)
+	}
+
+	// A later crawl still sees the transfer account: original stays frozen and the
+	// flag stays set even though this owner is not (any longer) a manual account.
+	stillXfer := transferred
+	stillXfer.ownerIsManualTransfer = false
+	mustUpsert(t, db, stillXfer)
+	if email, id, _, manual := readOrig("f"); email.String != "alice@example.com" || id.String != "alice-id" || manual != 1 {
+		t.Fatalf("after re-transfer: orig=(%q,%q) manual=%d, want frozen alice and manual stays 1", email.String, id.String, manual)
+	}
+
+	// Ownership handed back to a real person: original owner refreshes to them.
+	returned := node{
+		driveID: "f", name: "f.pdf", typ: typeBinary, mimeType: "application/pdf",
+		ownerEmail: nullString("bob@example.com"), ownerID: nullString("bob-id"),
+		ownerDisplay: nullString("Bob"),
+	}
+	mustUpsert(t, db, returned)
+	if email, id, disp, manual := readOrig("f"); email.String != "bob@example.com" || id.String != "bob-id" || disp.String != "Bob" || manual != 1 {
+		t.Fatalf("after return to real owner: orig=(%q,%q,%q) manual=%d, want (bob@example.com,bob-id,Bob) and manual still 1", email.String, id.String, disp.String, manual)
+	}
+
+	// A file first seen already owned by a transfer account has no prior owner to
+	// preserve, so the original owner seeds to the transfer account itself.
+	bornXfer := node{
+		driveID: "g", name: "g.pdf", typ: typeBinary, mimeType: "application/pdf",
+		ownerEmail: nullString("drive.transfer@gmail.com"), ownerID: nullString("xfer-id"),
+		ownerDisplay: nullString("Drive Transfer"), ownerIsTransfer: true,
+	}
+	mustUpsert(t, db, bornXfer)
+	if email, id, _, _ := readOrig("g"); email.String != "drive.transfer@gmail.com" || id.String != "xfer-id" {
+		t.Fatalf("born-transferred file: orig=(%q,%q), want the transfer account (nothing better to record)", email.String, id.String)
+	}
+}
+
 // A node found under a single parent that differs from its stored parent has
 // moved since the last crawl; setParent reparents it to where it lives now.
 func TestUpsertReparentsMovedNode(t *testing.T) {

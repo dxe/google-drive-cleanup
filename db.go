@@ -74,6 +74,14 @@ func now() string {
 	return time.Now().UTC().Format(time.RFC3339)
 }
 
+// boolToInt maps a Go bool to the 0/1 SQLite stores in an INTEGER flag column.
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
 type node struct {
 	driveID        string
 	name           string
@@ -90,6 +98,18 @@ type node struct {
 	// case), upsertNode leaves any existing value untouched (see the COALESCE
 	// below) rather than clearing it.
 	lastModified sql.NullString
+	// ownerIsTransfer reports whether ownerEmail is one of the configured
+	// ownership-transfer accounts. It decides how upsertNode updates the
+	// original_owner_* columns: when false the original owner is refreshed to this
+	// (real) owner; when true the previously recorded original owner is kept, so
+	// once a file lands on a transfer account its original owner is frozen at the
+	// last real owner. On insert the original owner is seeded to this owner
+	// regardless (there is no prior value to preserve).
+	ownerIsTransfer bool
+	// ownerIsManualTransfer reports whether ownerEmail is one of the configured
+	// manual-ownership-transfer accounts. When true the row's
+	// manual_transfer_performed flag is set (and never cleared thereafter).
+	ownerIsManualTransfer bool
 }
 
 // upsertNode inserts n or refreshes the existing row with the same drive_id.
@@ -122,10 +142,16 @@ func upsertNode(tx *sql.Tx, n node, setParent bool) (rowID int64, existed bool, 
 		return 0, false, sql.NullInt64{}, false, err
 	}
 
+	// original_owner_* seed to this owner on insert (excluded.*); on update they
+	// are refreshed to this owner unless it is a transfer account, in which case
+	// the previously recorded original owner is preserved (COALESCE) so the
+	// original owner freezes at the last real owner before the transfer.
 	err = tx.QueryRow(`
 		INSERT INTO nodes (drive_id, name, type, mime_type, owner_email, owner_id,
-			owner_display_name, parent_id, shortcut_target_id, children_done, can_edit, crawled_at, last_modified)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+			owner_display_name, parent_id, shortcut_target_id, children_done, can_edit, crawled_at,
+			last_modified, original_owner_email, original_owner_id, original_owner_display_name,
+			manual_transfer_performed)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(drive_id) DO UPDATE SET
 			name               = excluded.name,
 			type               = excluded.type,
@@ -142,10 +168,24 @@ func upsertNode(tx *sql.Tx, n node, setParent bool) (rowID int64, existed bool, 
 			-- Preserve any previously recorded last_modified when this crawl did
 			-- not compute one (--update-last-modified off), so a plain re-crawl
 			-- keeps the estimate rather than wiping it.
-			last_modified      = COALESCE(excluded.last_modified, nodes.last_modified)
+			last_modified      = COALESCE(excluded.last_modified, nodes.last_modified),
+			-- When this owner is a transfer account, keep the original owner already
+			-- on record (the last real owner); otherwise refresh it to this owner.
+			-- The email/id/display columns move together so they always describe one
+			-- person.
+			original_owner_email        = CASE WHEN ? THEN COALESCE(nodes.original_owner_email, excluded.original_owner_email)
+			                                   ELSE COALESCE(excluded.original_owner_email, nodes.original_owner_email) END,
+			original_owner_id           = CASE WHEN ? THEN COALESCE(nodes.original_owner_id, excluded.original_owner_id)
+			                                   ELSE COALESCE(excluded.original_owner_id, nodes.original_owner_id) END,
+			original_owner_display_name = CASE WHEN ? THEN COALESCE(nodes.original_owner_display_name, excluded.original_owner_display_name)
+			                                   ELSE COALESCE(excluded.original_owner_display_name, nodes.original_owner_display_name) END,
+			-- Once a manual transfer has been seen the flag stays set forever.
+			manual_transfer_performed   = MAX(nodes.manual_transfer_performed, excluded.manual_transfer_performed)
 		RETURNING id`,
 		n.driveID, n.name, n.typ, n.mimeType, n.ownerEmail, n.ownerID,
-		n.ownerDisplay, n.parentID, n.shortcutTarget, n.canEdit, now(), n.lastModified, setParent,
+		n.ownerDisplay, n.parentID, n.shortcutTarget, n.canEdit, now(), n.lastModified,
+		n.ownerEmail, n.ownerID, n.ownerDisplay, boolToInt(n.ownerIsManualTransfer),
+		setParent, n.ownerIsTransfer, n.ownerIsTransfer, n.ownerIsTransfer,
 	).Scan(&rowID)
 	return rowID, existed, prevParent, prevDone, err
 }
