@@ -475,6 +475,15 @@ type ownedRoot struct {
 // account, ordered by row id. The crawl root is excluded by the JOIN (it has
 // no parent row). IS NOT treats a parent with NULL owner fields as not-owned.
 //
+// A node whose parent IS the crawl root also counts as a root, even when the
+// account owns the crawl root: the crawl root is the migration boundary and is
+// never moved, so an owned item directly under it is the top of an owned
+// subtree that must move. Without this, a user who owns the crawl root has no
+// owned roots at all (every owned item's parent chain runs up to the owned
+// root), Phase A moves nothing, and pack only rescues the tree item-by-item as
+// flattened Phase C stragglers. The crawl root is the unique node with a NULL
+// parent_id, so p.parent_id IS NULL identifies "parent is the crawl root".
+//
 // When subtreeRoot is non-empty the roots are computed relative to that
 // subfolder: only owned nodes within its subtree are considered, and the
 // subfolder itself acts as a boundary — an owned node whose parent lies outside
@@ -487,7 +496,10 @@ func ownedRoots(db *sql.DB, account, subtreeRoot string) ([]ownedRoot, error) {
 		FROM nodes n
 		JOIN nodes p ON p.id = n.parent_id
 		WHERE (n.owner_email = ? OR n.owner_id = ?)
-		  AND p.owner_email IS NOT ? AND p.owner_id IS NOT ?
+		  AND (
+		    (p.owner_email IS NOT ? AND p.owner_id IS NOT ?)
+		    OR p.parent_id IS NULL
+		  )
 		ORDER BY n.id`
 	queryArgs := []any{account, account, account, account}
 	if subtreeRoot != "" {
@@ -504,6 +516,7 @@ func ownedRoots(db *sql.DB, account, subtreeRoot string) ([]ownedRoot, error) {
 		  AND (
 		    p.id NOT IN (SELECT id FROM subtree)
 		    OR (p.owner_email IS NOT ? AND p.owner_id IS NOT ?)
+		    OR p.parent_id IS NULL
 		  )
 		ORDER BY n.id`
 		queryArgs = []any{subtreeRoot, account, account, account, account}

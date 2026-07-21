@@ -546,18 +546,41 @@ func TestOwnedRootsSubfolderOwnedParent(t *testing.T) {
 
 func TestOwnedRootsExcludesCrawlRoot(t *testing.T) {
 	db := testDB(t)
-	// The crawl root itself owned by the migrating user must never be a root.
+	// The crawl root itself, even when owned by the migrating user, must never be
+	// a root (it is the migration boundary and is never moved). But its owned
+	// children ARE roots: the crawl root never moves, so an owned item directly
+	// under it is the top of an owned subtree that pack must move. Without this,
+	// a user who owns the crawl root would have no roots at all and pack would
+	// move nothing in Phase A.
 	rootID, _, _, _ := mustUpsert(t, db, node{driveID: "root", name: "Root", typ: typeFolder, mimeType: folderMimeType,
 		ownerEmail: nullString("alice@example.com")})
 	mustUpsert(t, db, node{driveID: "f", name: "f.pdf", typ: typeBinary, mimeType: "application/pdf",
 		parentID: sql.NullInt64{Int64: rootID, Valid: true}, ownerEmail: nullString("alice@example.com")})
+	// A folder directly under the root with a file nested inside it, to confirm
+	// only the top-level child is a root and deeper owned items ride along.
+	dirID, _, _, _ := mustUpsert(t, db, node{driveID: "dir", name: "dir", typ: typeFolder, mimeType: folderMimeType,
+		parentID: sql.NullInt64{Int64: rootID, Valid: true}, ownerEmail: nullString("alice@example.com")})
+	mustUpsert(t, db, node{driveID: "nested", name: "nested.pdf", typ: typeBinary, mimeType: "application/pdf",
+		parentID: sql.NullInt64{Int64: dirID, Valid: true}, ownerEmail: nullString("alice@example.com")})
 
 	roots, err := ownedRoots(db, "alice@example.com", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(roots) != 0 {
-		t.Errorf("ownedRoots = %v, want none (root has no parent, f's parent is owned)", roots)
+	got := map[string]string{}
+	for _, r := range roots {
+		got[r.driveID] = r.parentDriveID
+	}
+	// f and dir are direct children of the crawl root -> roots. root itself is
+	// excluded (no parent row); nested rides along inside dir.
+	want := map[string]string{"f": "root", "dir": "root"}
+	if len(got) != len(want) {
+		t.Fatalf("ownedRoots = %v, want %v", got, want)
+	}
+	for id, parent := range want {
+		if got[id] != parent {
+			t.Errorf("ownedRoots[%s] parent = %q, want %q", id, got[id], parent)
+		}
 	}
 }
 
