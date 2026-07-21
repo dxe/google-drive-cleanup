@@ -30,7 +30,7 @@ const (
 	// clone's sharing can be recreated later. Reused by the root fetch and list.
 	permissionFields = "permissions(id, type, role, emailAddress, domain, displayName, allowFileDiscovery, deleted)"
 
-	listFields = "nextPageToken, files(id, name, mimeType, owners(emailAddress, displayName, permissionId), parents, shortcutDetails(targetId), capabilities(canEdit, canListChildren), " + permissionFields + ")"
+	listFields = "nextPageToken, files(id, name, mimeType, modifiedTime, owners(emailAddress, displayName, permissionId), parents, shortcutDetails(targetId), capabilities(canEdit, canListChildren), " + permissionFields + ")"
 )
 
 // Node types stored in the nodes.type column. These are the only valid values
@@ -60,6 +60,15 @@ type crawler struct {
 	srv         *drive.Service
 	limiter     *rate.Limiter
 	concurrency int // how many folders to list in parallel (see --concurrency)
+
+	// updateLastModified records each node's estimated last-content-change time
+	// into nodes.last_modified (see --update-last-modified). Off by default.
+	updateLastModified bool
+	// transferAccounts is the set of lower-cased ownership-transfer emails from
+	// config. A file owned by one of these has its last_modified estimated from
+	// the revision before the most recent one, since that most recent change was
+	// most likely the ownership transfer rather than a content edit.
+	transferAccounts map[string]bool
 
 	// visited guards against listing a folder twice (a cycle or a second parent).
 	// The concurrent drain does a test-and-set on it from many workers, so it and
@@ -132,7 +141,8 @@ pruning stale rows under it alone. The folder must already exist in the snapshot
 		wipe, _ := cmd.Flags().GetBool("wipe")
 		subfolder, _ := cmd.Flags().GetString("folder")
 		concurrency, _ := cmd.Flags().GetInt("concurrency")
-		return runCrawl(dbPath, cfgPath, refresh, wipe, subfolder, concurrency)
+		updateLastModified, _ := cmd.Flags().GetBool("update-last-modified")
+		return runCrawl(dbPath, cfgPath, refresh, wipe, subfolder, concurrency, updateLastModified)
 	},
 }
 
@@ -149,9 +159,10 @@ func init() {
 	crawlCmd.Flags().Bool("wipe", false, "discard the previous crawl snapshot entirely and crawl from scratch")
 	crawlCmd.Flags().String("folder", "", "Drive folder ID (already crawled) to re-index in place, pruning stale rows under that subfolder only")
 	crawlCmd.Flags().Int("concurrency", defaultCrawlConcurrency, "how many folders to list in parallel (all still share the global rate limiter)")
+	crawlCmd.Flags().Bool("update-last-modified", false, "record each node's estimated last-content-change time in last_modified (consults the Revisions API for files owned by migration.ownership-transfer-accounts)")
 }
 
-func runCrawl(dbPath, cfgPath string, refresh, wipe bool, subfolder string, concurrency int) error {
+func runCrawl(dbPath, cfgPath string, refresh, wipe bool, subfolder string, concurrency int, updateLastModified bool) error {
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
 		return err
@@ -196,9 +207,15 @@ func runCrawl(dbPath, cfgPath string, refresh, wipe bool, subfolder string, conc
 		// passes through this one shared limiter, so it — not the worker count — is
 		// the quota safety cap. 20/sec is far under Drive's per-user ceiling
 		// (~12k/min); backoff-on-429/403 self-throttles if we ever overshoot.
-		limiter:     rate.NewLimiter(rate.Limit(20), 20),
-		concurrency: concurrency,
-		visited:     make(map[string]bool),
+		limiter:            rate.NewLimiter(rate.Limit(20), 20),
+		concurrency:        concurrency,
+		visited:            make(map[string]bool),
+		updateLastModified: updateLastModified,
+		transferAccounts:   transferAccountSet(cfg.Migration.OwnershipTransferAccounts),
+	}
+
+	if updateLastModified {
+		log.Printf("--update-last-modified: recording last-content-change times (%d ownership-transfer account(s) configured)", len(c.transferAccounts))
 	}
 
 	// --folder re-indexes one already-crawled subtree in place; it shares the
@@ -345,7 +362,7 @@ func (c *crawler) runScopedCrawl(ctx context.Context, subfolder string) error {
 	if err != nil {
 		return fmt.Errorf("fetching subfolder %s: %w", subfolder, err)
 	}
-	if err := c.upsertFolder(f); err != nil {
+	if err := c.upsertFolder(ctx, f); err != nil {
 		return err
 	}
 
@@ -485,7 +502,7 @@ func (c *crawler) fetchFolder(ctx context.Context, id string) (*drive.File, erro
 	err := c.withRetry(ctx, "files.get "+id, func() error {
 		var err error
 		f, err = c.srv.Files.Get(id).
-			Fields("id, name, mimeType, owners(emailAddress, displayName, permissionId), capabilities(canEdit, canListChildren), " + permissionFields).
+			Fields("id, name, mimeType, modifiedTime, owners(emailAddress, displayName, permissionId), capabilities(canEdit, canListChildren), " + permissionFields).
 			SupportsAllDrives(true).
 			Context(ctx).Do()
 		return err
@@ -504,7 +521,7 @@ func (c *crawler) fetchFolder(ctx context.Context, id string) (*drive.File, erro
 // upsert preserves whatever parent the row already has (NULL for the crawl root;
 // the existing parent for a scoped re-index root, whose real parent is outside
 // the scope and so never re-observed through a listing this run).
-func (c *crawler) upsertFolder(f *drive.File) error {
+func (c *crawler) upsertFolder(ctx context.Context, f *drive.File) error {
 	tx, err := c.db.Begin()
 	if err != nil {
 		return err
@@ -520,6 +537,7 @@ func (c *crawler) upsertFolder(f *drive.File) error {
 		ownerID:      ownerID,
 		ownerDisplay: display,
 		canEdit:      canEditOf(f),
+		lastModified: nullString(c.lastModifiedFor(ctx, f)),
 	}, false); err != nil {
 		return fmt.Errorf("inserting %s: %w", f.Id, err)
 	}
@@ -541,7 +559,7 @@ func (c *crawler) validateAndInsertRoot(ctx context.Context, cfg rootConfig) err
 		return fmt.Errorf("root name mismatch for %s: config expects %q but Drive has %q — refusing to crawl (is the id pointing at the right folder?)",
 			cfg.ID, cfg.Name, f.Name)
 	}
-	return c.upsertFolder(f)
+	return c.upsertFolder(ctx, f)
 }
 
 // listFolder lists every child of f, committing each page of children in one
@@ -576,7 +594,7 @@ func (c *crawler) listFolder(ctx context.Context, f folderRef) ([]folderRef, err
 			return subfolders, err
 		}
 		lastPage := fl.NextPageToken == ""
-		subs, err := c.commitPage(f, fl.Files, lastPage)
+		subs, err := c.commitPage(ctx, f, fl.Files, lastPage)
 		subfolders = append(subfolders, subs...)
 		if err != nil {
 			return subfolders, err
@@ -590,7 +608,21 @@ func (c *crawler) listFolder(ctx context.Context, f folderRef) ([]folderRef, err
 
 // commitPage upserts one page of children of parent in a single transaction;
 // when last is true the same transaction marks the parent children_done=1.
-func (c *crawler) commitPage(parent folderRef, files []*drive.File, last bool) ([]folderRef, error) {
+func (c *crawler) commitPage(ctx context.Context, parent folderRef, files []*drive.File, last bool) ([]folderRef, error) {
+	// Resolve each file's last-content-change time before opening the
+	// transaction: for ownership-transfer-owned files this makes Revisions API
+	// calls, and network I/O must never happen while holding the single SQLite
+	// write connection. When --update-last-modified is off this is a no-op.
+	lastMod := make(map[string]string, len(files))
+	if c.updateLastModified {
+		for _, file := range files {
+			if err := ctx.Err(); err != nil {
+				return nil, err // interrupted; children_done stays 0 so a rerun retries
+			}
+			lastMod[file.Id] = c.lastModifiedFor(ctx, file)
+		}
+	}
+
 	tx, err := c.db.Begin()
 	if err != nil {
 		return nil, err
@@ -609,6 +641,7 @@ func (c *crawler) commitPage(parent folderRef, files []*drive.File, last bool) (
 			ownerID:      ownerID,
 			ownerDisplay: display,
 			canEdit:      canEditOf(file),
+			lastModified: nullString(lastMod[file.Id]),
 			// Record the folder we discovered it through, not files.parents[0]:
 			// parent_id must always point at a row we actually crawled.
 			parentID: sql.NullInt64{Int64: parent.rowID, Valid: true},
@@ -730,6 +763,91 @@ func permissionsOf(f *drive.File) []permission {
 
 func nullString(s string) sql.NullString {
 	return sql.NullString{String: s, Valid: s != ""}
+}
+
+// transferAccountSet lower-cases the configured ownership-transfer emails into a
+// lookup set (email comparison is case-insensitive). Returns an empty, non-nil
+// set when none are configured.
+func transferAccountSet(emails []string) map[string]bool {
+	set := make(map[string]bool, len(emails))
+	for _, e := range emails {
+		if e = strings.ToLower(strings.TrimSpace(e)); e != "" {
+			set[e] = true
+		}
+	}
+	return set
+}
+
+// ownedByTransferAccount reports whether f's owner is one of the configured
+// ownership-transfer accounts.
+func (c *crawler) ownedByTransferAccount(f *drive.File) bool {
+	if len(c.transferAccounts) == 0 || len(f.Owners) == 0 || f.Owners[0] == nil {
+		return false
+	}
+	return c.transferAccounts[strings.ToLower(f.Owners[0].EmailAddress)]
+}
+
+// lastModifiedFor returns the value to store in nodes.last_modified for f, or ""
+// (recorded as NULL) when --update-last-modified is off. Normally this is
+// Drive's top-level modifiedTime, but for a file owned by an ownership-transfer
+// account the most recent change is most likely the ownership transfer itself,
+// so we consult the Revisions API and prefer the second-to-last revision's time
+// as a better estimate of the last real content edit. It falls back to
+// modifiedTime when the file has fewer than two revisions or its history cannot
+// be read (logged, not fatal — a single unreadable file must not stall a crawl).
+func (c *crawler) lastModifiedFor(ctx context.Context, f *drive.File) string {
+	if !c.updateLastModified {
+		return ""
+	}
+	// Revisions exist only for actual files; folders and shortcuts have none, so
+	// don't waste an API call on them.
+	if typ := classify(f.MimeType); (typ == typeGoogleDoc || typ == typeBinary) && c.ownedByTransferAccount(f) {
+		t, err := c.secondToLastRevisionTime(ctx, f.Id)
+		switch {
+		case err == nil && t != "":
+			return t
+		case err != nil && ctx.Err() == nil:
+			log.Printf("warning: %s (%q): could not read revision history (%v); using modifiedTime %s",
+				f.Id, f.Name, err, f.ModifiedTime)
+		}
+	}
+	return f.ModifiedTime
+}
+
+// secondToLastRevisionTime returns the modifiedTime of the revision immediately
+// before the most recent one, or "" when the file has fewer than two revisions.
+func (c *crawler) secondToLastRevisionTime(ctx context.Context, fileID string) (string, error) {
+	var revisions []*drive.Revision
+	pageToken := ""
+	for {
+		var list *drive.RevisionList
+		err := c.withRetry(ctx, "revisions.list "+fileID, func() error {
+			call := c.srv.Revisions.List(fileID).
+				Fields("nextPageToken, revisions(id, modifiedTime)").
+				PageSize(1000).
+				Context(ctx)
+			if pageToken != "" {
+				call = call.PageToken(pageToken)
+			}
+			var err error
+			list, err = call.Do()
+			return err
+		})
+		if err != nil {
+			return "", err
+		}
+		revisions = append(revisions, list.Revisions...)
+		if list.NextPageToken == "" {
+			break
+		}
+		pageToken = list.NextPageToken
+	}
+	if len(revisions) < 2 {
+		return "", nil
+	}
+	// Drive returns revisions oldest-first, so the penultimate entry is the edit
+	// before the most recent change (the likely ownership transfer).
+	return revisions[len(revisions)-2].ModifiedTime, nil
 }
 
 func joinKnown(ids []string, known map[string]bool) string {

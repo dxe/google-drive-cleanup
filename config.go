@@ -72,6 +72,13 @@ type migrationConfig struct {
 	// pack the rest instead of aborting. Either the flag or this setting enables
 	// the behavior.
 	SkipUnmovable bool `json:"skip-unmovable" doc:"set true to skip uneditable items and pack the rest instead of aborting (same as pack's --skip-unmovable)"`
+	// OwnershipTransferAccounts lists the email addresses that files may be
+	// transferred to during the migration. When `crawl --update-last-modified`
+	// finds a file owned by one of these accounts, its top-level modifiedTime
+	// most likely reflects that transfer rather than a content edit, so the
+	// crawl consults the Revisions API and records the second-to-last revision's
+	// time instead as a better estimate of the last real content change.
+	OwnershipTransferAccounts []string `json:"ownership-transfer-accounts" doc:"emails files may be transferred to; crawl --update-last-modified uses revisions to skip the transfer when estimating last edit"`
 }
 
 func loadConfig(path string) (config, error) {
@@ -107,9 +114,10 @@ func configTemplate() (string, error) {
 		InternalDomains: []string{"example.com"},
 		Owners:          ownersConfig{IgnoreInternalDomains: false},
 		Migration: migrationConfig{
-			PackingFolder: folder("PACKING"),
-			DropoffFolder: folder("DROPOFF"),
-			SkipUnmovable: false,
+			PackingFolder:             folder("PACKING"),
+			DropoffFolder:             folder("DROPOFF"),
+			SkipUnmovable:             false,
+			OwnershipTransferAccounts: []string{},
 		},
 	}
 	b, err := json.MarshalIndent(cfg, "", "  ")

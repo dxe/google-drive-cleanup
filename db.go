@@ -85,6 +85,11 @@ type node struct {
 	parentID       sql.NullInt64 // internal row id of the folder we found it under; NULL for the root
 	shortcutTarget sql.NullString
 	canEdit        bool // whether the crawling account can edit the node
+	// lastModified is the estimated time of the node's last content change,
+	// recorded only by `crawl --update-last-modified`. When invalid (the common
+	// case), upsertNode leaves any existing value untouched (see the COALESCE
+	// below) rather than clearing it.
+	lastModified sql.NullString
 }
 
 // upsertNode inserts n or refreshes the existing row with the same drive_id.
@@ -119,8 +124,8 @@ func upsertNode(tx *sql.Tx, n node, setParent bool) (rowID int64, existed bool, 
 
 	err = tx.QueryRow(`
 		INSERT INTO nodes (drive_id, name, type, mime_type, owner_email, owner_id,
-			owner_display_name, parent_id, shortcut_target_id, children_done, can_edit, crawled_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+			owner_display_name, parent_id, shortcut_target_id, children_done, can_edit, crawled_at, last_modified)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
 		ON CONFLICT(drive_id) DO UPDATE SET
 			name               = excluded.name,
 			type               = excluded.type,
@@ -133,10 +138,14 @@ func upsertNode(tx *sql.Tx, n node, setParent bool) (rowID int64, existed bool, 
 			shortcut_target_id = excluded.shortcut_target_id,
 			children_done      = MAX(nodes.children_done, excluded.children_done),
 			can_edit           = excluded.can_edit,
-			crawled_at         = excluded.crawled_at
+			crawled_at         = excluded.crawled_at,
+			-- Preserve any previously recorded last_modified when this crawl did
+			-- not compute one (--update-last-modified off), so a plain re-crawl
+			-- keeps the estimate rather than wiping it.
+			last_modified      = COALESCE(excluded.last_modified, nodes.last_modified)
 		RETURNING id`,
 		n.driveID, n.name, n.typ, n.mimeType, n.ownerEmail, n.ownerID,
-		n.ownerDisplay, n.parentID, n.shortcutTarget, n.canEdit, now(), setParent,
+		n.ownerDisplay, n.parentID, n.shortcutTarget, n.canEdit, now(), n.lastModified, setParent,
 	).Scan(&rowID)
 	return rowID, existed, prevParent, prevDone, err
 }
