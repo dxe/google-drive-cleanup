@@ -596,40 +596,31 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 	// the crawl; the sweep doubles as the pre-drag ownership verification.
 	// seen collects every user-owned item observed in the tree for Phase C.
 	seen := make(map[string]bool)
-	if dryRun {
-		preview, err := unownedChildrenOfOwned(db, account, subfolder)
-		if err != nil {
-			return err
-		}
-		for _, s := range preview {
-			if unmovable[s.driveID] {
-				log.Printf("WOULD skip %q (%s): not editable by the crawling account; cannot sweep it to the Stash", s.name, s.driveID)
-				stats.skip()
-				continue
-			}
-			log.Printf("WOULD move %q (%s) out of owned folder %s into the Stash", s.name, s.driveID, s.parentDriveID)
-			stats.swept()
-		}
-		log.Printf("NOTE the real sweep works from live Drive listings, so it also catches items the crawl never saw")
-	} else {
-		// First walk the tree (listing only, on this goroutine) to enumerate the
-		// items to sweep — the database bookkeeping (orphan recording) and the
-		// owned/unowned classification stay single-threaded, so the DB and the
-		// seen map need no locking. Moving unowned items to the Stash never
-		// changes which folders are owned, so enumerating before moving is safe.
-		type stashTarget struct{ id, name, parent string }
+
+	// stashTarget is one unowned item to relocate into the flat Stash.
+	type stashTarget struct{ id, name, parent string }
+
+	// enumerateStash walks the live folder trees rooted at seeds (breadth-first,
+	// listing only, on the caller's goroutine) and returns every item the user
+	// does not own — the ones that must move to the Stash before the drag. Owned
+	// items are recorded in seen and descended into. The DB bookkeeping (orphan
+	// recording) and the owned/unowned classification stay single-threaded, so
+	// the DB and the seen map need no locking; callers must not run it while the
+	// worker pool is active. Moving unowned items to the Stash never changes which
+	// folders are owned, so enumerating fully before moving is safe.
+	enumerateStash := func(seeds []string) ([]stashTarget, error) {
 		var toStash []stashTarget
-		queue := []string{containerF.Id}
+		queue := append([]string(nil), seeds...)
 		for len(queue) > 0 {
 			if interrupted() {
-				return ctx.Err()
+				return nil, ctx.Err()
 			}
 			folderID := queue[0]
 			queue = queue[1:]
 			children, err := listChildren(ctx, svc, limiter, folderID,
 				"nextPageToken, files(id, name, mimeType, owners(emailAddress, permissionId))")
 			if err != nil {
-				return fmt.Errorf("sweeping Container tree (listing %s): %w", folderID, err)
+				return nil, fmt.Errorf("sweeping Container tree (listing %s): %w", folderID, err)
 			}
 			for _, c := range children {
 				if ownedByAccount(c, account) {
@@ -648,16 +639,20 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 					log.Printf("WARN not in database: %q (%s), swept from %s — if unpack cannot place it, it lands in %s/%s for manual restore",
 						c.Name, c.Id, folderID, errorsFolderName, folderID)
 					if err := recordPackOrphan(db, account, c.Id, folderID); err != nil {
-						return fmt.Errorf("recording orphan %s: %w", c.Id, err)
+						return nil, fmt.Errorf("recording orphan %s: %w", c.Id, err)
 					}
 				} else if derr != nil {
-					return derr
+					return nil, derr
 				}
 				warnExtraParents(c.Id, c.Name)
 				toStash = append(toStash, stashTarget{c.Id, c.Name, folderID})
 			}
 		}
-		// Then sweep them all to the Stash concurrently.
+		return toStash, nil
+	}
+
+	// sweep moves each enumerated unowned item into the flat Stash, concurrently.
+	sweep := func(toStash []stashTarget) {
 		forEachConcurrent(moveCtx, workers, toStash, func(t stashTarget) {
 			prog.tick("progress: %d/%d swept to Stash", stats.sweptCount(), len(toStash))
 			if merr := rec.moveFile(moveCtx, svc, limiter, t.id, stashF.Id, t.parent); merr != nil {
@@ -670,6 +665,30 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 			detailf("OK swept %q (%s) -> Stash", t.name, t.id)
 			stats.swept()
 		})
+	}
+
+	if dryRun {
+		preview, err := unownedChildrenOfOwned(db, account, subfolder)
+		if err != nil {
+			return err
+		}
+		for _, s := range preview {
+			if unmovable[s.driveID] {
+				log.Printf("WOULD skip %q (%s): not editable by the crawling account; cannot sweep it to the Stash", s.name, s.driveID)
+				stats.skip()
+				continue
+			}
+			log.Printf("WOULD move %q (%s) out of owned folder %s into the Stash", s.name, s.driveID, s.parentDriveID)
+			stats.swept()
+		}
+		log.Printf("NOTE the real sweep works from live Drive listings, so it also catches items the crawl never saw")
+	} else {
+		// Enumerate the whole Container tree first, then sweep the unowned items.
+		toStash, err := enumerateStash([]string{containerF.Id})
+		if err != nil {
+			return err
+		}
+		sweep(toStash)
 		if interrupted() {
 			return ctx.Err()
 		}
@@ -681,9 +700,16 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 	// Phase C: stragglers — items the database says the user owns that never
 	// showed up inside the Container tree (usually items that moved since the
 	// crawl, so their owned ancestor no longer carries them). Costs no API
-	// calls unless something is actually missing. seen is read-only here, so the
-	// workers can share it without locking.
+	// calls unless something is actually missing. seen is read-only inside the
+	// worker pool, so the workers can share it without locking; the straggler
+	// sweep afterwards writes it single-threaded, once the pool has drained.
 	if !dryRun {
+		// Folder stragglers move into the Container after Phase B's sweep has
+		// already run, so any third-party items inside them are still sitting in
+		// the packed tree. Collect them here and sweep their subtrees below,
+		// exactly as Phase B swept the rest.
+		var stragglerMu sync.Mutex
+		var stragglerFolders []string
 		forEachConcurrent(moveCtx, workers, owned, func(n ownedNode) {
 			if seen[n.driveID] || n.driveID == crawlRoot {
 				return
@@ -736,10 +762,14 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 					}
 					stats.fail("ERROR moving straggler %q (%s) into the Container: %v", n.name, n.driveID, merr)
 				} else {
-					log.Printf("WARN straggler %q (%s) was outside the packed tree (live parent %v); moved flat into the Container", n.name, n.driveID, f.Parents)
 					stats.moved()
 					if f.MimeType == folderMimeType {
-						log.Printf("WARN straggler %q (%s) is a folder; re-run pack to sweep any third-party items inside it", n.name, n.driveID)
+						log.Printf("WARN straggler %q (%s) is a folder that was outside the packed tree (live parent %v); moved flat into the Container — sweeping its contents for third-party items", n.name, n.driveID, f.Parents)
+						stragglerMu.Lock()
+						stragglerFolders = append(stragglerFolders, n.driveID)
+						stragglerMu.Unlock()
+					} else {
+						log.Printf("WARN straggler %q (%s) was outside the packed tree (live parent %v); moved flat into the Container", n.name, n.driveID, f.Parents)
 					}
 				}
 			}
@@ -749,6 +779,24 @@ func runPack(dbPath, cfgPath, account, subfolder string, dryRun bool, maxErrors 
 		}
 		if stats.aborted {
 			return stats.err
+		}
+
+		// Sweep the third-party contents of any folder stragglers just moved flat
+		// into the Container — the pool has drained, so enumerateStash and seen are
+		// safe to touch single-threaded again. Descending the owned subtree also
+		// reaches items nested below owned subfolders, matching Phase B's behavior.
+		if len(stragglerFolders) > 0 {
+			toStash, err := enumerateStash(stragglerFolders)
+			if err != nil {
+				return err
+			}
+			sweep(toStash)
+			if interrupted() {
+				return ctx.Err()
+			}
+			if stats.aborted {
+				return stats.err
+			}
 		}
 	}
 
