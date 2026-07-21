@@ -1,40 +1,55 @@
 package main
 
 // export-review renders the keep/delete decision state (nodes.decision, as
-// marked in the review web UI) into one self-contained HTML file that can be
-// emailed to teammates: the full crawled tree with the same red / green /
-// yellow subtree coloring as the UI.
+// marked in the review web UI) into a set of self-contained HTML files that
+// can be emailed to teammates: the full crawled tree plus focused reports that
+// surface likely-wrong decisions, all with the same red / green / yellow
+// subtree coloring as the UI.
 
 import (
 	"fmt"
 	"html/template"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/spf13/cobra"
 )
 
 var exportReviewCmd = &cobra.Command{
 	Use:   "export-review",
-	Short: "Write a self-contained HTML review of keep/delete decisions",
-	Long: `Write a single self-contained HTML file showing the whole crawled tree
-with each item's keep/delete decision as marked in the review UI: delete
-subtrees red, keep subtrees green, folders containing both yellow, pale colors
-for partially-decided subtrees. All CSS/JS is inlined so the file can be sent
-to teammates as-is.`,
+	Short: "Write self-contained HTML reviews of keep/delete decisions",
+	Long: `Write a set of self-contained HTML files into an output directory, each
+showing the crawled tree with keep/delete decisions as marked in the review UI:
+delete subtrees red, keep subtrees green, folders containing both yellow, pale
+colors for partially-decided subtrees. All CSS/JS is inlined so the files can be
+sent to teammates as-is. The files written are:
+
+  review-all.html             the whole crawled tree
+  review-delete-recents.html  files marked delete but modified recently
+  review-keep-old.html        files marked keep but not touched in years
+  review-undecided-old.html   undecided files not modified recently
+
+The "recent" window and "old" threshold are configurable (see --recent-months
+and --old-years). The focused reports only include files whose last_modified is
+known (recorded by 'crawl --update-last-modified').`,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dbPath, _ := cmd.Flags().GetString("db")
-		outPath, _ := cmd.Flags().GetString("out")
-		return runExportReview(dbPath, outPath)
+		outDir, _ := cmd.Flags().GetString("out-dir")
+		recentMonths, _ := cmd.Flags().GetInt("recent-months")
+		oldYears, _ := cmd.Flags().GetInt("old-years")
+		return runExportReview(dbPath, outDir, recentMonths, oldYears)
 	},
 }
 
 func init() {
-	exportReviewCmd.Flags().String("out", "out/review.html", "path of the HTML file to write")
+	exportReviewCmd.Flags().String("out-dir", "out", "directory to write the review HTML files into")
+	exportReviewCmd.Flags().Int("recent-months", 6, `"recently modified" window, in months, for the delete-recents and undecided-old reports`)
+	exportReviewCmd.Flags().Int("old-years", 2, `age threshold, in years, for the keep-old report`)
 }
 
-func runExportReview(dbPath, outPath string) error {
+func runExportReview(dbPath, outDir string, recentMonths, oldYears int) error {
 	db, err := openDB(dbPath)
 	if err != nil {
 		return err
@@ -49,8 +64,82 @@ func runExportReview(dbPath, outPath string) error {
 		return fmt.Errorf("database has no crawled nodes; run crawl first")
 	}
 
-	var data reviewExportData
-	data.Roots = roots
+	now := time.Now()
+	recentCutoff := now.AddDate(0, -recentMonths, 0)
+	oldCutoff := now.AddDate(-oldYears, 0, 0)
+
+	// modifiedAfter/modifiedBefore only match files whose last_modified is known
+	// and valid; a file with no recorded time never lands in a focused report.
+	modifiedAfter := func(t time.Time) func(*reviewNode) bool {
+		return func(n *reviewNode) bool {
+			mt, ok := n.modTime()
+			return ok && mt.After(t)
+		}
+	}
+	modifiedBefore := func(t time.Time) func(*reviewNode) bool {
+		return func(n *reviewNode) bool {
+			mt, ok := n.modTime()
+			return ok && mt.Before(t)
+		}
+	}
+	decided := func(dec string, when func(*reviewNode) bool) func(*reviewNode) bool {
+		return func(n *reviewNode) bool { return n.decision == dec && when(n) }
+	}
+
+	reports := []struct {
+		file        string
+		title       string
+		description string
+		roots       []*reviewNode
+		expanded    bool
+	}{
+		{
+			file:        "review-all.html",
+			title:       "keep / delete plan",
+			description: "The whole crawled tree with every keep/delete decision.",
+			roots:       roots,
+		},
+		{
+			file:        "review-delete-recents.html",
+			title:       "delete, but recently modified",
+			description: fmt.Sprintf("Files marked delete despite being modified within the last %s.", monthsPhrase(recentMonths)),
+			roots:       filterReviewForest(roots, decided(decisionDelete, modifiedAfter(recentCutoff))),
+			expanded:    true,
+		},
+		{
+			file:        "review-keep-old.html",
+			title:       "keep, but old",
+			description: fmt.Sprintf("Files marked keep despite not being modified in over %s.", yearsPhrase(oldYears)),
+			roots:       filterReviewForest(roots, decided(decisionKeep, modifiedBefore(oldCutoff))),
+			expanded:    true,
+		},
+		{
+			file:        "review-undecided-old.html",
+			title:       "undecided and old",
+			description: fmt.Sprintf("Undecided files not modified in the last %s.", monthsPhrase(recentMonths)),
+			roots:       filterReviewForest(roots, decided(decisionNone, modifiedBefore(recentCutoff))),
+			expanded:    true,
+		},
+	}
+
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return fmt.Errorf("creating %s: %w", outDir, err)
+	}
+	for _, r := range reports {
+		data := buildReviewExport(r.roots, r.title, r.description, r.expanded)
+		path := filepath.Join(outDir, r.file)
+		if err := writeReviewReport(path, data); err != nil {
+			return err
+		}
+		fmt.Println(path)
+	}
+	return nil
+}
+
+// buildReviewExport tallies the (possibly filtered) forest and packages it for
+// the template.
+func buildReviewExport(roots []*reviewNode, title, description string, expanded bool) reviewExportData {
+	data := reviewExportData{Roots: roots, Title: title, Description: description, Expanded: expanded}
 	var tally func(n *reviewNode)
 	tally = func(n *reviewNode) {
 		if n.typ == typeFolder {
@@ -65,26 +154,95 @@ func runExportReview(dbPath, outPath string) error {
 	for _, r := range roots {
 		tally(r)
 	}
+	return data
+}
 
-	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
-		return fmt.Errorf("creating %s: %w", filepath.Dir(outPath), err)
-	}
-	f, err := os.Create(outPath)
+func writeReviewReport(path string, data reviewExportData) error {
+	f, err := os.Create(path)
 	if err != nil {
-		return fmt.Errorf("creating %s: %w", outPath, err)
+		return fmt.Errorf("creating %s: %w", path, err)
 	}
 	defer f.Close()
 	if err := reviewExportTemplate.Execute(f, data); err != nil {
-		return fmt.Errorf("rendering HTML: %w", err)
+		return fmt.Errorf("rendering %s: %w", path, err)
 	}
-	if err := f.Close(); err != nil {
-		return err
+	return f.Close()
+}
+
+// filterReviewForest returns a pruned deep copy of roots that keeps only the
+// files (non-folders) for which match is true, plus the folders on the path to
+// them; folders with no surviving descendant are dropped. Subtree/directFiles
+// tallies are recomputed on the copy so folder coloring and counts reflect the
+// filtered set. Returns nil when nothing matches.
+func filterReviewForest(roots []*reviewNode, match func(*reviewNode) bool) []*reviewNode {
+	var out []*reviewNode
+	for _, r := range roots {
+		if c := filterReviewNode(r, match); c != nil {
+			out = append(out, c)
+		}
 	}
-	fmt.Println(outPath)
-	return nil
+	for _, r := range out {
+		computeReviewCounts(r)
+	}
+	return out
+}
+
+func filterReviewNode(n *reviewNode, match func(*reviewNode) bool) *reviewNode {
+	if n.typ != typeFolder {
+		if match(n) {
+			cp := *n
+			cp.children = nil
+			return &cp
+		}
+		return nil
+	}
+	var kids []*reviewNode
+	for _, c := range n.children {
+		if fc := filterReviewNode(c, match); fc != nil {
+			kids = append(kids, fc)
+		}
+	}
+	if len(kids) == 0 {
+		return nil
+	}
+	cp := *n
+	cp.children = kids
+	cp.subtree = decisionCounts{}
+	cp.directFiles = decisionCounts{}
+	return &cp
+}
+
+// modTime parses the node's recorded last_modified (RFC3339). ok is false when
+// it is NULL, empty, or unparseable.
+func (n *reviewNode) modTime() (time.Time, bool) {
+	if !n.lastModified.Valid || n.lastModified.String == "" {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339, n.lastModified.String)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+func monthsPhrase(m int) string {
+	if m == 1 {
+		return "month"
+	}
+	return fmt.Sprintf("%d months", m)
+}
+
+func yearsPhrase(y int) string {
+	if y == 1 {
+		return "year"
+	}
+	return fmt.Sprintf("%d years", y)
 }
 
 type reviewExportData struct {
+	Title        string
+	Description  string
+	Expanded     bool
 	Roots        []*reviewNode
 	FileTotals   decisionCounts
 	FolderTotals decisionCounts
@@ -141,7 +299,7 @@ const reviewExportHTML = `<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Drive cleanup review</title>
+<title>Drive cleanup review — {{.Title}}</title>
 <style>
   :root { color-scheme: light dark;
           --red: #e53935; --green: #43a047; --yellow: #f9a825; }
@@ -150,6 +308,8 @@ const reviewExportHTML = `<!DOCTYPE html>
   header { margin-bottom: 1rem; }
   h1 { font-size: 1.25rem; margin: 0 0 .25rem; }
   .sub { color: #666; font-size: .9rem; }
+  .desc { color: #444; font-size: .9rem; margin: .1rem 0 .3rem; }
+  .empty { color: #666; font-style: italic; padding: 1rem .35rem; }
   .hint { color: #888; font-size: .8rem; margin-top: .5rem; }
   .legend { display: flex; flex-wrap: wrap; gap: .4rem 1rem; margin-top: .6rem; font-size: .8rem; color: #555; }
   .legend .sw { display: inline-block; width: .85rem; height: .85rem; border-radius: .2rem;
@@ -189,9 +349,10 @@ const reviewExportHTML = `<!DOCTYPE html>
   li[aria-expanded=true] > ul { display: block; }
 </style>
 </head>
-<body>
+<body{{if .Expanded}} data-expand-all{{end}}>
 <header>
-  <h1>Drive cleanup review — keep / delete plan</h1>
+  <h1>Drive cleanup review — {{.Title}}</h1>
+  {{if .Description}}<div class="desc">{{.Description}}</div>{{end}}
   <div class="sub">
     Folders: <b>{{.FolderTotals.Keep}}</b> keep · <b>{{.FolderTotals.Delete}}</b> delete · <b>{{.FolderTotals.Undecided}}</b> undecided
     &nbsp;|&nbsp;
@@ -208,9 +369,13 @@ const reviewExportHTML = `<!DOCTYPE html>
     Click a ▶ or row to expand. Keyboard: ↑/↓ move, →/← expand/collapse, Enter/Space toggles. ↗ opens the item in Google Drive.</div>
 </header>
 
+{{if .Roots}}
 <ul role="tree" aria-label="Cleanup review tree">
   {{range .Roots}}{{template "rnode" .}}{{end}}
 </ul>
+{{else}}
+<p class="empty">No matching files.</p>
+{{end}}
 
 {{define "rnode"}}
 <li role="treeitem"{{if .Children}} aria-expanded="false"{{end}}>
@@ -303,6 +468,12 @@ const reviewExportHTML = `<!DOCTYPE html>
     }
     e.preventDefault();
   });
+
+  if (document.body.hasAttribute('data-expand-all')) {
+    Array.prototype.forEach.call(tree.querySelectorAll('li[aria-expanded]'), function (li) {
+      li.setAttribute('aria-expanded', 'true');
+    });
+  }
 
   var first = tree.querySelector('.row');
   if (first) first.tabIndex = 0;

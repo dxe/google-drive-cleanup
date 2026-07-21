@@ -123,7 +123,10 @@ type reviewNode struct {
 	typ      string
 	decision string
 	parentID sql.NullInt64
-	children []*reviewNode
+	// lastModified is the estimated last-content-change time (RFC3339), only
+	// populated by `crawl --update-last-modified`; NULL/invalid otherwise.
+	lastModified sql.NullString
+	children     []*reviewNode
 	// subtree tallies decisions over the node itself plus every descendant.
 	subtree decisionCounts
 	// directFiles tallies decisions over the node's direct non-folder children.
@@ -134,7 +137,7 @@ type reviewNode struct {
 // first, then case-insensitive by name, like a file browser) and computes the
 // per-node decision tallies.
 func loadReviewForest(db *sql.DB) ([]*reviewNode, error) {
-	rows, err := db.Query(`SELECT id, drive_id, name, type, parent_id, decision FROM nodes`)
+	rows, err := db.Query(`SELECT id, drive_id, name, type, parent_id, decision, last_modified FROM nodes`)
 	if err != nil {
 		return nil, err
 	}
@@ -143,7 +146,7 @@ func loadReviewForest(db *sql.DB) ([]*reviewNode, error) {
 	all := make(map[int64]*reviewNode)
 	for rows.Next() {
 		var n reviewNode
-		if err := rows.Scan(&n.rowID, &n.driveID, &n.name, &n.typ, &n.parentID, &n.decision); err != nil {
+		if err := rows.Scan(&n.rowID, &n.driveID, &n.name, &n.typ, &n.parentID, &n.decision, &n.lastModified); err != nil {
 			return nil, err
 		}
 		all[n.rowID] = &n

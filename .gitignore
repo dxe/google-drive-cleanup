@@ -47,8 +47,7 @@ config.json
 # .vscode/
 
 # Generated files
-out/explore-owned-files/
-out/review.html
+out/**
 
 # Next.js review UI
 web/node_modules/
