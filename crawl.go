@@ -816,13 +816,14 @@ func (c *crawler) ownedByManualTransferAccount(f *drive.File) bool {
 // lastModifiedFor returns the value to store in nodes.last_modified for f, or ""
 // (recorded as NULL) when --update-last-modified is off. Normally this is
 // Drive's top-level modifiedTime, but for a file owned by a manual-ownership-
-// transfer account the most recent change is the manual transfer itself (which
-// permanently bumped modifiedTime), so we consult the Revisions API and prefer
-// the second-to-last revision's time as a better estimate of the last real
-// content edit. Non-manual transfers do not bump modifiedTime, so those files
-// keep it. It falls back to modifiedTime when the file has fewer than two
-// revisions or its history cannot be read (logged, not fatal — a single
-// unreadable file must not stall a crawl).
+// transfer account that modifiedTime is unreliable: the manual transfer
+// permanently bumped it even though the transfer was not a content edit.
+// Ownership transfers do not create a Drive revision, so the most recent
+// revision is the last real content edit — we consult the Revisions API and
+// prefer it. Non-manual transfers do not bump modifiedTime, so those files keep
+// it. It falls back to modifiedTime when the file has no revisions or its
+// history cannot be read (logged, not fatal — a single unreadable file must not
+// stall a crawl).
 func (c *crawler) lastModifiedFor(ctx context.Context, f *drive.File) string {
 	if !c.updateLastModified {
 		return ""
@@ -830,7 +831,7 @@ func (c *crawler) lastModifiedFor(ctx context.Context, f *drive.File) string {
 	// Revisions exist only for actual files; folders and shortcuts have none, so
 	// don't waste an API call on them.
 	if typ := classify(f.MimeType); (typ == typeGoogleDoc || typ == typeBinary) && c.ownedByManualTransferAccount(f) {
-		t, err := c.secondToLastRevisionTime(ctx, f.Id)
+		t, err := c.lastRevisionTime(ctx, f.Id)
 		switch {
 		case err == nil && t != "":
 			return t
@@ -842,9 +843,14 @@ func (c *crawler) lastModifiedFor(ctx context.Context, f *drive.File) string {
 	return f.ModifiedTime
 }
 
-// secondToLastRevisionTime returns the modifiedTime of the revision immediately
-// before the most recent one, or "" when the file has fewer than two revisions.
-func (c *crawler) secondToLastRevisionTime(ctx context.Context, fileID string) (string, error) {
+// lastRevisionTime returns the modifiedTime of the file's most recent revision,
+// or "" when it has no revisions. A revision is created only by a content change
+// (a new upload for binary files, an autosaved or named version for Google-
+// native files); metadata-only events such as an ownership transfer bump the
+// top-level modifiedTime without adding a revision. The newest revision is
+// therefore the last real content edit, whereas modifiedTime may reflect a
+// later transfer.
+func (c *crawler) lastRevisionTime(ctx context.Context, fileID string) (string, error) {
 	var revisions []*drive.Revision
 	pageToken := ""
 	for {
@@ -870,12 +876,13 @@ func (c *crawler) secondToLastRevisionTime(ctx context.Context, fileID string) (
 		}
 		pageToken = list.NextPageToken
 	}
-	if len(revisions) < 2 {
+	if len(revisions) == 0 {
 		return "", nil
 	}
-	// Drive returns revisions oldest-first, so the penultimate entry is the edit
-	// before the most recent change (the likely ownership transfer).
-	return revisions[len(revisions)-2].ModifiedTime, nil
+	// Drive returns revisions oldest-first, so the last entry is the most recent
+	// content edit — the value we want, since the ownership transfer that bumped
+	// modifiedTime did not itself create a revision.
+	return revisions[len(revisions)-1].ModifiedTime, nil
 }
 
 func joinKnown(ids []string, known map[string]bool) string {

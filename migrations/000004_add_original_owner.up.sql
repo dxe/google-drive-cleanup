@@ -13,7 +13,8 @@ UPDATE nodes SET original_owner_id = owner_id, original_owner_display_name = own
 -- of migration.manual-ownership-transfer-accounts. A manual ownership transfer
 -- through such an account permanently bumps the file's modifiedTime, so this flag
 -- marks that the top-level modifiedTime is superfluously new and the last real
--- edit must be read from the penultimate revision instead. Once set it is never
+-- edit must be read from the most recent revision instead (the transfer itself
+-- does not create a revision). Once set it is never
 -- cleared, since the modifiedTime bump is permanent. Defaults to 0 (no manual
 -- transfer observed).
 ALTER TABLE nodes ADD COLUMN manual_transfer_performed INTEGER NOT NULL DEFAULT 0;
