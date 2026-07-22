@@ -378,7 +378,7 @@ const reviewExportHTML = `<!DOCTYPE html>
 {{end}}
 
 {{define "rnode"}}
-<li role="treeitem"{{if .Children}} aria-expanded="false"{{end}}>
+<li role="treeitem"{{if .Children}} aria-expanded="false"{{if gt (len .Children) 6}} data-many{{end}}{{end}}>
   <div class="row st-{{.Status}}" tabindex="-1">
     {{if .Children}}<span class="twisty" aria-hidden="true">▶</span>{{else}}<span class="twisty leaf" aria-hidden="true">▶</span>{{end}}
     <span class="icon">{{if .IsFolder}}📁{{else if .IsShortcut}}↪️{{else}}📄{{end}}</span>
@@ -471,7 +471,8 @@ const reviewExportHTML = `<!DOCTYPE html>
 
   if (document.body.hasAttribute('data-expand-all')) {
     Array.prototype.forEach.call(tree.querySelectorAll('li[aria-expanded]'), function (li) {
-      li.setAttribute('aria-expanded', 'true');
+      // Leave folders with many children (data-many) collapsed by default.
+      if (!li.hasAttribute('data-many')) li.setAttribute('aria-expanded', 'true');
     });
   }
 
