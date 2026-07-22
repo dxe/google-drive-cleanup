@@ -123,8 +123,8 @@ type reviewNode struct {
 	typ      string
 	decision string
 	parentID sql.NullInt64
-	// lastModified is the estimated last-content-change time (RFC3339), only
-	// populated by `crawl --update-last-modified`; NULL/invalid otherwise.
+	// lastModified is the estimated last-content-change time (RFC3339), populated
+	// by `crawl`; NULL/invalid otherwise.
 	lastModified sql.NullString
 	children     []*reviewNode
 	// subtree tallies decisions over the node itself plus every descendant.

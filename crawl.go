@@ -61,9 +61,6 @@ type crawler struct {
 	limiter     *rate.Limiter
 	concurrency int // how many folders to list in parallel (see --concurrency)
 
-	// updateLastModified records each node's estimated last-content-change time
-	// into nodes.last_modified (see --update-last-modified). Off by default.
-	updateLastModified bool
 	// transferAccounts is the set of lower-cased ownership-transfer emails from
 	// config. The crawl keeps each node's original_owner_* pointed at the most
 	// recent owner that is NOT one of these, so once a file lands on a transfer
@@ -72,9 +69,9 @@ type crawler struct {
 	// manualTransferAccounts is the lower-cased subset of transferAccounts whose
 	// transfers are performed by hand. A file owned by one of these gets its
 	// manual_transfer_performed flag set (a manual transfer permanently bumps
-	// modifiedTime); with --update-last-modified its last_modified is estimated
-	// from the revision before the most recent one, since that most recent change
-	// was the ownership transfer rather than a content edit.
+	// modifiedTime), and its last_modified is read from the most recent revision
+	// rather than modifiedTime, since that most recent change was the ownership
+	// transfer — which leaves no revision — rather than a content edit.
 	manualTransferAccounts map[string]bool
 
 	// visited guards against listing a folder twice (a cycle or a second parent).
@@ -148,8 +145,7 @@ pruning stale rows under it alone. The folder must already exist in the snapshot
 		wipe, _ := cmd.Flags().GetBool("wipe")
 		subfolder, _ := cmd.Flags().GetString("folder")
 		concurrency, _ := cmd.Flags().GetInt("concurrency")
-		updateLastModified, _ := cmd.Flags().GetBool("update-last-modified")
-		return runCrawl(dbPath, cfgPath, refresh, wipe, subfolder, concurrency, updateLastModified)
+		return runCrawl(dbPath, cfgPath, refresh, wipe, subfolder, concurrency)
 	},
 }
 
@@ -166,10 +162,9 @@ func init() {
 	crawlCmd.Flags().Bool("wipe", false, "discard the previous crawl snapshot entirely and crawl from scratch")
 	crawlCmd.Flags().String("folder", "", "Drive folder ID (already crawled) to re-index in place, pruning stale rows under that subfolder only")
 	crawlCmd.Flags().Int("concurrency", defaultCrawlConcurrency, "how many folders to list in parallel (all still share the global rate limiter)")
-	crawlCmd.Flags().Bool("update-last-modified", false, "record each node's estimated last-content-change time in last_modified (consults the Revisions API for files owned by migration.manual-ownership-transfer-accounts)")
 }
 
-func runCrawl(dbPath, cfgPath string, refresh, wipe bool, subfolder string, concurrency int, updateLastModified bool) error {
+func runCrawl(dbPath, cfgPath string, refresh, wipe bool, subfolder string, concurrency int) error {
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
 		return err
@@ -217,14 +212,11 @@ func runCrawl(dbPath, cfgPath string, refresh, wipe bool, subfolder string, conc
 		limiter:                rate.NewLimiter(rate.Limit(20), 20),
 		concurrency:            concurrency,
 		visited:                make(map[string]bool),
-		updateLastModified:     updateLastModified,
 		transferAccounts:       transferAccountSet(cfg.Migration.OwnershipTransferAccounts),
 		manualTransferAccounts: transferAccountSet(cfg.Migration.ManualOwnershipTransferAccounts),
 	}
 
-	if updateLastModified {
-		log.Printf("--update-last-modified: recording last-content-change times (%d manual ownership-transfer account(s) configured)", len(c.manualTransferAccounts))
-	}
+	log.Printf("recording last-content-change times in last_modified (%d manual ownership-transfer account(s) configured)", len(c.manualTransferAccounts))
 
 	// --folder re-indexes one already-crawled subtree in place; it shares the
 	// Drive client and signal handling above but none of the whole-tree session
@@ -620,17 +612,15 @@ func (c *crawler) listFolder(ctx context.Context, f folderRef) ([]folderRef, err
 // when last is true the same transaction marks the parent children_done=1.
 func (c *crawler) commitPage(ctx context.Context, parent folderRef, files []*drive.File, last bool) ([]folderRef, error) {
 	// Resolve each file's last-content-change time before opening the
-	// transaction: for ownership-transfer-owned files this makes Revisions API
-	// calls, and network I/O must never happen while holding the single SQLite
-	// write connection. When --update-last-modified is off this is a no-op.
+	// transaction: for manual-ownership-transfer-owned files this makes Revisions
+	// API calls, and network I/O must never happen while holding the single
+	// SQLite write connection.
 	lastMod := make(map[string]string, len(files))
-	if c.updateLastModified {
-		for _, file := range files {
-			if err := ctx.Err(); err != nil {
-				return nil, err // interrupted; children_done stays 0 so a rerun retries
-			}
-			lastMod[file.Id] = c.lastModifiedFor(ctx, file)
+	for _, file := range files {
+		if err := ctx.Err(); err != nil {
+			return nil, err // interrupted; children_done stays 0 so a rerun retries
 		}
+		lastMod[file.Id] = c.lastModifiedFor(ctx, file)
 	}
 
 	tx, err := c.db.Begin()
@@ -813,21 +803,17 @@ func (c *crawler) ownedByManualTransferAccount(f *drive.File) bool {
 	return c.manualTransferAccounts[strings.ToLower(f.Owners[0].EmailAddress)]
 }
 
-// lastModifiedFor returns the value to store in nodes.last_modified for f, or ""
-// (recorded as NULL) when --update-last-modified is off. Normally this is
-// Drive's top-level modifiedTime, but for a file owned by a manual-ownership-
-// transfer account that modifiedTime is unreliable: the manual transfer
-// permanently bumped it even though the transfer was not a content edit.
-// Ownership transfers do not create a Drive revision, so the most recent
+// lastModifiedFor returns the value to store in nodes.last_modified for f.
+// Normally this is Drive's top-level modifiedTime, but for a file owned by a
+// manual-ownership-transfer account that modifiedTime is unreliable: the manual
+// transfer permanently bumped it even though the transfer was not a content
+// edit. Ownership transfers do not create a Drive revision, so the most recent
 // revision is the last real content edit — we consult the Revisions API and
 // prefer it. Non-manual transfers do not bump modifiedTime, so those files keep
 // it. It falls back to modifiedTime when the file has no revisions or its
 // history cannot be read (logged, not fatal — a single unreadable file must not
 // stall a crawl).
 func (c *crawler) lastModifiedFor(ctx context.Context, f *drive.File) string {
-	if !c.updateLastModified {
-		return ""
-	}
 	// Revisions exist only for actual files; folders and shortcuts have none, so
 	// don't waste an API call on them.
 	if typ := classify(f.MimeType); (typ == typeGoogleDoc || typ == typeBinary) && c.ownedByManualTransferAccount(f) {

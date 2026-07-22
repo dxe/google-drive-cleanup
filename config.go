@@ -81,10 +81,10 @@ type migrationConfig struct {
 	// ManualOwnershipTransferAccounts is the subset of OwnershipTransferAccounts
 	// whose transfers are performed by hand. A manual transfer permanently bumps
 	// the file's modifiedTime, so a file crawled while owned by one of these is
-	// flagged manual_transfer_performed, and `crawl --update-last-modified` reads
-	// its last real edit from the most recent revision rather than modifiedTime
-	// (an ownership transfer does not create a revision).
-	ManualOwnershipTransferAccounts []string `json:"manual-ownership-transfer-accounts" doc:"subset of ownership-transfer-accounts whose transfers bump modifiedTime; crawl --update-last-modified uses the most recent revision for their files"`
+	// flagged manual_transfer_performed, and `crawl` reads its last real edit from
+	// the most recent revision rather than modifiedTime (an ownership transfer
+	// does not create a revision).
+	ManualOwnershipTransferAccounts []string `json:"manual-ownership-transfer-accounts" doc:"subset of ownership-transfer-accounts whose transfers bump modifiedTime; crawl uses the most recent revision for their files"`
 }
 
 func loadConfig(path string) (config, error) {

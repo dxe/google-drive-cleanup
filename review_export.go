@@ -32,7 +32,7 @@ sent to teammates as-is. The files written are:
 
 The "recent" window and "old" threshold are configurable (see --recent-months
 and --old-years). The focused reports only include files whose last_modified is
-known (recorded by 'crawl --update-last-modified').`,
+known (recorded by 'crawl').`,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dbPath, _ := cmd.Flags().GetString("db")

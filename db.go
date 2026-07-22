@@ -94,9 +94,9 @@ type node struct {
 	shortcutTarget sql.NullString
 	canEdit        bool // whether the crawling account can edit the node
 	// lastModified is the estimated time of the node's last content change,
-	// recorded only by `crawl --update-last-modified`. When invalid (the common
-	// case), upsertNode leaves any existing value untouched (see the COALESCE
-	// below) rather than clearing it.
+	// recorded by every `crawl`. When invalid (only if the crawl could not
+	// determine a time), upsertNode leaves any existing value untouched (see the
+	// COALESCE below) rather than clearing it.
 	lastModified sql.NullString
 	// ownerIsTransfer reports whether ownerEmail is one of the configured
 	// ownership-transfer accounts. It decides how upsertNode updates the
@@ -165,9 +165,8 @@ func upsertNode(tx *sql.Tx, n node, setParent bool) (rowID int64, existed bool, 
 			children_done      = MAX(nodes.children_done, excluded.children_done),
 			can_edit           = excluded.can_edit,
 			crawled_at         = excluded.crawled_at,
-			-- Preserve any previously recorded last_modified when this crawl did
-			-- not compute one (--update-last-modified off), so a plain re-crawl
-			-- keeps the estimate rather than wiping it.
+			-- Preserve any previously recorded last_modified in the rare case this
+			-- crawl could not compute one, rather than wiping it.
 			last_modified      = COALESCE(excluded.last_modified, nodes.last_modified),
 			-- When this owner is a transfer account, keep the original owner already
 			-- on record (the last real owner); otherwise refresh it to this owner.
