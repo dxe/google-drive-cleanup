@@ -73,7 +73,7 @@ func init() {
 	rootCmd.PersistentFlags().String("config", "config.json", "path to the config JSON")
 	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "log every item touched, not just progress summaries and errors")
 
-	rootCmd.AddCommand(initCmd, crawlCmd, ownersCmd, pathCmd, checkEditAccessCmd, exploreCmd, packCmd, unpackCmd, reviewCmd, exportReviewCmd)
+	rootCmd.AddCommand(initCmd, crawlCmd, ownersCmd, pathCmd, checkEditAccessCmd, exploreCmd, packCmd, unpackCmd, reviewCmd, exportReviewCmd, keepRecentCmd)
 }
 
 func runPath(dbPath, driveID string) error {

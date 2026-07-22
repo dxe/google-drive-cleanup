@@ -734,9 +734,34 @@ func (s *reviewServer) applyMarkMany(req markManyRequest) (markResult, error) {
 	defer tx.Rollback()
 
 	rec := make(map[int64]string)
+	res, matched, err := markManyInTx(tx, req.DriveIDs, req.Decision, rec)
+	if err != nil {
+		return markResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return markResult{}, err
+	}
+	res.Changed = len(rec)
+	if len(rec) > 0 {
+		s.pushUndo(reviewUndoEntry{
+			label: fmt.Sprintf("%s %d files", decisionVerb(req.Decision), matched),
+			prev:  rec,
+		})
+	}
+	return res, nil
+}
+
+// markManyInTx bulk-marks the given files (non-folders) with decision inside tx,
+// maintaining the no-kept-item-inside-a-delete-subtree invariant and rolling up
+// their ancestor folders — the same logic the review UI's "all files" buttons
+// use. Touched nodes' previous decisions accumulate in rec for undo. Missing
+// drive IDs are skipped; a folder in the list is an error. It does not commit:
+// the caller owns the transaction. Returns the result and the number of files
+// matched (existing, non-folder).
+func markManyInTx(tx *sql.Tx, driveIDs []string, decision string, rec map[int64]string) (markResult, int, error) {
 	var targets []nodeBrief
 	parentSet := make(map[int64]bool)
-	for _, driveID := range req.DriveIDs {
+	for _, driveID := range driveIDs {
 		var (
 			n      nodeBrief
 			typ    string
@@ -748,60 +773,49 @@ func (s *reviewServer) applyMarkMany(req markManyRequest) (markResult, error) {
 			continue
 		}
 		if err != nil {
-			return markResult{}, err
+			return markResult{}, 0, err
 		}
 		if typ == typeFolder {
-			return markResult{}, fmt.Errorf("mark-many accepts files only; mark folders individually")
+			return markResult{}, 0, fmt.Errorf("mark-many accepts files only; mark folders individually")
 		}
 		targets = append(targets, n)
 		if parent.Valid {
 			parentSet[parent.Int64] = true
 		}
 	}
-	if err := applyDecision(tx, targets, req.Decision, rec); err != nil {
-		return markResult{}, err
+	if err := applyDecision(tx, targets, decision, rec); err != nil {
+		return markResult{}, 0, err
 	}
 	res := markResult{}
 	// Invariant fix + rollup share each file's ancestor chain, so run them
 	// once per distinct parent folder, not once per file. A kept/cleared file
 	// may not sit inside a delete subtree: un-mark the parent itself and any
 	// delete ancestors above it, then let the rollup re-decide the chain.
-	if req.Decision != decisionDelete {
+	if decision != decisionDelete {
 		for parent := range parentSet {
 			var pd string
 			if err := tx.QueryRow(`SELECT decision FROM nodes WHERE id = ?`, parent).Scan(&pd); err != nil {
-				return markResult{}, err
+				return markResult{}, 0, err
 			}
 			if pd == decisionDelete {
 				if err := applyDecision(tx, []nodeBrief{{parent, pd}}, decisionNone, rec); err != nil {
-					return markResult{}, err
+					return markResult{}, 0, err
 				}
 				res.ClearedAncestors++
 			}
 			cleared, err := clearDeleteAncestors(tx, parent, rec)
 			if err != nil {
-				return markResult{}, err
+				return markResult{}, 0, err
 			}
 			res.ClearedAncestors += cleared
 		}
 	}
 	for parent := range parentSet {
 		if err := rollupSelfAndAncestors(tx, parent, rec); err != nil {
-			return markResult{}, err
+			return markResult{}, 0, err
 		}
 	}
-
-	if err := tx.Commit(); err != nil {
-		return markResult{}, err
-	}
-	res.Changed = len(rec)
-	if len(rec) > 0 {
-		s.pushUndo(reviewUndoEntry{
-			label: fmt.Sprintf("%s %d files", decisionVerb(req.Decision), len(targets)),
-			prev:  rec,
-		})
-	}
-	return res, nil
+	return res, len(targets), nil
 }
 
 // rollupSelfAndAncestors auto-decides the given folder (if undecided and all
