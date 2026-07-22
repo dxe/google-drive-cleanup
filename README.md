@@ -155,6 +155,7 @@ drive-cleanup unpack someone@gmail.com --allow-not-moved
 
 # Serve the keep/delete review API locally (dev only, no auth), then run the
 # UI with `cd web && npm run dev` and open http://localhost:3000
+# Or use VS Code run/debug panel (launch.json).
 drive-cleanup review
 
 # Export the keep/delete decisions as one self-contained HTML file to send

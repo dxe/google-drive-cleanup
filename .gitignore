@@ -61,3 +61,6 @@ db-backups/**
 
 # Playwright MCP
 .playwright-mcp
+
+# Go
+__debug**
