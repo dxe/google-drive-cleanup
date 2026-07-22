@@ -537,7 +537,8 @@ func (c *crawler) upsertFolder(ctx context.Context, f *drive.File) error {
 		ownerID:               ownerID,
 		ownerDisplay:          display,
 		canEdit:               canEditOf(f),
-		lastModified:          nullString(c.lastModifiedFor(ctx, f)),
+		// Folders have no revisions, so the manual-transfer flag is irrelevant here.
+		lastModified:          nullString(c.lastModifiedFor(ctx, f, false)),
 		ownerIsTransfer:       c.emailIsTransferAccount(email),
 		ownerIsManualTransfer: c.emailIsManualTransferAccount(email),
 	}, false); err != nil {
@@ -612,15 +613,29 @@ func (c *crawler) listFolder(ctx context.Context, f folderRef) ([]folderRef, err
 // when last is true the same transaction marks the parent children_done=1.
 func (c *crawler) commitPage(ctx context.Context, parent folderRef, files []*drive.File, last bool) ([]folderRef, error) {
 	// Resolve each file's last-content-change time before opening the
-	// transaction: for manual-ownership-transfer-owned files this makes Revisions
-	// API calls, and network I/O must never happen while holding the single
-	// SQLite write connection.
+	// transaction: for manually-transferred files this makes Revisions API calls,
+	// and network I/O must never happen while holding the single SQLite write
+	// connection. A file counts as manually transferred when its persisted
+	// manual_transfer_performed flag is already set (from a past crawl, even if it
+	// has since moved to a non-manual account) or its current owner is a manual-
+	// ownership-transfer account — the same value the flag takes after this crawl's
+	// MAX(...) upsert below.
+	driveIDs := make([]string, len(files))
+	for i, file := range files {
+		driveIDs[i] = file.Id
+	}
+	existingManual, err := manualTransferPerformedByDriveID(c.db, driveIDs)
+	if err != nil {
+		return nil, fmt.Errorf("reading manual_transfer_performed flags: %w", err)
+	}
 	lastMod := make(map[string]string, len(files))
 	for _, file := range files {
 		if err := ctx.Err(); err != nil {
 			return nil, err // interrupted; children_done stays 0 so a rerun retries
 		}
-		lastMod[file.Id] = c.lastModifiedFor(ctx, file)
+		email, _, _ := ownerOf(file)
+		manualTransfer := existingManual[file.Id] || c.emailIsManualTransferAccount(email)
+		lastMod[file.Id] = c.lastModifiedFor(ctx, file, manualTransfer)
 	}
 
 	tx, err := c.db.Begin()
@@ -793,30 +808,22 @@ func (c *crawler) emailIsManualTransferAccount(email sql.NullString) bool {
 	return email.Valid && c.manualTransferAccounts[strings.ToLower(email.String)]
 }
 
-// ownedByManualTransferAccount reports whether f's owner is one of the configured
-// manual-ownership-transfer accounts — the case where the most recent change is
-// a manual ownership transfer that bumped modifiedTime rather than a content edit.
-func (c *crawler) ownedByManualTransferAccount(f *drive.File) bool {
-	if len(c.manualTransferAccounts) == 0 || len(f.Owners) == 0 || f.Owners[0] == nil {
-		return false
-	}
-	return c.manualTransferAccounts[strings.ToLower(f.Owners[0].EmailAddress)]
-}
-
 // lastModifiedFor returns the value to store in nodes.last_modified for f.
-// Normally this is Drive's top-level modifiedTime, but for a file owned by a
-// manual-ownership-transfer account that modifiedTime is unreliable: the manual
-// transfer permanently bumped it even though the transfer was not a content
-// edit. Ownership transfers do not create a Drive revision, so the most recent
-// revision is the last real content edit — we consult the Revisions API and
-// prefer it. Non-manual transfers do not bump modifiedTime, so those files keep
-// it. It falls back to modifiedTime when the file has no revisions or its
-// history cannot be read (logged, not fatal — a single unreadable file must not
-// stall a crawl).
-func (c *crawler) lastModifiedFor(ctx context.Context, f *drive.File) string {
+// Normally this is Drive's top-level modifiedTime, but when manualTransferPerformed
+// is set that modifiedTime is unreliable: a manual ownership transfer permanently
+// bumped it even though the transfer was not a content edit. Ownership transfers
+// do not create a Drive revision, so the most recent revision is the last real
+// content edit — we consult the Revisions API and prefer it. manualTransferPerformed
+// reflects the persisted manual_transfer_performed flag (set once a file is seen
+// under a manual-ownership-transfer account and never cleared, since the bump is
+// permanent) OR'd with the current owner being such an account, so it does not
+// depend on who owns the file now. It falls back to modifiedTime when the file
+// has no revisions or its history cannot be read (logged, not fatal — a single
+// unreadable file must not stall a crawl).
+func (c *crawler) lastModifiedFor(ctx context.Context, f *drive.File, manualTransferPerformed bool) string {
 	// Revisions exist only for actual files; folders and shortcuts have none, so
 	// don't waste an API call on them.
-	if typ := classify(f.MimeType); (typ == typeGoogleDoc || typ == typeBinary) && c.ownedByManualTransferAccount(f) {
+	if typ := classify(f.MimeType); manualTransferPerformed && (typ == typeGoogleDoc || typ == typeBinary) {
 		t, err := c.lastRevisionTime(ctx, f.Id)
 		switch {
 		case err == nil && t != "":

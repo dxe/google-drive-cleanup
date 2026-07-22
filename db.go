@@ -770,6 +770,42 @@ func nodeTypeByDriveID(db *sql.DB, driveID string) (string, error) {
 	return typ, err
 }
 
+// manualTransferPerformedByDriveID returns, for each of driveIDs already present
+// in the nodes table, whether its persisted manual_transfer_performed flag is
+// set. IDs not yet in the table (a file seen for the first time this crawl) are
+// simply absent from the map, which callers treat as false. The flag is sticky,
+// so a file manually transferred in a past crawl keeps it even after moving to a
+// non-manual account — which is exactly when its modifiedTime stays bogus and
+// last_modified must be read from revisions instead.
+func manualTransferPerformedByDriveID(db *sql.DB, driveIDs []string) (map[string]bool, error) {
+	flags := make(map[string]bool, len(driveIDs))
+	if len(driveIDs) == 0 {
+		return flags, nil
+	}
+	placeholders := make([]string, len(driveIDs))
+	args := make([]any, len(driveIDs))
+	for i, id := range driveIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	rows, err := db.Query(
+		`SELECT drive_id, manual_transfer_performed FROM nodes WHERE drive_id IN (`+
+			strings.Join(placeholders, ",")+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		var flag int
+		if err := rows.Scan(&id, &flag); err != nil {
+			return nil, err
+		}
+		flags[id] = flag != 0
+	}
+	return flags, rows.Err()
+}
+
 // exploreNode is one node in the ownership tree built by ownedAndAncestors:
 // every item the target account owns, plus the ancestor folders that hold them.
 type exploreNode struct {
