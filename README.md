@@ -113,6 +113,10 @@ crawl root — inside it, the archive would inherit the crawl root's sharing, an
 (after the crawl root) so archived files stay in the snapshot; the review UI,
 `keep-recent`, and `export-review` exclude it from decision marking.
 
+`migration.dropoff-folder` is required by `archive` and `delete` as well as by
+`pack`/`unpack`: both route internally-owned items through the shared drive it
+lives in to move their ownership to the org.
+
 `crawl.root.id` and `crawl.root.name` are both required. Before crawling, the
 tool fetches the folder from Drive and verifies it really is a folder **and**
 that its name exactly matches `name`. A mismatch aborts with both names
@@ -259,10 +263,11 @@ to realize something important is missing:
 `restore` reverses the archival of one file.
 
 The recommended order of operations is **crawl → pack/unpack → archive →
-delete**: transferring ownership to the org first (pack/unpack) means `delete`
-can remove most items directly instead of routing them through the dropoff
-shared drive. Packing and unpacking *after* archiving works too — the archive
-tree is part of the crawl snapshot, so archived files pack like any others.
+delete**: transferring ownership to the org first (pack/unpack) means `archive`
+and `delete` can act on most items directly instead of routing them through the
+dropoff shared drive file by file. Packing and unpacking *after* archiving works
+too — the archive tree is part of the crawl snapshot, so archived files pack
+like any others.
 Just treat `pack` and `unpack` as one atomic pair: don't archive between a pack
 and its unpack, while files sit in mid-migration scaffolding.
 
@@ -283,6 +288,33 @@ access **first** — it may only have access via a Google Group, and dropping
 that group's grant while holding no direct one would lock it out — and only
 once that grant is in place are the other grants revoked. The owner's
 permission and domain/anyone grants are left alone.
+
+A file **owned by another internal account** (an owner whose email ends in one
+of the `internal-domains`) is unsharable from that owner: an owner permission
+cannot be revoked. Those files therefore take a detour before they are archived:
+
+1. the file is moved into an `Archival pending` folder inside the dropoff shared
+   drive (`migration.dropoff-folder`), which transfers its ownership to the org;
+2. `archive` waits for that transfer to land — Drive applies it asynchronously,
+   file by file, the same lag `unpack` waits out after a Container drag, and a
+   file moved back out too early would land in the archive still owned by its
+   original owner. One listing of the pending folder answers "has it
+   transferred?" for the whole batch at once (a shared drive's files report no
+   owner), and the wait gives up on the remainder only once a full round brings
+   nothing new;
+3. the file then moves on into its archive replica, which makes the running
+   account its owner, and the previous owner's now-ordinary grant is revoked
+   with the rest of its individual permissions.
+
+The snapshot's `owner_*` columns follow the transfer; `original_owner_*` stays
+frozen at what the crawl discovered, as always. The `Archival pending` folder is
+removed again once the run leaves it empty; files still in it (a transfer that
+never landed, or an interrupted run) are reported, and re-running `archive`
+picks them up from there. This needs the Google Workspace privilege **"Move any
+file or folder into shared drives"** and **manager access on the dropoff shared
+drive** (to move files back out); the latter is checked before any file goes in.
+Externally-owned files are archived as before — their ownership cannot be taken
+over, so they keep it and their owner keeps access.
 
 Delete-marked **folders** are archived too once a live check shows them empty
 (descendants are archived before ancestors, so a folder's turn comes after its
@@ -305,7 +337,9 @@ confirmation prompt with counts. Ownership decides the mechanics:
   cannot be deleted directly, but moving an item into a shared drive flips its
   ownership to the org: they are moved into a `Deletion pending` folder inside
   the dropoff shared drive (`migration.dropoff-folder`), deleted there, and the
-  folder itself is removed once it empties. **This requires the Google
+  folder itself is removed once it empties. In practice this path now mostly
+  handles archived **folders**, which keep their owner — `archive` already took
+  ownership of internally-owned files on the way in. **This requires the Google
   Workspace privilege "Move any file or folder into shared drives"** for the
   OAuth user (or the admin enabling it for all users); without it these moves
   fail.
@@ -326,7 +360,9 @@ crawled folder's ID is accepted too and resolved to its replica.
 clears the archived state, and marks the item **keep** (so the next `archive`
 run doesn't immediately re-archive it). It fails loudly, changing nothing, if
 the original parent no longer exists. Permissions removed during archiving are
-not restored — re-share by hand if needed.
+not restored — re-share by hand if needed — and neither is ownership: a file
+whose ownership `archive` transferred to the org comes back owned by the running
+account.
 
 ## Migrating a user (`pack` / `unpack`)
 
@@ -568,7 +604,7 @@ Single `nodes` table (SQLite, pure-Go `modernc.org/sqlite` driver):
 | `name` | item name |
 | `type` | `folder`, `shortcut`, `google_doc` (native Google file), or `binary` |
 | `mime_type` | raw Drive mimeType, kept for debugging |
-| `owner_email` / `owner_id` / `owner_display_name` | owner identity; email can be missing, `owner_id` is the stable Drive permission id |
+| `owner_email` / `owner_id` / `owner_display_name` | current owner identity; email can be missing, `owner_id` is the stable Drive permission id. Updated when ownership moves to the org: by `unpack` after a Container drag, and by `archive` when it takes over an internally-owned file |
 | `parent_id` | row id of the folder this node was **discovered through** (NULL for the root) |
 | `shortcut_target_id` | for shortcuts, the Drive ID they point to (shortcuts are recorded, never followed) |
 | `children_done` | 1 once all children are fully listed — the resume unit |

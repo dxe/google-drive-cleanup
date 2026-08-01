@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"strings"
 	"testing"
+
+	"google.golang.org/api/drive/v3"
 )
 
 func TestReplicaName(t *testing.T) {
@@ -196,6 +198,58 @@ func TestMarkArchivedAndClear(t *testing.T) {
 	}
 	if origParent.Valid || parentID != aRow || skipped != 0 {
 		t.Errorf("after clearArchived: origParent=%v parent=%d skipped=%d, want NULL, A row %d, 0", origParent, parentID, skipped, aRow)
+	}
+}
+
+// Taking ownership of an internally-owned file (archive's detour through the
+// dropoff shared drive) moves the current-owner columns only; original_owner_*
+// stays frozen at whoever the crawl discovered.
+func TestSetNodeOwnerKeepsOriginalOwner(t *testing.T) {
+	db := testDB(t)
+	mustUpsert(t, db, node{driveID: "f1", name: "f1.pdf", typ: typeBinary, mimeType: "application/pdf",
+		ownerEmail: nullString("colleague@example.com"), ownerID: nullString("perm-colleague"),
+		ownerDisplay: nullString("A Colleague")})
+
+	if err := setNodeOwner(db, "f1", "me@example.com", "perm-me", "Me"); err != nil {
+		t.Fatal(err)
+	}
+	var email, id, display, origEmail, origID, origDisplay sql.NullString
+	if err := db.QueryRow(`
+		SELECT owner_email, owner_id, owner_display_name,
+		       original_owner_email, original_owner_id, original_owner_display_name
+		FROM nodes WHERE drive_id = 'f1'`).
+		Scan(&email, &id, &display, &origEmail, &origID, &origDisplay); err != nil {
+		t.Fatal(err)
+	}
+	if email.String != "me@example.com" || id.String != "perm-me" || display.String != "Me" {
+		t.Errorf("current owner = %v/%v/%v, want me@example.com/perm-me/Me", email, id, display)
+	}
+	if origEmail.String != "colleague@example.com" || origID.String != "perm-colleague" || origDisplay.String != "A Colleague" {
+		t.Errorf("original owner changed: %v/%v/%v", origEmail, origID, origDisplay)
+	}
+}
+
+// archive routes exactly the files owned by another account in the org through
+// the ownership-transfer detour: its own are already unsharable-free, and an
+// external owner's ownership cannot be taken over at all.
+func TestClassifyOwnerPicksInternalFiles(t *testing.T) {
+	me := &drive.User{EmailAddress: "me@example.com", PermissionId: "perm-me"}
+	domains := []string{"example.com"}
+	cases := []struct {
+		name string
+		t    archiveTarget
+		want ownerClass
+	}{
+		{"own email", archiveTarget{ownerEmail: nullString("ME@example.com")}, ownerMine},
+		{"own permission id", archiveTarget{ownerID: nullString("perm-me")}, ownerMine},
+		{"colleague in the org", archiveTarget{ownerEmail: nullString("colleague@example.com")}, ownerInternal},
+		{"other domain", archiveTarget{ownerEmail: nullString("stranger@other.com")}, ownerExternal},
+		{"unknown owner", archiveTarget{}, ownerExternal},
+	}
+	for _, c := range cases {
+		if got := classifyOwner(c.t, me, domains); got != c.want {
+			t.Errorf("classifyOwner(%s) = %d, want %d", c.name, got, c.want)
+		}
 	}
 }
 

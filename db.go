@@ -1339,6 +1339,18 @@ func updateSubtreeOwner(db *sql.DB, rootDriveID, fromAccount, email, permissionI
 	return res.RowsAffected()
 }
 
+// setNodeOwner overwrites one node's current-owner columns. Called by archive
+// after it takes ownership of an internally-owned file by routing it through the
+// dropoff shared drive, so the snapshot names the account that owns the archived
+// file now. The original_owner_* columns are deliberately untouched: they record
+// who held the file when the crawl discovered it and are never updated after.
+func setNodeOwner(db *sql.DB, driveID, email, permissionID, displayName string) error {
+	_, err := db.Exec(`
+		UPDATE nodes SET owner_email = ?, owner_id = ?, owner_display_name = ?
+		WHERE drive_id = ?`, email, permissionID, displayName, driveID)
+	return err
+}
+
 // originalParentDriveID returns the Drive ID of the folder the given file was
 // crawled under. Returns sql.ErrNoRows if the file is not in the database or
 // has no recorded parent (i.e. it is the crawl root).

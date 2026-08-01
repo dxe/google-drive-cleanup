@@ -111,7 +111,9 @@ func (s *restoreStats) processed() int {
 // a tree dragged moments ago can be only partially transferred (seen live:
 // five files deep in a dragged Container still owned by the migrating user
 // minutes later, while their siblings had flipped). Unpack polls until the
-// tree is clean before restoring; these bound the wait.
+// tree is clean before restoring; these bound the wait. Archive reuses them
+// for the same lag when it hands internally-owned files to the org through the
+// dropoff shared drive.
 const (
 	flipPollInterval = 15 * time.Second
 	flipWaitTimeout  = 5 * time.Minute

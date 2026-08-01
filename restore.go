@@ -28,7 +28,9 @@ marked delete would just re-archive it on the next archive run.
 
 The item is looked up by its Google Drive ID and must have been archived by
 this tool (the database records the original parent). Permissions removed
-during archiving are not restored; re-share the item by hand if needed.
+during archiving are not restored; re-share the item by hand if needed. Neither
+is ownership: a file whose ownership archive transferred to the org comes back
+owned by the running account.
 
 This command requires the full Drive scope. If the cached token.json only has
 read-only access, the tool re-runs consent automatically to obtain it.`,

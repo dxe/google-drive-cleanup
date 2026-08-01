@@ -5,10 +5,13 @@ package main
 // inside mirrors the crawl root's folder structure as "ARCH "-prefixed replica
 // folders, so an archived file remains findable by its original location and
 // name. Individually-added permissions on archived files are replaced with the
-// running account's own, so archived content stops being shared. Delete-marked
-// folders that are empty on Drive (their contents archived or gone) are
-// archived too, descendants before ancestors. The restore command reverses one
-// item; the delete command permanently deletes archived items.
+// running account's own, so archived content stops being shared. A file owned by
+// another INTERNAL account first takes a detour through an "Archival pending"
+// folder in the dropoff shared drive, which transfers its ownership to the org
+// so the original owner's access becomes removable too. Delete-marked folders
+// that are empty on Drive (their contents archived or gone) are archived too,
+// descendants before ancestors. The restore command reverses one item; the
+// delete command permanently deletes archived items.
 
 import (
 	"context"
@@ -18,6 +21,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/time/rate"
@@ -37,6 +41,13 @@ const (
 	// the file can still be moved by restore and delete.
 	archivedPermissionRole = "writer"
 )
+
+// archivalPendingFolderName is the working folder created inside the dropoff
+// shared drive for internally-owned files: moving a file there transfers its
+// ownership to the org, so the previous owner's access becomes an ordinary
+// grant instead of un-revokable ownership. Removed again when empty, like the
+// delete command's "Deletion pending".
+const archivalPendingFolderName = "Archival pending"
 
 // replicaName returns the archive replica folder name for an original folder
 // name: prefixed and rune-safely truncated.
@@ -58,6 +69,18 @@ name. Replica folders are created without the originals' sharing. After each
 file moves, its individually-added permissions (users and groups) are replaced
 with the running account's own, so the archived copy stops being shared; the
 running account is added first, and nothing is removed if that fails.
+
+A file owned by another internal account (config internal-domains) is first
+moved into an "Archival pending" folder inside the dropoff shared drive
+(migration.dropoff-folder), which transfers its ownership to the org; once Drive
+has applied that transfer — it is asynchronous, so archive polls until it lands
+(and gives up on a file only after the whole batch has stopped progressing) — the
+file moves on into the archive, owned by the running account, and its previous
+owner's access is revoked with the rest of its individual permissions. The
+folder is removed again when it ends up empty. This needs the Google Workspace
+privilege "Move any file or folder into shared drives" and manager access on
+the dropoff shared drive (see the README). Externally-owned files are archived
+as before: their ownership cannot be taken over, so they keep it.
 
 Delete-marked folders are archived too when a live check shows them empty
 (their contents already archived or gone) — descendants before ancestors, so a
@@ -100,13 +123,18 @@ type archiveStats struct {
 	moved   int
 	already int
 	skipped int
+	// handed counts internally-owned files handed to the org by moving them into
+	// the archival-pending folder, i.e. the ownership transfers this run started.
+	handed int
 }
 
 func (s *archiveStats) move()         { s.mu.Lock(); s.moved++; s.mu.Unlock() }
 func (s *archiveStats) alreadyThere() { s.mu.Lock(); s.already++; s.mu.Unlock() }
 func (s *archiveStats) skip()         { s.mu.Lock(); s.skipped++; s.mu.Unlock() }
+func (s *archiveStats) hand()         { s.mu.Lock(); s.handed++; s.mu.Unlock() }
 
-func (s *archiveStats) movedCount() int { s.mu.Lock(); defer s.mu.Unlock(); return s.moved }
+func (s *archiveStats) movedCount() int  { s.mu.Lock(); defer s.mu.Unlock(); return s.moved }
+func (s *archiveStats) handedCount() int { s.mu.Lock(); defer s.mu.Unlock(); return s.handed }
 
 // replicaRef is one resolved replica folder: its Drive ID and its nodes row.
 type replicaRef struct {
@@ -239,6 +267,12 @@ func runArchive(dbPath, cfgPath, subfolder string, dryRun bool, maxErrors, concu
 	if err := cfg.Archive.Root.validate("archive.root"); err != nil {
 		return fmt.Errorf("%s: %w", cfgPath, err)
 	}
+	// The dropoff folder is only needed for internally-owned files, but it is
+	// validated eagerly — as in delete — so a broken config fails before
+	// anything moves.
+	if err := cfg.Migration.DropoffFolder.validate("migration.dropoff-folder"); err != nil {
+		return fmt.Errorf("%s: %w", cfgPath, err)
+	}
 
 	db, err := openDB(dbPath)
 	if err != nil {
@@ -339,6 +373,29 @@ func runArchive(dbPath, cfgPath, subfolder string, dryRun bool, maxErrors, concu
 		return fmt.Errorf("archive folder %s (%q) is inside the crawl root %s; move it outside — inside, the archive inherits the crawl root's sharing", archiveFolder.Id, archiveFolder.Name, crawlRoot)
 	}
 
+	// Internally-owned files are archived by way of the dropoff shared drive (it
+	// is what makes their ownership transferable, see phase B), so it is resolved
+	// and checked up front even when this run turns out to have none.
+	dropoff, err := getConfiguredFolder(ctx, svc, cfg.Migration.DropoffFolder, "migration.dropoff-folder")
+	if err != nil {
+		return err
+	}
+	if dropoff.DriveId == "" {
+		return fmt.Errorf("dropoff folder %s is not in a shared drive; moving internally-owned files there would not transfer their ownership to the org", dropoff.Id)
+	}
+
+	// Files owned by another account in the org take the ownership-transfer
+	// detour; the rest (this account's own, and third parties' — whose ownership
+	// cannot be taken over) move straight into the archive.
+	var directF, internalF []archiveTarget
+	for _, t := range files {
+		if classifyOwner(t, me, cfg.InternalDomains) == ownerInternal {
+			internalF = append(internalF, t)
+		} else {
+			directF = append(directF, t)
+		}
+	}
+
 	// All Drive calls below share this one limiter; it — not the worker count —
 	// is the quota safety cap (see pack).
 	limiter := rate.NewLimiter(rate.Limit(20), 20)
@@ -347,12 +404,19 @@ func runArchive(dbPath, cfgPath, subfolder string, dryRun bool, maxErrors, concu
 	if subfolder != "" {
 		scopeNote = fmt.Sprintf(" under subfolder %q", subfolderPath)
 	}
+	// internalNote spells out the ownership-transfer detour when this run has
+	// files that need it.
+	internalNote := ""
+	if len(internalF) > 0 {
+		internalNote = fmt.Sprintf("\n%d of those file(s) are owned by other internal accounts: each goes through %q in the dropoff shared drive %q first, so its ownership transfers to the org and it reaches the archive owned by %s.",
+			len(internalF), archivalPendingFolderName, dropoff.Name, me.EmailAddress)
+	}
 	if dryRun {
-		fmt.Fprintf(os.Stderr, "DRY RUN: no changes will be made. Would archive %d file(s) and %d empty folder(s) marked delete%s into %q.\n",
-			len(files), len(folders), scopeNote, archiveFolder.Name)
+		fmt.Fprintf(os.Stderr, "DRY RUN: no changes will be made. Would archive %d file(s) and %d empty folder(s) marked delete%s into %q.%s\n",
+			len(files), len(folders), scopeNote, archiveFolder.Name, internalNote)
 	} else {
-		fmt.Fprintf(os.Stderr, "About to archive %d file(s) and up to %d folder(s) marked delete%s into %q (%s), replacing archived files' individually-added permissions.\n",
-			len(files), len(folders), scopeNote, archiveFolder.Name, archiveFolder.Id)
+		fmt.Fprintf(os.Stderr, "About to archive %d file(s) and up to %d folder(s) marked delete%s into %q (%s), replacing archived files' individually-added permissions.%s\n",
+			len(files), len(folders), scopeNote, archiveFolder.Name, archiveFolder.Id, internalNote)
 		if !promptYesNo("Continue? [y/N] ") {
 			fmt.Fprintln(os.Stderr, "Aborted.")
 			return nil
@@ -406,17 +470,58 @@ func runArchive(dbPath, cfgPath, subfolder string, dryRun bool, maxErrors, concu
 	}
 	prog := newProgress()
 
+	// archivalPending lazily finds or creates the working folder in the dropoff
+	// shared drive, verifying up front that the account can move items back out
+	// of that drive again — without manager access every file handed to the org
+	// would strand in there. Created only if an internally-owned file needs it.
+	var archivalPending *drive.File
+	ensureArchivalPending := func(ctx context.Context) (*drive.File, error) {
+		if archivalPending != nil {
+			return archivalPending, nil
+		}
+		f, err := findChildFolder(ctx, svc, limiter, dropoff.Id, archivalPendingFolderName)
+		if err != nil {
+			return nil, fmt.Errorf("looking up %q in %q: %w", archivalPendingFolderName, dropoff.Name, err)
+		}
+		if f == nil {
+			if f, err = rec.createFolder(ctx, svc, limiter, dropoff.Id, archivalPendingFolderName); err != nil {
+				return nil, fmt.Errorf("creating %q in %q: %w", archivalPendingFolderName, dropoff.Name, err)
+			}
+		}
+		state, err := svc.Files.Get(f.Id).
+			Fields("id, capabilities(canMoveItemOutOfDrive)").
+			SupportsAllDrives(true).Context(ctx).Do()
+		if err != nil {
+			return nil, fmt.Errorf("fetching %q (%s): %w", archivalPendingFolderName, f.Id, err)
+		}
+		if state.Capabilities != nil && !state.Capabilities.CanMoveItemOutOfDrive {
+			return nil, fmt.Errorf("%s cannot move items out of the shared drive %s holding %q; it needs manager access there to archive internally-owned files",
+				me.EmailAddress, dropoff.DriveId, dropoff.Name)
+		}
+		archivalPending = f
+		return f, nil
+	}
+
 	// archiveOne moves one item into its parent's replica and records the
-	// archival. Moves are optimistic (one files.update, removing the recorded
-	// parent); a failure is diagnosed from the item's live state, pack-style.
-	// Reports whether the item ended up archived (moved or already there).
-	archiveOne := func(t archiveTarget) bool {
+	// archival. Moves are optimistic (one files.update, removing fromParent —
+	// normally the recorded parent, the archival-pending folder for a file coming
+	// back out of the shared drive); a failure is diagnosed from the item's live
+	// state, pack-style. Reports whether the item ended up archived (moved or
+	// already there).
+	archiveOne := func(t archiveTarget, fromParent string, outOfSharedDrive bool) bool {
 		parent := t.parentDriveID.String
 		replica, ok := resolver.verified[parent]
 		if !ok { // resolved up front; missing means the pre-phase was interrupted
 			return false
 		}
-		err := rec.moveFile(moveCtx, svc, limiter, t.driveID, replica.driveID, parent)
+		// A move out of the shared drive is parent-verified: that is the one move
+		// Drive has been seen to report as successful while silently dropping the
+		// item at the mover's My Drive root (see moveFileVerified).
+		move := rec.moveFile
+		if outOfSharedDrive {
+			move = rec.moveFileVerified
+		}
+		err := move(moveCtx, svc, limiter, t.driveID, replica.driveID, fromParent)
 		if err == nil {
 			detailf("OK %s %q (%s) -> archive", t.typ, t.name, t.driveID)
 			if merr := markArchived(db, t.driveID, parent, replica.rowID); merr != nil {
@@ -455,7 +560,7 @@ func runArchive(dbPath, cfgPath, subfolder string, dryRun bool, maxErrors, concu
 		default:
 			// The recorded parent is stale (the item moved since the crawl);
 			// retry from its live parents.
-			if merr := rec.moveFile(moveCtx, svc, limiter, t.driveID, replica.driveID, strings.Join(f.Parents, ",")); merr != nil {
+			if merr := move(moveCtx, svc, limiter, t.driveID, replica.driveID, strings.Join(f.Parents, ",")); merr != nil {
 				if moveCtx.Err() != nil {
 					return false
 				}
@@ -482,11 +587,19 @@ func runArchive(dbPath, cfgPath, subfolder string, dryRun bool, maxErrors, concu
 		return archiveFolder.Name + "/" + rel + " (as ARCH replicas)"
 	}
 
-	// Phase A: files, concurrently. Permission replacement happens per file
-	// right after its move, so an interrupted run leaves no moved-but-shared
-	// stragglers beyond the items in flight.
-	forEachConcurrent(moveCtx, workers, files, func(t archiveTarget) {
-		prog.tick("progress: %d/%d file(s) archived", stats.movedCount(), len(files))
+	// interrupted reports the tallies of a run cut short by Ctrl-C.
+	interrupted := func() {
+		log.Printf("interrupted: %d archived, %d already archived, %d handed to the org, %d skipped, %d failed",
+			stats.moved, stats.already, stats.handed, stats.skipped, stats.failed)
+	}
+
+	// Phase A: files this account owns, plus externally-owned ones whose
+	// ownership cannot be taken over — straight into the archive, concurrently.
+	// Permission replacement happens per file right after its move, so an
+	// interrupted run leaves no moved-but-shared stragglers beyond the items in
+	// flight.
+	forEachConcurrent(moveCtx, workers, directF, func(t archiveTarget) {
+		prog.tick("progress: %d/%d file(s) archived", stats.movedCount(), len(directF))
 		if dryRun {
 			log.Printf("WOULD move %s %q (%s) into %q", t.typ, t.name, t.driveID, destination(t))
 			if t.canEdit {
@@ -495,7 +608,7 @@ func runArchive(dbPath, cfgPath, subfolder string, dryRun bool, maxErrors, concu
 			stats.move()
 			return
 		}
-		if !archiveOne(t) {
+		if !archiveOne(t, t.parentDriveID.String, false) {
 			return
 		}
 		if t.canEdit {
@@ -503,14 +616,203 @@ func runArchive(dbPath, cfgPath, subfolder string, dryRun bool, maxErrors, concu
 		}
 	})
 	if ctx.Err() != nil {
-		log.Printf("interrupted: %d archived, %d already archived, %d skipped, %d failed", stats.moved, stats.already, stats.skipped, stats.failed)
+		interrupted()
 		return ctx.Err()
 	}
 	if stats.aborted {
 		return stats.err
 	}
 
-	// Phase B: folders, sequentially and deepest-first — a folder is archived
+	// Phase B: files owned by other internal accounts. Such an owner cannot be
+	// unshared — an owner permission is not revokable — so the file detours
+	// through the archival-pending folder in the dropoff shared drive: the move
+	// in transfers ownership to the org, the move back out into the archive makes
+	// the running account the owner, and the previous owner is left holding an
+	// ordinary grant that replaceDirectPermissions revokes with the rest.
+	if len(internalF) > 0 && moveCtx.Err() == nil {
+		if dryRun {
+			for _, t := range internalF {
+				log.Printf("WOULD move %s %q (%s), owned by %s, into %q in the dropoff shared drive %q to transfer its ownership to the org, wait for the transfer, then move it into %q owned by %s",
+					t.typ, t.name, t.driveID, t.ownerEmail.String, archivalPendingFolderName, dropoff.Name, destination(t), me.EmailAddress)
+				log.Printf("WOULD replace individually-added permissions on %q with %s", t.name, me.EmailAddress)
+				stats.hand()
+				stats.move()
+			}
+		} else if pending, perr := ensureArchivalPending(moveCtx); perr != nil {
+			stats.fail("ERROR preparing %q: %v", archivalPendingFolderName, perr)
+		} else {
+			// B1: hand each file to the org by moving it into the pending folder.
+			// handed collects what got there and still needs its transfer to land;
+			// ready collects files an interrupted run already carried past it.
+			var listMu sync.Mutex
+			var handed, ready []archiveTarget
+			addHanded := func(t archiveTarget) {
+				listMu.Lock()
+				handed = append(handed, t)
+				listMu.Unlock()
+				stats.hand()
+			}
+			addReady := func(t archiveTarget) { listMu.Lock(); ready = append(ready, t); listMu.Unlock() }
+			forEachConcurrent(moveCtx, workers, internalF, func(t archiveTarget) {
+				prog.tick("progress: %d/%d internally-owned file(s) handed to the org", stats.handedCount(), len(internalF))
+				err := rec.moveFileVerified(moveCtx, svc, limiter, t.driveID, pending.Id, t.parentDriveID.String)
+				if err == nil {
+					detailf("OK %q (%s) -> %q (ownership transferring to the org)", t.name, t.driveID, archivalPendingFolderName)
+					addHanded(t)
+					return
+				}
+				if moveCtx.Err() != nil {
+					return
+				}
+				f, gerr := getFileState(moveCtx, svc, limiter, t.driveID)
+				if moveCtx.Err() != nil {
+					return
+				}
+				replica, haveReplica := resolver.verified[t.parentDriveID.String]
+				switch {
+				case isNotFound(gerr):
+					log.Printf("SKIP %q (%s): no longer exists", t.name, t.driveID)
+					stats.skip()
+				case gerr != nil:
+					stats.fail("ERROR %q (%s): move into %q failed (%v) and live lookup failed (%v)", t.name, t.driveID, archivalPendingFolderName, err, gerr)
+				case f.Trashed:
+					log.Printf("SKIP %q (%s): trashed since the crawl", t.name, t.driveID)
+					stats.skip()
+				case hasParent(f, pending.Id):
+					// A previous run already handed it over; wait for its transfer.
+					detailf("OK %q (%s): already in %q", t.name, t.driveID, archivalPendingFolderName)
+					addHanded(t)
+				case haveReplica && hasParent(f, replica.driveID):
+					// A previous run got it all the way into the archive but was cut
+					// short before recording it; B3 finishes the bookkeeping.
+					addReady(t)
+				default:
+					// The recorded parent is stale (the file moved since the crawl);
+					// retry from its live parents.
+					if merr := rec.moveFileVerified(moveCtx, svc, limiter, t.driveID, pending.Id, strings.Join(f.Parents, ",")); merr != nil {
+						if moveCtx.Err() == nil {
+							stats.fail("ERROR moving %q (%s) into %q: %v (this needs the Workspace privilege \"Move any file or folder into shared drives\")",
+								t.name, t.driveID, archivalPendingFolderName, merr)
+						}
+						return
+					}
+					detailf("OK %q (%s) -> %q (from live parent %v)", t.name, t.driveID, archivalPendingFolderName, f.Parents)
+					addHanded(t)
+				}
+			})
+
+			// B2: wait for Drive to apply the ownership transfer, which it does
+			// asynchronously and file by file — the same lag unpack waits out after
+			// a Container drag. Moving a file back out too early would return it to
+			// My Drive still owned by its original owner, whose access could then
+			// not be removed. A file the shared drive holds reports no owner at all,
+			// so one listing of the pending folder answers this for the whole batch
+			// (thousands of files at a time, far too many to ask about one by one).
+			// The listing can lag, but only toward the OLD owner — it cannot report
+			// a transfer that has not happened — so a file it reports as ownerless
+			// really is transferred; a file it does not mention yet is asked about
+			// directly, which is also how one that vanished gets noticed.
+			//
+			// The timeout is a no-progress window, not a total: a large batch can
+			// legitimately take many rounds to trickle through, and each round that
+			// transfers something is a reason to keep waiting.
+			for lastProgress := time.Now(); len(handed) > 0 && moveCtx.Err() == nil; {
+				children, lerr := listChildren(moveCtx, svc, limiter, pending.Id, "nextPageToken, files(id, owners(emailAddress))")
+				if lerr != nil && moveCtx.Err() == nil {
+					log.Printf("WARN listing %q: %v; checking each file individually instead", archivalPendingFolderName, lerr)
+				}
+				stillOwnedByID := make(map[string]bool, len(children))
+				for _, c := range children {
+					stillOwnedByID[c.Id] = len(c.Owners) > 0
+				}
+				var stillOwned []archiveTarget
+				progressed := 0
+				for _, t := range handed {
+					if moveCtx.Err() != nil {
+						stillOwned = append(stillOwned, t)
+						continue
+					}
+					if hasOwner, listed := stillOwnedByID[t.driveID]; listed {
+						if hasOwner {
+							stillOwned = append(stillOwned, t)
+						} else {
+							ready = append(ready, t)
+							progressed++
+						}
+						continue
+					}
+					// Not in the listing yet; ask about the file itself.
+					f, gerr := getFileState(moveCtx, svc, limiter, t.driveID)
+					switch {
+					case moveCtx.Err() != nil:
+						stillOwned = append(stillOwned, t)
+					case isNotFound(gerr):
+						log.Printf("SKIP %q (%s): no longer exists", t.name, t.driveID)
+						stats.skip()
+					case gerr != nil:
+						stats.fail("ERROR checking the ownership transfer of %q (%s): %v", t.name, t.driveID, gerr)
+					case f.Trashed:
+						log.Printf("SKIP %q (%s): trashed since it was moved into %q", t.name, t.driveID, archivalPendingFolderName)
+						stats.skip()
+					case len(f.Owners) == 0:
+						ready = append(ready, t)
+						progressed++
+					default:
+						stillOwned = append(stillOwned, t)
+					}
+				}
+				handed = stillOwned
+				if len(handed) == 0 || moveCtx.Err() != nil {
+					break
+				}
+				if progressed > 0 {
+					lastProgress = time.Now()
+				} else if time.Since(lastProgress) > flipWaitTimeout {
+					break
+				}
+				log.Printf("%d file(s) in %q are still owned by their original owner; the ownership transfer is still propagating — rechecking in %v",
+					len(handed), archivalPendingFolderName, flipPollInterval)
+				select {
+				case <-moveCtx.Done():
+				case <-time.After(flipPollInterval):
+				}
+			}
+
+			// B3: move each transferred file out of the shared drive into its
+			// archive replica — that move makes the running account the owner — and
+			// unshare it. The snapshot's owner columns follow the transfer; the
+			// original_owner_* columns stay frozen at what the crawl discovered.
+			base := stats.movedCount()
+			forEachConcurrent(moveCtx, workers, ready, func(t archiveTarget) {
+				prog.tick("progress: %d/%d transferred file(s) archived", stats.movedCount()-base, len(ready))
+				if !archiveOne(t, pending.Id, true) {
+					return
+				}
+				if err := setNodeOwner(db, t.driveID, me.EmailAddress, me.PermissionId, me.DisplayName); err != nil {
+					log.Printf("WARN recording %s as the new owner of %q (%s): %v", me.EmailAddress, t.name, t.driveID, err)
+				}
+				// The account owns the file now, so its permissions are ours to
+				// replace whatever the crawl recorded in can_edit.
+				replaceDirectPermissions(moveCtx, svc, limiter, rec, t.driveID, t.name, me)
+			})
+
+			// Whatever never transferred stays in the pending folder; a re-run finds
+			// it there and carries on (its row is still unarchived).
+			for _, t := range handed {
+				stats.fail("ERROR %q (%s) is still owned by %s after %v without progress in %q; its ownership transfer has not landed and the file is stranded there — re-run archive to finish it",
+					t.name, t.driveID, t.ownerEmail.String, flipWaitTimeout, archivalPendingFolderName)
+			}
+		}
+	}
+	if ctx.Err() != nil {
+		interrupted()
+		return ctx.Err()
+	}
+	if stats.aborted {
+		return stats.err
+	}
+
+	// Phase C: folders, sequentially and deepest-first — a folder is archived
 	// only once a live check shows it empty, which requires its own contents
 	// (deeper in the list) to have been archived first. Folders keep their
 	// permissions.
@@ -541,22 +843,37 @@ func runArchive(dbPath, cfgPath, subfolder string, dryRun bool, maxErrors, concu
 			stats.skip()
 			continue
 		}
-		archiveOne(t)
+		archiveOne(t, t.parentDriveID.String, false)
 	}
 	if ctx.Err() != nil {
-		log.Printf("interrupted: %d archived, %d already archived, %d skipped, %d failed", stats.moved, stats.already, stats.skipped, stats.failed)
+		interrupted()
 		return ctx.Err()
 	}
 	if stats.aborted {
 		return stats.err
 	}
 
+	// Remove the archival-pending folder again once it was used and a live
+	// listing confirms nothing is stranded in it. Skipped when the run aborted
+	// above: then something probably is.
+	if archivalPending != nil && moveCtx.Err() == nil {
+		if empty, err := folderIsEmpty(moveCtx, svc, limiter, archivalPending.Id); err != nil {
+			log.Printf("WARN checking %q: %v", archivalPendingFolderName, err)
+		} else if !empty {
+			log.Printf("%q is not empty (stranded files, or Drive's listing lags recent moves); leaving it", archivalPendingFolderName)
+		} else if err := rec.deleteFile(moveCtx, svc, limiter, archivalPending.Id); err != nil {
+			log.Printf("WARN removing empty %q folder: %v", archivalPendingFolderName, err)
+		} else {
+			detailf("OK removed empty %q folder", archivalPendingFolderName)
+		}
+	}
+
 	verb := "archived"
 	if dryRun {
 		verb = "would be archived"
 	}
-	log.Printf("done: %d item(s) %s (%d already archived), %d skipped, %d failed",
-		stats.moved, verb, stats.already, stats.skipped, stats.failed)
+	log.Printf("done: %d item(s) %s (%d already archived, %d via %q for ownership transfer), %d skipped, %d failed",
+		stats.moved, verb, stats.already, stats.handed, archivalPendingFolderName, stats.skipped, stats.failed)
 	if stats.failed > 0 {
 		return fmt.Errorf("%d item(s) failed; re-run archive to retry", stats.failed)
 	}
