@@ -79,6 +79,13 @@ func (l *opLog) moveFileVerified(ctx context.Context, svc *drive.Service, limite
 	return err
 }
 
+func (l *opLog) removeFromParent(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, fileID, removeParents string) error {
+	started := now()
+	err := removeFromParent(ctx, svc, limiter, fileID, removeParents)
+	l.record("remove_parent", fileID, "", removeParents, "", "", started, err)
+	return err
+}
+
 func (l *opLog) deleteFile(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, fileID string) error {
 	started := now()
 	err := deleteFile(ctx, svc, limiter, fileID)

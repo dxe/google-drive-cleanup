@@ -194,14 +194,22 @@ func listChildren(ctx context.Context, svc *drive.Service, limiter *rate.Limiter
 	}
 }
 
+// escapeDriveQuery escapes a string for embedding in a files.list q clause:
+// backslashes and single quotes get a leading backslash, per the Drive API's
+// query grammar.
+func escapeDriveQuery(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	return strings.ReplaceAll(s, `'`, `\'`)
+}
+
 // findChildFolder returns the (first) non-trashed subfolder of parentID named
-// name, or nil if none exists. name must not contain single quotes.
+// name, or nil if none exists.
 func findChildFolder(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, parentID, name string) (*drive.File, error) {
 	if err := limiter.Wait(ctx); err != nil {
 		return nil, err
 	}
 	list, err := svc.Files.List().
-		Q(fmt.Sprintf("'%s' in parents and name = '%s' and mimeType = '%s' and trashed = false", parentID, name, folderMimeType)).
+		Q(fmt.Sprintf("'%s' in parents and name = '%s' and mimeType = '%s' and trashed = false", parentID, escapeDriveQuery(name), folderMimeType)).
 		Fields("files(id, name)").
 		SupportsAllDrives(true).IncludeItemsFromAllDrives(true).
 		PageSize(10).
@@ -301,17 +309,16 @@ func moveFileVerified(ctx context.Context, svc *drive.Service, limiter *rate.Lim
 	return confirmParent(ctx, svc, limiter, fileID, addParent)
 }
 
-// findUserPermission returns email's existing permission on fileID
-// (case-insensitive), or nil if none. Used to make granting idempotent so a
-// re-run does not re-notify the user.
-func findUserPermission(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, fileID, email string) (*drive.Permission, error) {
+// listPermissions returns every permission on fileID, paginated.
+func listPermissions(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, fileID string) ([]*drive.Permission, error) {
+	var out []*drive.Permission
 	pageToken := ""
 	for {
 		if err := limiter.Wait(ctx); err != nil {
 			return nil, err
 		}
 		call := svc.Permissions.List(fileID).
-			Fields("nextPageToken, permissions(id, type, emailAddress, role)").
+			Fields("nextPageToken, permissions(id, type, emailAddress, role, deleted)").
 			SupportsAllDrives(true).
 			PageSize(100).
 			Context(ctx)
@@ -322,16 +329,28 @@ func findUserPermission(ctx context.Context, svc *drive.Service, limiter *rate.L
 		if err != nil {
 			return nil, err
 		}
-		for _, p := range list.Permissions {
-			if p.Type == "user" && strings.EqualFold(p.EmailAddress, email) {
-				return p, nil
-			}
-		}
+		out = append(out, list.Permissions...)
 		if list.NextPageToken == "" {
-			return nil, nil
+			return out, nil
 		}
 		pageToken = list.NextPageToken
 	}
+}
+
+// findUserPermission returns email's existing permission on fileID
+// (case-insensitive), or nil if none. Used to make granting idempotent so a
+// re-run does not re-notify the user.
+func findUserPermission(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, fileID, email string) (*drive.Permission, error) {
+	perms, err := listPermissions(ctx, svc, limiter, fileID)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range perms {
+		if p.Type == "user" && strings.EqualFold(p.EmailAddress, email) {
+			return p, nil
+		}
+	}
+	return nil, nil
 }
 
 // grantPermission grants email the given role on fileID. role uses the Drive
@@ -360,6 +379,41 @@ func deleteFile(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, 
 	return withRetry(ctx, limiter, "files.delete "+fileID, func() error {
 		return svc.Files.Delete(fileID).SupportsAllDrives(true).Context(ctx).Do()
 	})
+}
+
+// removeFromParent detaches fileID from removeParents (comma-separated parent
+// IDs) WITHOUT adding a new parent: Drive relocates the item to its owner's My
+// Drive, permissions intact. Used by delete --remove-unowned to hand an
+// externally-owned file back to its owner.
+func removeFromParent(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, fileID, removeParents string) error {
+	return withRetry(ctx, limiter, "files.update remove-parent "+fileID, func() error {
+		_, err := svc.Files.Update(fileID, nil).
+			RemoveParents(removeParents).
+			SupportsAllDrives(true).
+			Fields("id").
+			Context(ctx).Do()
+		return err
+	})
+}
+
+// folderIsEmpty reports whether folderID has no non-trashed children (a single
+// files.list page of size 1). NOTE files.list is eventually consistent: a
+// just-emptied folder may briefly still report a child. Callers treat "not
+// empty" as skip-and-retry-later, never as an error.
+func folderIsEmpty(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, folderID string) (bool, error) {
+	if err := limiter.Wait(ctx); err != nil {
+		return false, err
+	}
+	list, err := svc.Files.List().
+		Q(fmt.Sprintf("'%s' in parents and trashed = false", folderID)).
+		Fields("files(id)").
+		SupportsAllDrives(true).IncludeItemsFromAllDrives(true).
+		PageSize(1).
+		Context(ctx).Do()
+	if err != nil {
+		return false, err
+	}
+	return len(list.Files) == 0, nil
 }
 
 // getFileState fetches the live parents, owner, and trashed flag of one item.

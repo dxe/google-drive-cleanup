@@ -1112,11 +1112,21 @@ func subtreeDriveIDs(db *sql.DB, rootDriveID string) (map[string]bool, error) {
 	return ids, rows.Err()
 }
 
-// crawlRootDriveID returns the Drive ID of the crawl root (the node with no
-// parent). Returns sql.ErrNoRows if the database is empty.
+// crawlRootDriveID returns the Drive ID of the crawl root. The authoritative
+// record is crawl_meta (the tree the snapshot describes); a database from
+// before crawl_meta existed falls back to the oldest parentless node. "The"
+// parentless node alone is no longer authoritative because the archive tree,
+// when configured, is crawled as a second parentless root.
 func crawlRootDriveID(db *sql.DB) (string, error) {
 	var id string
-	err := db.QueryRow(`SELECT drive_id FROM nodes WHERE parent_id IS NULL LIMIT 1`).Scan(&id)
+	err := db.QueryRow(`SELECT root_drive_id FROM crawl_meta WHERE id = 1`).Scan(&id)
+	if err == nil {
+		return id, nil
+	}
+	if err != sql.ErrNoRows {
+		return "", err
+	}
+	err = db.QueryRow(`SELECT drive_id FROM nodes WHERE parent_id IS NULL ORDER BY id LIMIT 1`).Scan(&id)
 	return id, err
 }
 
@@ -1190,15 +1200,25 @@ func deleteStaleNodes(db *sql.DB, sessionStart string) (int64, error) {
 	}
 	// A surviving node whose first-discovered parent is going away (a
 	// re-discovered multi-parent item whose original parent vanished) would
-	// dangle; detach it to a root rather than block the delete.
+	// dangle; detach it to a root rather than block the delete. Archived rows
+	// (original_parent_drive_id set) survive the sweep below even when stale,
+	// so they too must be detached when their parent is pruned.
 	if _, err := tx.Exec(`
 		UPDATE nodes SET parent_id = NULL
-		WHERE crawled_at >= ?
-		  AND parent_id IN (SELECT id FROM nodes WHERE crawled_at < ?)`,
+		WHERE (crawled_at >= ? OR original_parent_drive_id IS NOT NULL)
+		  AND parent_id IN (SELECT id FROM nodes
+		                    WHERE crawled_at < ? AND original_parent_drive_id IS NULL)`,
 		sessionStart, sessionStart); err != nil {
 		return 0, err
 	}
-	res, err := tx.Exec(`DELETE FROM nodes WHERE crawled_at < ?`, sessionStart)
+	// Archived rows are exempt from pruning: when the archive tree is crawled
+	// (the normal case) they are re-observed and fresh anyway, but if the
+	// archive section was removed or misconfigured this keeps a full crawl from
+	// destroying the archival records that restore and delete depend on. A row
+	// whose item truly vanished from Drive self-heals later: delete treats a
+	// 404 as already deleted and removes the row.
+	res, err := tx.Exec(
+		`DELETE FROM nodes WHERE crawled_at < ? AND original_parent_drive_id IS NULL`, sessionStart)
 	if err != nil {
 		return 0, err
 	}
@@ -1258,18 +1278,22 @@ func deleteStaleNodesUnder(db *sql.DB, subfolderDriveID, cutoff string) (int64, 
 	// A surviving node whose first-discovered parent (within the subtree) is
 	// going away — a re-discovered multi-parent item whose original parent
 	// vanished — would dangle; detach it to a root rather than block the delete.
+	// Archived rows are kept even when stale (see deleteStaleNodes), so they are
+	// detached too when their parent is pruned.
 	if _, err := tx.Exec(`
 		UPDATE nodes SET parent_id = NULL
 		WHERE id IN (SELECT id FROM scoped_subtree)
-		  AND crawled_at >= ?
+		  AND (crawled_at >= ? OR original_parent_drive_id IS NOT NULL)
 		  AND parent_id IN (
 			SELECT s.id FROM scoped_subtree s JOIN nodes n ON n.id = s.id
-			WHERE n.crawled_at < ?
+			WHERE n.crawled_at < ? AND n.original_parent_drive_id IS NULL
 		  )`, cutoff, cutoff); err != nil {
 		return 0, err
 	}
-	res, err := tx.Exec(
-		`DELETE FROM nodes WHERE id IN (SELECT id FROM scoped_subtree) AND crawled_at < ?`, cutoff)
+	// Archived rows are exempt, mirroring deleteStaleNodes.
+	res, err := tx.Exec(`
+		DELETE FROM nodes WHERE id IN (SELECT id FROM scoped_subtree)
+		  AND crawled_at < ? AND original_parent_drive_id IS NULL`, cutoff)
 	if err != nil {
 		return 0, err
 	}
@@ -1360,4 +1384,286 @@ func nodePath(db *sql.DB, driveID string) ([]string, error) {
 		segments[i], segments[j] = segments[j], segments[i]
 	}
 	return segments, nil
+}
+
+// --- archive / delete / restore persistence ---
+
+// archiveTarget is one row the archive and delete commands act on: a
+// delete-marked item to archive, or an archived item to permanently delete.
+type archiveTarget struct {
+	rowID   int64
+	driveID string
+	name    string
+	typ     string
+	// parentDriveID is the recorded parent's Drive ID: the original folder for
+	// an unarchived item, the archive replica for an archived one. Invalid when
+	// the parent row was pruned (a detached row).
+	parentDriveID sql.NullString
+	ownerEmail    sql.NullString
+	ownerID       sql.NullString
+	canEdit       bool
+	// originalParent is original_parent_drive_id — set once the item is archived.
+	originalParent sql.NullString
+	// archiveFolder is the folder's cached replica Drive ID (folders only).
+	archiveFolder sql.NullString
+	deleteSkipped bool
+	depth         int
+}
+
+// archiveTargetQuery is the shared SELECT for archiveTarget rows. depths ranks
+// every node by distance from its root (the crawl root or the archive root),
+// used to order folders deepest-first so descendants are handled before
+// ancestors. subtree scopes the result to one folder's subtree; when
+// subfolder is empty it degenerates to the whole table.
+const archiveTargetQuery = `
+	WITH RECURSIVE depths(id, depth) AS (
+		SELECT id, 0 FROM nodes WHERE parent_id IS NULL
+		UNION ALL
+		SELECT n.id, d.depth + 1 FROM nodes n JOIN depths d ON n.parent_id = d.id
+	), subtree(id) AS (
+		SELECT id FROM nodes WHERE (?1 = '' AND parent_id IS NULL) OR drive_id = ?1
+		UNION ALL
+		SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
+	)
+	SELECT n.id, n.drive_id, n.name, n.type, p.drive_id, n.owner_email, n.owner_id,
+	       n.can_edit, n.original_parent_drive_id, n.archive_folder_drive_id,
+	       n.delete_skipped, COALESCE(d.depth, 0)
+	FROM nodes n
+	LEFT JOIN nodes p ON p.id = n.parent_id
+	LEFT JOIN depths d ON d.id = n.id
+	WHERE n.id IN (SELECT id FROM subtree)`
+
+func scanArchiveTargets(rows *sql.Rows) ([]archiveTarget, error) {
+	defer rows.Close()
+	var out []archiveTarget
+	for rows.Next() {
+		var (
+			t          archiveTarget
+			canEdit    int
+			skippedInt int
+		)
+		if err := rows.Scan(&t.rowID, &t.driveID, &t.name, &t.typ, &t.parentDriveID,
+			&t.ownerEmail, &t.ownerID, &canEdit, &t.originalParent, &t.archiveFolder,
+			&skippedInt, &t.depth); err != nil {
+			return nil, err
+		}
+		t.canEdit = canEdit != 0
+		t.deleteSkipped = skippedInt != 0
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// archivableFiles returns every delete-marked, not-yet-archived file (any
+// non-folder type), optionally scoped to the subtree rooted at subfolder.
+// Rows without a parent (detached survivors) are excluded — archiving needs
+// the recorded parent to build the replica path.
+func archivableFiles(db *sql.DB, subfolder string) ([]archiveTarget, error) {
+	rows, err := db.Query(archiveTargetQuery+`
+		  AND n.decision = ? AND n.type <> ? AND n.original_parent_drive_id IS NULL
+		  AND p.drive_id IS NOT NULL
+		ORDER BY n.id`, subfolder, decisionDelete, typeFolder)
+	if err != nil {
+		return nil, err
+	}
+	return scanArchiveTargets(rows)
+}
+
+// archivableFolders returns every delete-marked, not-yet-archived folder,
+// deepest-first so descendants are archived before their ancestors. The crawl
+// and archive roots have no parent row and so are never included.
+func archivableFolders(db *sql.DB, subfolder string) ([]archiveTarget, error) {
+	rows, err := db.Query(archiveTargetQuery+`
+		  AND n.decision = ? AND n.type = ? AND n.original_parent_drive_id IS NULL
+		  AND p.drive_id IS NOT NULL
+		ORDER BY depth DESC, n.id`, subfolder, decisionDelete, typeFolder)
+	if err != nil {
+		return nil, err
+	}
+	return scanArchiveTargets(rows)
+}
+
+// archivedForDeletion returns every archived item still marked delete — the
+// delete command's work list — split into files and folders, folders deepest-
+// first. subfolder (optional) scopes to a subtree of the archive tree; archived
+// items are reparented under their replica rows, so the subtree walk finds them.
+func archivedForDeletion(db *sql.DB, subfolder string) (files, folders []archiveTarget, err error) {
+	rows, err := db.Query(archiveTargetQuery+`
+		  AND n.decision = ? AND n.original_parent_drive_id IS NOT NULL
+		ORDER BY depth DESC, n.id`, subfolder, decisionDelete)
+	if err != nil {
+		return nil, nil, err
+	}
+	all, err := scanArchiveTargets(rows)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, t := range all {
+		if t.typ == typeFolder {
+			folders = append(folders, t)
+		} else {
+			files = append(files, t)
+		}
+	}
+	return files, folders, nil
+}
+
+// foldersWithReplicas returns every folder with a cached archive replica,
+// deepest-first — the order replicas must be pruned in, since a child folder's
+// replica nests inside its parent's.
+func foldersWithReplicas(db *sql.DB) ([]archiveTarget, error) {
+	rows, err := db.Query(archiveTargetQuery+`
+		  AND n.archive_folder_drive_id IS NOT NULL
+		ORDER BY depth DESC, n.id`, "")
+	if err != nil {
+		return nil, err
+	}
+	return scanArchiveTargets(rows)
+}
+
+// folderChainToRoot returns the folder rows from just below the root down to
+// folderDriveID (inclusive) — the ancestors whose replicas must exist before a
+// child of folderDriveID can be archived. Empty when folderDriveID is a root
+// itself (its replica is the archive root). Cycle-guarded like nodePath.
+func folderChainToRoot(db *sql.DB, folderDriveID string) ([]archiveTarget, error) {
+	var chain []archiveTarget
+	seen := make(map[string]bool)
+	cur := folderDriveID
+	for {
+		if seen[cur] {
+			return nil, fmt.Errorf("cycle detected in parent chain at %s", cur)
+		}
+		seen[cur] = true
+		var (
+			t      archiveTarget
+			parent sql.NullString
+		)
+		err := db.QueryRow(`
+			SELECT n.id, n.drive_id, n.name, n.archive_folder_drive_id, p.drive_id
+			FROM nodes n LEFT JOIN nodes p ON p.id = n.parent_id
+			WHERE n.drive_id = ?`, cur).
+			Scan(&t.rowID, &t.driveID, &t.name, &t.archiveFolder, &parent)
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("folder %s not found in database while walking ancestors of %s", cur, folderDriveID)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if !parent.Valid {
+			// cur is a root; roots have no replica of their own.
+			break
+		}
+		chain = append(chain, t)
+		cur = parent.String
+	}
+	for i, j := 0, len(chain)-1; i < j; i, j = i+1, j-1 {
+		chain[i], chain[j] = chain[j], chain[i]
+	}
+	return chain, nil
+}
+
+// nodeInSubtree reports whether the node with driveID lies within the subtree
+// rooted at rootDriveID (inclusive), walking parent_id upward. False when
+// either node is missing or rootDriveID is empty.
+func nodeInSubtree(db *sql.DB, rootDriveID, driveID string) (bool, error) {
+	if rootDriveID == "" || driveID == "" {
+		return false, nil
+	}
+	seen := make(map[string]bool)
+	cur := driveID
+	for {
+		if cur == rootDriveID {
+			return true, nil
+		}
+		if seen[cur] {
+			return false, nil // cycle: corrupt chain, but definitely not under the root
+		}
+		seen[cur] = true
+		var parent sql.NullString
+		err := db.QueryRow(`
+			SELECT p.drive_id FROM nodes n LEFT JOIN nodes p ON p.id = n.parent_id
+			WHERE n.drive_id = ?`, cur).Scan(&parent)
+		if err == sql.ErrNoRows {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if !parent.Valid {
+			return false, nil
+		}
+		cur = parent.String
+	}
+}
+
+// markArchived records that the item was moved into the archive: the original
+// parent's Drive ID is stamped (first value wins, so a re-archive of an
+// already-archived item cannot overwrite the true origin) and the row is
+// reparented under the replica folder's row.
+func markArchived(db *sql.DB, driveID, originalParentDriveID string, replicaRowID int64) error {
+	_, err := db.Exec(`
+		UPDATE nodes SET
+			original_parent_drive_id = COALESCE(original_parent_drive_id, ?),
+			parent_id = ?
+		WHERE drive_id = ?`, originalParentDriveID, replicaRowID, driveID)
+	return err
+}
+
+// clearArchived undoes markArchived after a restore: the archived marker and
+// delete_skipped flag reset, and parent_id re-points at the original parent's
+// row when it still exists (NULL otherwise; the next crawl re-observes the
+// node in place and fixes it).
+func clearArchived(db *sql.DB, driveID, originalParentDriveID string) error {
+	_, err := db.Exec(`
+		UPDATE nodes SET
+			original_parent_drive_id = NULL,
+			delete_skipped = 0,
+			parent_id = (SELECT id FROM nodes WHERE drive_id = ?)
+		WHERE drive_id = ?`, originalParentDriveID, driveID)
+	return err
+}
+
+// setArchiveFolder caches a folder's replica Drive ID (see the
+// archive_folder_drive_id migration comment).
+func setArchiveFolder(db *sql.DB, folderDriveID, replicaDriveID string) error {
+	_, err := db.Exec(`UPDATE nodes SET archive_folder_drive_id = ? WHERE drive_id = ?`,
+		replicaDriveID, folderDriveID)
+	return err
+}
+
+// clearArchiveFolder drops a folder's replica cache after the replica is pruned.
+func clearArchiveFolder(db *sql.DB, folderDriveID string) error {
+	_, err := db.Exec(`UPDATE nodes SET archive_folder_drive_id = NULL WHERE drive_id = ?`, folderDriveID)
+	return err
+}
+
+// markDeleteSkipped records that the delete command skipped this archived item
+// because it is externally owned.
+func markDeleteSkipped(db *sql.DB, driveID string) error {
+	_, err := db.Exec(`UPDATE nodes SET delete_skipped = 1 WHERE drive_id = ?`, driveID)
+	return err
+}
+
+// deleteNodeRow removes a really-deleted item's row and sweeps the auxiliary
+// rows that referenced it. Any children still recorded under it (stale rows
+// for items that vanished from Drive outside our control) are detached to
+// roots rather than blocking on the foreign key.
+func deleteNodeRow(db *sql.DB, driveID string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`
+		UPDATE nodes SET parent_id = NULL
+		WHERE parent_id = (SELECT id FROM nodes WHERE drive_id = ?)`, driveID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM nodes WHERE drive_id = ?`, driveID); err != nil {
+		return err
+	}
+	if err := pruneOrphanedAuxRows(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
 }

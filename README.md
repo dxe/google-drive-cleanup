@@ -99,9 +99,19 @@ can add settings without colliding:
   "migration": {
     "packing-folder": { "id": "1PaCkInG...", "name": "Packing" },
     "dropoff-folder": { "id": "0ADrOpOfF...", "name": "Dropoff" }
+  },
+  "archive": {
+    "root": { "id": "1ArChIvE...", "name": "Archive root" }
   }
 }
 ```
+
+`archive.root` (optional; required by `archive`/`delete`/`restore`) is the
+My-Drive folder soft-deleted files are moved into. It must live **outside** the
+crawl root — inside it, the archive would inherit the crawl root's sharing, and
+`archive` refuses to run. When configured, `crawl` also crawls the archive tree
+(after the crawl root) so archived files stay in the snapshot; the review UI,
+`keep-recent`, and `export-review` exclude it from decision marking.
 
 `crawl.root.id` and `crawl.root.name` are both required. Before crawling, the
 tool fetches the folder from Drive and verifies it really is a folder **and**
@@ -161,17 +171,30 @@ drive-cleanup review
 # Export the keep/delete decisions as one self-contained HTML file to send
 # to teammates (same red/green/yellow coloring as the review UI)
 drive-cleanup export-review --out out/review.html
+
+# Soft-delete everything marked delete: move it into the archive folder,
+# mirroring the original folder structure as "ARCH " replicas
+drive-cleanup archive
+drive-cleanup archive --folder 1AbCdEfGh...   # only that subtree
+
+# Permanently delete archived items (asks for confirmation with counts)
+drive-cleanup delete
+drive-cleanup delete --remove-unowned          # also handle externally-owned items
+
+# Bring one archived item back to its original folder and mark it keep
+drive-cleanup restore 1AbCdEfGh...
 ```
 
-The two commands that move files — `pack` and `unpack` — accept `--dry-run`,
-which reports every `WOULD move/create/delete` action without changing
-anything. A dry run authenticates with the read-only scope (so it never
-triggers a write-scope consent) and skips the confirmation prompt. Run one
-first to preview a migration step. They also accept `--max-errors` (default 5):
-once more than that many items fail to move, the run aborts — an error burst
-means something systemic (wrong account, wrong config, revoked access), not
-per-item drift. Pass `--verbose`/`-v` to any command to log every item it
-touches instead of just progress and errors.
+The commands that change Drive — `pack`, `unpack`, `archive`, `delete`, and
+`restore` — accept `--dry-run`, which reports every `WOULD
+move/create/delete` action without changing anything. A dry run authenticates
+with the read-only scope (so it never triggers a write-scope consent) and skips
+the confirmation prompt. Run one first to preview a step. They also accept
+`--max-errors` (default 5, except single-item `restore`): once more than that
+many items fail to move, the run aborts — an error burst means something
+systemic (wrong account, wrong config, revoked access), not per-item drift.
+Pass `--verbose`/`-v` to any command to log every item it touches instead of
+just progress and errors.
 
 `explore-owned-files` produces a single offline HTML file: an interactive,
 collapsible tree of every file and folder the account owns plus their ancestor
@@ -225,6 +248,83 @@ compresses well for sending.
 the account that ran it) is false — the items you would be unable to move.
 Folders are listed first, each with its full path and owner. Nodes whose edit
 capability could not be determined (`can_edit = NULL`) are not reported.
+
+## Archiving and deleting (`archive` / `delete` / `restore`)
+
+Once the review is done, deletion happens in two stages so nothing is lost to a
+mis-click: `archive` soft-deletes (moves marked files into the archive folder),
+and `delete` permanently deletes what was archived. `restore` reverses one
+archival.
+
+The recommended order of operations is **crawl → pack/unpack → archive →
+delete**: transferring ownership to the org first (pack/unpack) means `delete`
+can remove most items directly instead of routing them through the dropoff
+shared drive. Packing and unpacking *after* archiving works too — the archive
+tree is part of the crawl snapshot, so archived files pack like any others.
+Just treat `pack` and `unpack` as one atomic pair: don't archive between a pack
+and its unpack, while files sit in mid-migration scaffolding.
+
+### `archive`
+
+`archive` moves every file marked **delete** into the archive folder
+(`archive.root`), recreating the file's ancestor chain beneath it as replica
+folders prefixed with `ARCH ` (truncated if very long) so nothing is confused
+with an original and every archived file keeps its original location and name.
+Replica folders are created *without* the originals' sharing, and each folder's
+replica ID is cached on its row (`archive_folder_drive_id`) so re-runs don't
+repeat lookups or create duplicates; a cached replica that was deleted on Drive
+is re-created.
+
+After each file moves, its individually-added permissions (user and group
+grants) are replaced with the running account's own: the account grants itself
+access **first** — it may only have access via a Google Group, and dropping
+that group's grant while holding no direct one would lock it out — and only
+once that grant is in place are the other grants revoked. The owner's
+permission and domain/anyone grants are left alone.
+
+Delete-marked **folders** are archived too once a live check shows them empty
+(descendants are archived before ancestors, so a folder's turn comes after its
+contents). Folders keep their permissions. Drive listings are eventually
+consistent, so a folder that emptied a moment ago may be skipped once — re-run
+`archive` to pick it up. `--folder <id>` scopes the run to one crawled subtree.
+
+The archived state is recorded in `original_parent_drive_id` (the restore
+target; also what marks a row "archived"), and the row is reparented under the
+replica's row so the snapshot keeps describing where things actually live.
+
+### `delete`
+
+`delete` permanently deletes archived items that are still marked delete —
+only rows whose `original_parent_drive_id` is set are ever touched — after a
+confirmation prompt with counts. Ownership decides the mechanics:
+
+- Items **owned by the running account** are deleted directly.
+- Items owned by **other internal accounts** (`internal-domains` in config)
+  cannot be deleted directly, but moving an item into a shared drive flips its
+  ownership to the org: they are moved into a `Deletion pending` folder inside
+  the dropoff shared drive (`migration.dropoff-folder`), deleted there, and the
+  folder itself is removed once it empties. **This requires the Google
+  Workspace privilege "Move any file or folder into shared drives"** for the
+  OAuth user (or the admin enabling it for all users); without it these moves
+  fail.
+- **Externally-owned** items are skipped and counted (flagged `delete_skipped`)
+  unless `--remove-unowned` is passed, which removes the item from its archive
+  folder — Drive relocates it to its owner's My Drive with sharing intact —
+  and then drops every direct permission the account can revoke, its own last.
+
+A really-deleted item's database row is removed. Empty `ARCH ` replica folders
+are pruned afterwards (deepest first) and their originals' caches cleared;
+folders that still look non-empty (eventual consistency again) are left for a
+re-run. `--folder <id>` scopes the run to one subtree of the archive tree — a
+crawled folder's ID is accepted too and resolved to its replica.
+
+### `restore <drive_id>`
+
+`restore` moves one archived item back under its recorded original parent,
+clears the archived state, and marks the item **keep** (so the next `archive`
+run doesn't immediately re-archive it). It fails loudly, changing nothing, if
+the original parent no longer exists. Permissions removed during archiving are
+not restored — re-share by hand if needed.
 
 ## Migrating a user (`pack` / `unpack`)
 
@@ -435,6 +535,13 @@ removed, along with the `folder_permissions` and `extra_parents` rows that
 referenced it. The snapshot therefore reflects the tree as it is now rather than
 accumulating ghosts of deleted files.
 
+**Archived rows are exempt** from this pruning. Normally that changes nothing —
+the archive tree is crawled too, so archived rows are re-observed like any
+others — but if the `archive` config section is ever removed or misconfigured,
+the exemption keeps a full crawl from destroying the archival records that
+`restore` and `delete` depend on. A row whose item truly vanished from Drive
+self-heals later: `delete` treats a 404 as already deleted and drops the row.
+
 The cutoff is persisted so an interrupted crawl **resumes the same session**
 instead of resetting it (which would delete everything written before the
 interruption). Cleanup runs only on a fully successful completion — never after
@@ -465,6 +572,9 @@ Single `nodes` table (SQLite, pure-Go `modernc.org/sqlite` driver):
 | `children_done` | 1 once all children are fully listed — the resume unit |
 | `can_edit` | Drive `capabilities.canEdit` for the crawling account: 1 editable, 0 not, NULL unknown — drives `check-edit-access` |
 | `crawled_at` | RFC3339 timestamp |
+| `original_parent_drive_id` | Drive ID of the folder the item lived in before `archive` moved it; non-NULL means "archived" — the `restore` target and `delete` prerequisite |
+| `archive_folder_drive_id` | folders only: cached Drive ID of the folder's `ARCH ` replica in the archive tree; cleared when `delete` prunes the replica |
+| `delete_skipped` | 1 when `delete` skipped the archived item because it is externally owned (re-run with `--remove-unowned`) |
 
 `parent_id` is deliberately the traversal parent, not `files.parents[0]`, so
 it always references a row we actually crawled — `path` walks this chain to

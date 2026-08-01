@@ -289,7 +289,7 @@ func TestReviewForestCountsAndStatus(t *testing.T) {
 	mustMark(t, s, "B", decisionDelete, "")
 	mustMark(t, s, "a1", decisionKeep, "")
 
-	roots, err := loadReviewForest(db)
+	roots, err := loadReviewForest(db, "")
 	if err != nil {
 		t.Fatal(err)
 	}

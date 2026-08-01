@@ -32,9 +32,10 @@ re-run crawl first if it is stale.`,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dbPath, _ := cmd.Flags().GetString("db")
+		cfgPath, _ := cmd.Flags().GetString("config")
 		months, _ := cmd.Flags().GetInt("months")
 		dryRun, _ := cmd.Flags().GetBool("dry-run")
-		return runKeepRecent(dbPath, months, dryRun)
+		return runKeepRecent(dbPath, cfgPath, months, dryRun)
 	},
 }
 
@@ -43,7 +44,7 @@ func init() {
 	keepRecentCmd.Flags().Bool("dry-run", false, "report what would change without writing")
 }
 
-func runKeepRecent(dbPath string, months int, dryRun bool) error {
+func runKeepRecent(dbPath, cfgPath string, months int, dryRun bool) error {
 	if months <= 0 {
 		return fmt.Errorf("--months must be a positive number of months")
 	}
@@ -53,6 +54,20 @@ func runKeepRecent(dbPath string, months int, dryRun bool) error {
 		return err
 	}
 	defer db.Close()
+
+	// Archived items must keep their 'delete' decision (the delete command
+	// consumes it), so the archive tree is excluded from bulk keep-marking just
+	// as it is hidden from the review UI.
+	archiveRootID, err := optionalArchiveRootID(cfgPath)
+	if err != nil {
+		return err
+	}
+	inArchive := map[string]bool{}
+	if archiveRootID != "" {
+		if inArchive, err = subtreeDriveIDs(db, archiveRootID); err != nil {
+			return err
+		}
+	}
 
 	cutoff := time.Now().AddDate(0, -months, 0)
 
@@ -70,6 +85,9 @@ func runKeepRecent(dbPath string, months int, dryRun bool) error {
 		var driveID, lastMod string
 		if err := rows.Scan(&driveID, &lastMod); err != nil {
 			return err
+		}
+		if inArchive[driveID] {
+			continue
 		}
 		t, err := time.Parse(time.RFC3339, lastMod)
 		if err != nil {

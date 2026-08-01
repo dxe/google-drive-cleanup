@@ -2,7 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"strings"
 )
@@ -22,6 +24,7 @@ type config struct {
 	InternalDomains []string        `json:"internal-domains" doc:"your org's email domains"`
 	Owners          ownersConfig    `json:"owners"`
 	Migration       migrationConfig `json:"migration"`
+	Archive         archiveConfig   `json:"archive"`
 }
 
 type crawlConfig struct {
@@ -40,6 +43,15 @@ type ownersConfig struct {
 type rootConfig struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
+}
+
+// configured reports whether the folder spec was actually filled in (non-empty
+// and not the init template's placeholder). Unlike validate it never errors:
+// it is for optional sections consulted by commands that also work without
+// them (e.g. the crawl and review commands consult archive.root only when set).
+func (r rootConfig) configured() bool {
+	return r.ID != "" && r.Name != "" &&
+		!strings.HasPrefix(r.ID, placeholderPrefix) && !strings.HasPrefix(r.Name, placeholderPrefix)
 }
 
 // validate reports whether the folder spec is filled in. section is the dotted
@@ -87,6 +99,20 @@ type migrationConfig struct {
 	ManualOwnershipTransferAccounts []string `json:"manual-ownership-transfer-accounts" doc:"subset of ownership-transfer-accounts whose transfers bump modifiedTime; crawl uses the most recent revision for their files"`
 }
 
+// archiveConfig holds settings for the archive/delete/restore commands.
+type archiveConfig struct {
+	// Root is the folder the archive command moves soft-deleted files into,
+	// recreating the crawl root's folder structure beneath it as "ARCH "-prefixed
+	// replicas. It MUST be outside the crawl root (inside it, the archive would
+	// inherit the crawl root's sharing and the archive command refuses to run)
+	// and must be a regular My-Drive folder, never in a shared drive (archived
+	// files may still be owned by third parties, which a shared drive cannot
+	// hold). When configured, the crawl command also crawls this tree — after
+	// the crawl root — so archived files stay packable; the review UI and
+	// keep-recent exclude it from decision marking.
+	Root rootConfig `json:"root" doc:"a My-Drive folder outside the crawl root that archived (soft-deleted) files are moved into"`
+}
+
 func loadConfig(path string) (config, error) {
 	var cfg config
 	b, err := os.ReadFile(path)
@@ -100,6 +126,25 @@ func loadConfig(path string) (config, error) {
 		return cfg, fmt.Errorf("%s: %w", path, err)
 	}
 	return cfg, nil
+}
+
+// optionalArchiveRootID returns archive.root.id when the config file exists
+// and the section is filled in, and "" when the file is absent or the section
+// is not configured. Database-only commands (review, export-review,
+// keep-recent) use it to exclude the archive tree from decision marking
+// without making config.json mandatory for them.
+func optionalArchiveRootID(path string) (string, error) {
+	cfg, err := loadConfig(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if !cfg.Archive.Root.configured() {
+		return "", nil
+	}
+	return cfg.Archive.Root.ID, nil
 }
 
 // configTemplate is the scaffold written by `drive-cleanup init`. It is built by
@@ -126,6 +171,7 @@ func configTemplate() (string, error) {
 			OwnershipTransferAccounts:       []string{},
 			ManualOwnershipTransferAccounts: []string{},
 		},
+		Archive: archiveConfig{Root: folder("ARCHIVE")},
 	}
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {

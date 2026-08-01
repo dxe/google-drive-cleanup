@@ -36,10 +36,11 @@ known (recorded by 'crawl').`,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dbPath, _ := cmd.Flags().GetString("db")
+		cfgPath, _ := cmd.Flags().GetString("config")
 		outDir, _ := cmd.Flags().GetString("out-dir")
 		recentMonths, _ := cmd.Flags().GetInt("recent-months")
 		oldYears, _ := cmd.Flags().GetInt("old-years")
-		return runExportReview(dbPath, outDir, recentMonths, oldYears)
+		return runExportReview(dbPath, cfgPath, outDir, recentMonths, oldYears)
 	},
 }
 
@@ -49,14 +50,20 @@ func init() {
 	exportReviewCmd.Flags().Int("old-years", 2, `age threshold, in years, for the keep-old report`)
 }
 
-func runExportReview(dbPath, outDir string, recentMonths, oldYears int) error {
+func runExportReview(dbPath, cfgPath, outDir string, recentMonths, oldYears int) error {
 	db, err := openDB(dbPath)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	roots, err := loadReviewForest(db)
+	// The archive tree holds already-soft-deleted items; keep it out of the
+	// reports like the review UI does.
+	archiveRootID, err := optionalArchiveRootID(cfgPath)
+	if err != nil {
+		return err
+	}
+	roots, err := loadReviewForest(db, archiveRootID)
 	if err != nil {
 		return err
 	}

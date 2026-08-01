@@ -38,8 +38,9 @@ exported for teammates with 'export-review'.`,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dbPath, _ := cmd.Flags().GetString("db")
+		cfgPath, _ := cmd.Flags().GetString("config")
 		listen, _ := cmd.Flags().GetString("listen")
-		return runReview(dbPath, listen)
+		return runReview(dbPath, cfgPath, listen)
 	},
 }
 
@@ -47,14 +48,22 @@ func init() {
 	reviewCmd.Flags().String("listen", "127.0.0.1:8844", "address to serve the review UI on")
 }
 
-func runReview(dbPath, listen string) error {
+func runReview(dbPath, cfgPath, listen string) error {
 	db, err := openDB(dbPath)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	s := &reviewServer{db: db}
+	// The archive tree holds already-soft-deleted items; it is kept out of the
+	// review UI entirely so its decisions (still 'delete', consumed by the
+	// delete command) cannot be disturbed.
+	archiveRootID, err := optionalArchiveRootID(cfgPath)
+	if err != nil {
+		return err
+	}
+
+	s := &reviewServer{db: db, archiveRootID: archiveRootID}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
@@ -81,6 +90,10 @@ func runReview(dbPath, listen string) error {
 // forgets undo history but keeps all decisions (they are in the DB).
 type reviewServer struct {
 	db *sql.DB
+	// archiveRootID, when non-empty, is the archive tree's root Drive ID; that
+	// subtree is hidden from the tree endpoint and rejected by the mark
+	// endpoints (see runReview).
+	archiveRootID string
 
 	mu   sync.Mutex // serializes mark/undo and guards the undo stack
 	undo []reviewUndoEntry
@@ -135,8 +148,10 @@ type reviewNode struct {
 
 // loadReviewForest loads the whole nodes table into a sorted forest (folders
 // first, then case-insensitive by name, like a file browser) and computes the
-// per-node decision tallies.
-func loadReviewForest(db *sql.DB) ([]*reviewNode, error) {
+// per-node decision tallies. excludeDriveID, when non-empty, drops that node
+// and its whole subtree from the forest — used to hide the archive tree from
+// decision marking and the exported reports.
+func loadReviewForest(db *sql.DB, excludeDriveID string) ([]*reviewNode, error) {
 	rows, err := db.Query(`SELECT id, drive_id, name, type, parent_id, decision, last_modified FROM nodes`)
 	if err != nil {
 		return nil, err
@@ -157,6 +172,11 @@ func loadReviewForest(db *sql.DB) ([]*reviewNode, error) {
 
 	var roots []*reviewNode
 	for _, n := range all {
+		if n.driveID == excludeDriveID && excludeDriveID != "" {
+			// The excluded node is linked neither as a root nor as a child, so
+			// its descendants (which attach to it below) dangle out of the forest.
+			continue
+		}
 		if n.parentID.Valid {
 			if p := all[n.parentID.Int64]; p != nil {
 				p.children = append(p.children, n)
@@ -246,7 +266,7 @@ type treeResponseJSON struct {
 }
 
 func (s *reviewServer) handleTree(w http.ResponseWriter, r *http.Request) {
-	roots, err := loadReviewForest(s.db)
+	roots, err := loadReviewForest(s.db, s.archiveRootID)
 	if err != nil {
 		httpError(w, err)
 		return
@@ -360,6 +380,13 @@ func (s *reviewServer) handleMark(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid decision", http.StatusBadRequest)
 		return
 	}
+	if inArchive, err := s.inArchiveTree(req.DriveID); err != nil {
+		httpError(w, err)
+		return
+	} else if inArchive {
+		http.Error(w, "node is inside the archive tree; archived decisions cannot be changed here (use restore)", http.StatusBadRequest)
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	res, err := s.applyMark(req)
@@ -372,6 +399,17 @@ func (s *reviewServer) handleMark(w http.ResponseWriter, r *http.Request) {
 
 func validDecision(d string) bool {
 	return d == decisionNone || d == decisionKeep || d == decisionDelete
+}
+
+// inArchiveTree reports whether driveID sits inside the configured archive
+// tree. The UI never shows those nodes (handleTree excludes them), so this is
+// defense-in-depth: an archived item's 'delete' decision is what the delete
+// command consumes, and a stray mark would silently exempt it.
+func (s *reviewServer) inArchiveTree(driveID string) (bool, error) {
+	if s.archiveRootID == "" {
+		return false, nil
+	}
+	return nodeInSubtree(s.db, s.archiveRootID, driveID)
 }
 
 // applyMark runs one mark action in a transaction and, if it wrote anything,
@@ -713,6 +751,15 @@ func (s *reviewServer) handleMarkMany(w http.ResponseWriter, r *http.Request) {
 	if len(req.DriveIDs) == 0 {
 		writeJSON(w, markResult{})
 		return
+	}
+	for _, id := range req.DriveIDs {
+		if inArchive, err := s.inArchiveTree(id); err != nil {
+			httpError(w, err)
+			return
+		} else if inArchive {
+			http.Error(w, fmt.Sprintf("node %s is inside the archive tree; archived decisions cannot be changed here (use restore)", id), http.StatusBadRequest)
+			return
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

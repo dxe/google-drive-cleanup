@@ -74,6 +74,12 @@ type crawler struct {
 	// transfer — which leaves no revision — rather than a content edit.
 	manualTransferAccounts map[string]bool
 
+	// archiveRoot is config archive.root when filled in. A configured archive
+	// tree is crawled as a second root after the crawl root finishes, so
+	// archived files stay in the snapshot (and packable); the review UI and
+	// keep-recent exclude the tree from decision marking instead.
+	archiveRoot rootConfig
+
 	// visited guards against listing a folder twice (a cycle or a second parent).
 	// The concurrent drain does a test-and-set on it from many workers, so it and
 	// its mutex must be used together (see markVisited/isVisited).
@@ -215,6 +221,12 @@ func runCrawl(dbPath, cfgPath string, refresh, wipe bool, subfolder string, conc
 		transferAccounts:       transferAccountSet(cfg.Migration.OwnershipTransferAccounts),
 		manualTransferAccounts: transferAccountSet(cfg.Migration.ManualOwnershipTransferAccounts),
 	}
+	if cfg.Archive.Root.configured() {
+		if cfg.Archive.Root.ID == cfg.Crawl.Root.ID {
+			return fmt.Errorf("archive.root.id equals crawl.root.id (%s); the archive folder must be a separate folder outside the crawl root", cfg.Crawl.Root.ID)
+		}
+		c.archiveRoot = cfg.Archive.Root
+	}
 
 	log.Printf("recording last-content-change times in last_modified (%d manual ownership-transfer account(s) configured)", len(c.manualTransferAccounts))
 
@@ -277,8 +289,15 @@ func runCrawl(dbPath, cfgPath string, refresh, wipe bool, subfolder string, conc
 	// folder with children_done=0 still needs its children listed. Folders
 	// discovered mid-crawl are also appended in memory, but since they are
 	// inserted with children_done=0 before their parent is marked done, an
-	// interrupted run picks them up here on resume.
-	queue, err := pendingFolders(db, "")
+	// interrupted run picks them up here on resume. With an archive tree
+	// configured this first phase is scoped to the crawl root's subtree; the
+	// archive phase below then drains everything still pending (the archive
+	// tree plus any detached stragglers).
+	crawlScope := ""
+	if c.archiveRoot.configured() {
+		crawlScope = cfg.Crawl.Root.ID
+	}
+	queue, err := pendingFolders(db, crawlScope)
 	if err != nil {
 		return err
 	}
@@ -289,6 +308,22 @@ func runCrawl(dbPath, cfgPath string, refresh, wipe bool, subfolder string, conc
 	}
 
 	failed := c.drainQueue(ctx, queue)
+
+	// The archive tree is crawled after the crawl root so archived files stay
+	// in the snapshot: their owners keep refreshing (pack needs that for
+	// ownership transfer ahead of a delete) and stale-row pruning sees them
+	// re-observed. Skipped cleanly on interruption; a re-run picks it up.
+	if c.archiveRoot.configured() && ctx.Err() == nil {
+		if err := c.validateAndInsertRoot(ctx, c.archiveRoot); err != nil {
+			return fmt.Errorf("archive tree: %w", err)
+		}
+		archiveQueue, err := pendingFolders(db, "")
+		if err != nil {
+			return err
+		}
+		log.Printf("crawling archive tree %q (%s): %d folders pending", c.archiveRoot.Name, c.archiveRoot.ID, len(archiveQueue))
+		failed += c.drainQueue(ctx, archiveQueue)
+	}
 
 	remaining, cerr := countPendingFolders(db, "")
 	if cerr != nil {
@@ -646,6 +681,14 @@ func (c *crawler) commitPage(ctx context.Context, parent folderRef, files []*dri
 
 	var subfolders []folderRef
 	for _, file := range files {
+		// The archive folder is supposed to live outside the crawl root (inside
+		// it, the archive inherits the crawl root's sharing, and the archive
+		// command refuses to run). It is still crawled either way — as a child
+		// here or as the second root — so just flag the misplacement.
+		if c.archiveRoot.configured() && file.Id == c.archiveRoot.ID {
+			log.Printf("WARN archive root %q (%s) found inside the crawl root (under %q); move it outside — the archive command will refuse to run until it is",
+				file.Name, file.Id, parent.name)
+		}
 		email, ownerID, display := ownerOf(file)
 		n := node{
 			driveID:               file.Id,
