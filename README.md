@@ -251,10 +251,12 @@ capability could not be determined (`can_edit = NULL`) are not reported.
 
 ## Archiving and deleting (`archive` / `delete` / `restore`)
 
-Once the review is done, deletion happens in two stages so nothing is lost to a
-mis-click: `archive` soft-deletes (moves marked files into the archive folder),
-and `delete` permanently deletes what was archived. `restore` reverses one
-archival.
+Once the review is done, deletion happens in two stages to allow time for someone
+to realize something important is missing:
+* `archive` soft-deletes (moves marked files into the archive folder), and
+* `delete` permanently deletes what was archived.
+
+`restore` reverses the archival of one file.
 
 The recommended order of operations is **crawl → pack/unpack → archive →
 delete**: transferring ownership to the org first (pack/unpack) means `delete`
