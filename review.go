@@ -239,8 +239,10 @@ func computeReviewCounts(n *reviewNode) decisionCounts {
 // variants are pale (some marks, rest undecided), todo=no marks at all.
 func reviewStatus(c decisionCounts) string {
 	switch {
-	case c.Keep > 0 && c.Delete > 0:
+	case c.Keep > 0 && c.Delete > 0 && c.Undecided == 0:
 		return "mixed"
+	case c.Keep > 0 && c.Delete > 0:
+		return "partial-mixed"
 	case c.Delete > 0 && c.Undecided == 0:
 		return "delete"
 	case c.Keep > 0 && c.Undecided == 0:

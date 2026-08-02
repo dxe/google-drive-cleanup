@@ -90,7 +90,7 @@ export function undo(): Promise<UndoResult> {
 
 /** Display status for a folder, derived from its subtree tally (self included). */
 export function folderStatus(c: Counts): string {
-  if (c.keep > 0 && c.delete > 0) return 'mixed';
+  if (c.keep > 0 && c.delete > 0) return c.undecided === 0 ? 'mixed' : 'partial-mixed';
   if (c.delete > 0 && c.undecided === 0) return 'delete';
   if (c.keep > 0 && c.undecided === 0) return 'keep';
   if (c.delete > 0) return 'partial-delete';

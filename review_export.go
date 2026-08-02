@@ -333,6 +333,7 @@ const reviewExportHTML = `<!DOCTYPE html>
   .st-keep           { background: color-mix(in srgb, var(--green) 22%, transparent); }
   .st-partial-keep   { background: color-mix(in srgb, var(--green) 9%, transparent); }
   .st-mixed          { background: color-mix(in srgb, var(--yellow) 26%, transparent); }
+  .st-partial-mixed  { background: color-mix(in srgb, var(--yellow) 11%, transparent); }
   .st-todo           { background: transparent; }
   .twisty { width: 1rem; display: inline-block; text-align: center; color: #888;
             cursor: pointer; user-select: none; flex: none; }
@@ -368,7 +369,8 @@ const reviewExportHTML = `<!DOCTYPE html>
   <div class="legend">
     <span><span class="sw" style="background:color-mix(in srgb, var(--red) 22%, transparent)"></span>delete (whole subtree)</span>
     <span><span class="sw" style="background:color-mix(in srgb, var(--green) 22%, transparent)"></span>keep</span>
-    <span><span class="sw" style="background:color-mix(in srgb, var(--yellow) 26%, transparent)"></span>mixed: contains keep and delete</span>
+    <span><span class="sw" style="background:color-mix(in srgb, var(--yellow) 26%, transparent)"></span>mixed: keep and delete, nothing left undecided</span>
+    <span><span class="sw" style="background:color-mix(in srgb, var(--yellow) 11%, transparent)"></span>partly mixed: keep and delete, some still undecided</span>
     <span><span class="sw" style="background:color-mix(in srgb, var(--red) 9%, transparent)"></span>/<span class="sw" style="background:color-mix(in srgb, var(--green) 9%, transparent); margin-left:.3rem"></span>partially decided</span>
     <span><span class="sw"></span>undecided</span>
   </div>

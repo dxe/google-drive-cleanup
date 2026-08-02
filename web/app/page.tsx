@@ -341,6 +341,15 @@ export default function Page() {
           ↩ Undo{tree.undoLabel ? `: ${tree.undoLabel}` : ''}
         </button>
       </header>
+      <div className="legendbar" aria-label="Folder colour legend">
+        <span><i className="sw st-keep" />keep</span>
+        <span><i className="sw st-partial-keep" />partly kept, rest undecided</span>
+        <span><i className="sw st-delete" />delete</span>
+        <span><i className="sw st-partial-delete" />partly deleted, rest undecided</span>
+        <span><i className="sw st-mixed" />mixed keep &amp; delete, all decided</span>
+        <span><i className="sw st-partial-mixed" />mixed keep &amp; delete, some undecided</span>
+        <span><i className="sw st-todo" />undecided</span>
+      </div>
       <main className="main">
         <section className={`pane tree-pane ${focus?.pane === 'files' ? 'pane-inactive' : ''}`}>
           <Tree

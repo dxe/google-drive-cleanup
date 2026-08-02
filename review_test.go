@@ -313,8 +313,9 @@ func TestReviewForestCountsAndStatus(t *testing.T) {
 	if a.directFiles.Keep != 1 || a.directFiles.Undecided != 1 {
 		t.Errorf("A direct files = %+v, want 1 keep / 1 undecided", a.directFiles)
 	}
-	if got := reviewStatus(a.subtree); got != "mixed" {
-		t.Errorf("A status = %q, want mixed", got)
+	// Keep and delete both present but undecided items remain: pale yellow.
+	if got := reviewStatus(a.subtree); got != "partial-mixed" {
+		t.Errorf("A status = %q, want partial-mixed", got)
 	}
 	if got := reviewStatus(byID["B"].subtree); got != "delete" {
 		t.Errorf("B status = %q, want delete", got)
@@ -322,7 +323,28 @@ func TestReviewForestCountsAndStatus(t *testing.T) {
 	if got := reviewStatus(byID["C"].subtree); got != "todo" {
 		t.Errorf("C status = %q, want todo", got)
 	}
-	if got := reviewStatus(byID["root"].subtree); got != "mixed" {
-		t.Errorf("root status = %q, want mixed", got)
+	if got := reviewStatus(byID["root"].subtree); got != "partial-mixed" {
+		t.Errorf("root status = %q, want partial-mixed", got)
+	}
+}
+
+func TestReviewStatus(t *testing.T) {
+	cases := []struct {
+		name string
+		c    decisionCounts
+		want string
+	}{
+		{"nothing marked", decisionCounts{Undecided: 3}, "todo"},
+		{"all keep", decisionCounts{Keep: 3}, "keep"},
+		{"all delete", decisionCounts{Delete: 3}, "delete"},
+		{"some keep, rest undecided", decisionCounts{Keep: 1, Undecided: 2}, "partial-keep"},
+		{"some delete, rest undecided", decisionCounts{Delete: 1, Undecided: 2}, "partial-delete"},
+		{"keep and delete, fully decided", decisionCounts{Keep: 2, Delete: 1}, "mixed"},
+		{"keep and delete, some undecided", decisionCounts{Keep: 2, Delete: 1, Undecided: 1}, "partial-mixed"},
+	}
+	for _, tc := range cases {
+		if got := reviewStatus(tc.c); got != tc.want {
+			t.Errorf("%s: reviewStatus(%+v) = %q, want %q", tc.name, tc.c, got, tc.want)
+		}
 	}
 }

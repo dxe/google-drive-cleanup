@@ -252,9 +252,11 @@ Rules the server maintains:
 - Undo (in-memory, last 200 actions) reverses whole actions while the server
   is running.
 
-Colors: red = delete subtree, green = keep, yellow = contains both, pale
-red/green = partially decided, no color = undecided. Each row has a small ↗
-icon that opens the item in Google Drive.
+Colors: red = delete subtree, green = keep, yellow = contains both with
+nothing left undecided, pale yellow = contains both but still has undecided
+items, pale red/green = partially decided, no color = undecided. A legend sits
+under the header. Each row has a small ↗ icon that opens the item in Google
+Drive.
 
 `export-review` writes the same tree, coloring, and per-folder tallies into a
 single self-contained HTML file (default `out/review.html`) that can be sent

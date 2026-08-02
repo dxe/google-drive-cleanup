@@ -64,7 +64,20 @@ html, body {
 .st-keep           { background: color-mix(in srgb, var(--green) 24%, transparent); }
 .st-partial-keep   { background: color-mix(in srgb, var(--green) 9%, transparent); }
 .st-mixed          { background: color-mix(in srgb, var(--yellow) 28%, transparent); }
+.st-partial-mixed  { background: color-mix(in srgb, var(--yellow) 11%, transparent); }
 .st-todo           { background: transparent; }
+
+/* ---- colour legend ---- */
+.legendbar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: .25rem .9rem;
+  padding: .3rem .9rem; border-bottom: 1px solid var(--border);
+  font-size: .74rem; color: var(--muted); flex: none;
+}
+.legendbar > span { display: inline-flex; align-items: center; gap: .3rem; white-space: nowrap; }
+.legendbar .sw {
+  width: .8rem; height: .8rem; border-radius: .2rem; flex: none;
+  border: 1px solid color-mix(in srgb, var(--muted) 45%, transparent);
+}
 
 .twisty {
   width: 1.05rem; flex: none; text-align: center; color: var(--muted);
