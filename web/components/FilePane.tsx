@@ -1,10 +1,13 @@
 // The right-hand pane: the selected folder's direct files with per-file mark
 // buttons, decision tallies, and bulk actions.
-import { Decision, FileItem, fileStatus } from '@/lib/api';
+import { Decision, FileItem, fileStatus, modDate, ownerLabel } from '@/lib/api';
 import { ExtLink, MarkButtons } from './RowBits';
 
 export type FilePaneProps = {
   path: string[] | null; // breadcrumb of the selected folder, null = nothing selected
+  /** Original owner of the selected folder, as recorded in the database. */
+  owner: string;
+  ownerEmail: string;
   files: FileItem[] | null;
   focusId: string | null;
   onMark: (id: string, d: Decision) => void;
@@ -18,7 +21,7 @@ const typeIcon: Record<string, string> = {
   binary: '📦',
 };
 
-export function FilePane({ path, files, focusId, onMark, onBulk, onFocus }: FilePaneProps) {
+export function FilePane({ path, owner, ownerEmail, files, focusId, onMark, onBulk, onFocus }: FilePaneProps) {
   if (!path) {
     return <div className="file-empty">Select a folder to see its files.</div>;
   }
@@ -35,6 +38,9 @@ export function FilePane({ path, files, focusId, onMark, onBulk, onFocus }: File
           {path.slice(0, -1).join(' / ')}
           {path.length > 1 ? ' / ' : ''}
           <b>{path[path.length - 1]}</b>
+        </div>
+        <div className="folder-owner" title={ownerEmail || undefined}>
+          Owner: <b>{ownerLabel(owner, ownerEmail)}</b>
         </div>
         <div className="file-stats">
           <span className="stat k">✓ {counts.keep} keep</span>
@@ -76,6 +82,14 @@ export function FilePane({ path, files, focusId, onMark, onBulk, onFocus }: File
               {f.decision !== '' && (
                 <span className={`chip chip-${f.decision}`}>{f.decision === 'keep' ? 'K' : 'D'}</span>
               )}
+              <span className="file-meta">
+                <span className="owner" title={f.ownerEmail || undefined}>
+                  {ownerLabel(f.owner, f.ownerEmail)}
+                </span>
+                <span className="mtime" title={f.lastModified ? `Last modified ${f.lastModified}` : 'No recorded modification time'}>
+                  {modDate(f.lastModified) || '—'}
+                </span>
+              </span>
               <MarkButtons decision={f.decision} onMark={(d) => onMark(f.driveId, d)} />
               <ExtLink driveId={f.driveId} isFolder={false} />
             </div>

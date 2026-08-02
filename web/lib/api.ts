@@ -9,6 +9,9 @@ export type TreeFolder = {
   driveId: string;
   name: string;
   decision: Decision;
+  /** Original owner (before any ownership transfer); '' when unrecorded. */
+  owner: string;
+  ownerEmail: string;
   /** Direct (non-folder) children by decision. */
   files: Counts;
   /** The folder itself plus every descendant, by decision. */
@@ -28,6 +31,11 @@ export type FileItem = {
   name: string;
   type: string;
   decision: Decision;
+  /** Original owner (before any ownership transfer); '' when unrecorded. */
+  owner: string;
+  ownerEmail: string;
+  /** Recorded last-content-change time (RFC3339); '' when unrecorded. */
+  lastModified: string;
 };
 
 export type MarkResult = {
@@ -92,6 +100,22 @@ export function folderStatus(c: Counts): string {
 
 export function fileStatus(decision: Decision): string {
   return decision === '' ? 'todo' : decision;
+}
+
+/**
+ * Owner label for a node: the display name, falling back to the email, then to
+ * a dash when the snapshot recorded neither.
+ */
+export function ownerLabel(owner: string, ownerEmail: string): string {
+  return owner || ownerEmail || '—';
+}
+
+/** Recorded modification time as YYYY-MM-DD; '' when missing or unparseable. */
+export function modDate(lastModified: string): string {
+  if (!lastModified) return '';
+  const t = new Date(lastModified);
+  if (Number.isNaN(t.getTime())) return '';
+  return t.toISOString().slice(0, 10);
 }
 
 export function driveUrl(driveId: string, isFolder: boolean): string {

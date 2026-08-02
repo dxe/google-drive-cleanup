@@ -51,6 +51,8 @@ export default function Page() {
     return out;
   }, [tree, expanded]);
 
+  const selectedFolder = selected ? (index.get(selected)?.folder ?? null) : null;
+
   const selectedPath = useMemo(() => {
     if (!selected || !index.has(selected)) return null;
     const path: string[] = [];
@@ -61,14 +63,23 @@ export default function Page() {
   }, [selected, index]);
 
   // ---- data loading ----
-  const refresh = useCallback(async (folderForFiles: string | null) => {
+  // Every file fetch takes a ticket; only the newest one may write to `files`.
+  // Without this, a slow refresh triggered by marking folder A can land after
+  // the user has already moved to folder B and paint A's files under B's name.
+  const filesSeq = useRef(0);
+  const selectedRef = useRef<string | null>(null);
+  selectedRef.current = selected;
+
+  const refresh = useCallback(async () => {
+    const folderForFiles = selectedRef.current;
+    const seq = ++filesSeq.current;
     try {
       const [t, f] = await Promise.all([
         getTree(),
         folderForFiles ? getFiles(folderForFiles) : Promise.resolve(null),
       ]);
       setTree(t);
-      setFiles(f);
+      if (seq === filesSeq.current) setFiles(f);
       setError(null);
     } catch (e) {
       setError(String(e));
@@ -92,9 +103,16 @@ export default function Page() {
   const selectFolder = useCallback(
     (id: string) => {
       setSelected(id);
+      selectedRef.current = id;
       setFocus({ pane: 'tree', id });
       setFiles(null);
-      getFiles(id).then(setFiles, (e) => setError(String(e)));
+      const seq = ++filesSeq.current;
+      getFiles(id).then(
+        (f) => {
+          if (seq === filesSeq.current) setFiles(f);
+        },
+        (e) => setError(String(e)),
+      );
     },
     [],
   );
@@ -153,12 +171,12 @@ export default function Page() {
             `${res.clearedAncestors} folder(s) above were un-marked from Delete and re-decided from their contents.`,
           );
         }
-        await refresh(selected);
+        await refresh();
       } catch (e) {
         setError(String(e));
       }
     },
-    [askConfirm, refresh, selected, showToast],
+    [askConfirm, refresh, showToast],
   );
 
   const doBulk = useCallback(
@@ -171,23 +189,23 @@ export default function Page() {
             `${res.clearedAncestors} folder(s) above were un-marked from Delete and re-decided from their contents.`,
           );
         }
-        await refresh(selected);
+        await refresh();
       } catch (e) {
         setError(String(e));
       }
     },
-    [files, refresh, selected, showToast],
+    [files, refresh, showToast],
   );
 
   const doUndo = useCallback(async () => {
     try {
       const res = await undo();
       showToast(`Undid: ${res.undone} (${res.changed} item(s) restored)`);
-      await refresh(selected);
+      await refresh();
     } catch (e) {
       setError(String(e));
     }
-  }, [refresh, selected, showToast]);
+  }, [refresh, showToast]);
 
   // ---- keyboard ----
   // The handler reads the latest state through a ref so one document-level
@@ -345,6 +363,8 @@ export default function Page() {
         <section className={`pane file-pane ${focus?.pane === 'tree' ? 'pane-inactive' : ''}`}>
           <FilePane
             path={selectedPath}
+            owner={selectedFolder?.owner ?? ''}
+            ownerEmail={selectedFolder?.ownerEmail ?? ''}
             files={files}
             focusId={focus?.pane === 'files' ? focus.id : null}
             onMark={doMark}

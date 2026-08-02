@@ -139,7 +139,12 @@ type reviewNode struct {
 	// lastModified is the estimated last-content-change time (RFC3339), populated
 	// by `crawl`; NULL/invalid otherwise.
 	lastModified sql.NullString
-	children     []*reviewNode
+	// originalOwner* record the last owner before the node was handed to an
+	// ownership-transfer account (see the original_owner_* columns); NULL on a
+	// snapshot crawled before those columns existed.
+	originalOwnerName  sql.NullString
+	originalOwnerEmail sql.NullString
+	children           []*reviewNode
 	// subtree tallies decisions over the node itself plus every descendant.
 	subtree decisionCounts
 	// directFiles tallies decisions over the node's direct non-folder children.
@@ -152,7 +157,8 @@ type reviewNode struct {
 // and its whole subtree from the forest — used to hide the archive tree from
 // decision marking and the exported reports.
 func loadReviewForest(db *sql.DB, excludeDriveID string) ([]*reviewNode, error) {
-	rows, err := db.Query(`SELECT id, drive_id, name, type, parent_id, decision, last_modified FROM nodes`)
+	rows, err := db.Query(`SELECT id, drive_id, name, type, parent_id, decision, last_modified,
+		original_owner_display_name, original_owner_email FROM nodes`)
 	if err != nil {
 		return nil, err
 	}
@@ -161,7 +167,8 @@ func loadReviewForest(db *sql.DB, excludeDriveID string) ([]*reviewNode, error) 
 	all := make(map[int64]*reviewNode)
 	for rows.Next() {
 		var n reviewNode
-		if err := rows.Scan(&n.rowID, &n.driveID, &n.name, &n.typ, &n.parentID, &n.decision, &n.lastModified); err != nil {
+		if err := rows.Scan(&n.rowID, &n.driveID, &n.name, &n.typ, &n.parentID, &n.decision, &n.lastModified,
+			&n.originalOwnerName, &n.originalOwnerEmail); err != nil {
 			return nil, err
 		}
 		all[n.rowID] = &n
@@ -250,12 +257,16 @@ func reviewStatus(c decisionCounts) string {
 // --- HTTP handlers ---
 
 type treeFolderJSON struct {
-	DriveID  string            `json:"driveId"`
-	Name     string            `json:"name"`
-	Decision string            `json:"decision"`
-	Files    decisionCounts    `json:"files"`
-	Subtree  decisionCounts    `json:"subtree"`
-	Folders  []*treeFolderJSON `json:"folders"`
+	DriveID  string `json:"driveId"`
+	Name     string `json:"name"`
+	Decision string `json:"decision"`
+	// Owner/OwnerEmail are the node's original owner (before any
+	// ownership-transfer hand-off); empty when the snapshot has no record.
+	Owner      string            `json:"owner"`
+	OwnerEmail string            `json:"ownerEmail"`
+	Files      decisionCounts    `json:"files"`
+	Subtree    decisionCounts    `json:"subtree"`
+	Folders    []*treeFolderJSON `json:"folders"`
 }
 
 type treeResponseJSON struct {
@@ -275,12 +286,14 @@ func (s *reviewServer) handleTree(w http.ResponseWriter, r *http.Request) {
 	var walk func(n *reviewNode) *treeFolderJSON
 	walk = func(n *reviewNode) *treeFolderJSON {
 		f := &treeFolderJSON{
-			DriveID:  n.driveID,
-			Name:     n.name,
-			Decision: n.decision,
-			Files:    n.directFiles,
-			Subtree:  n.subtree,
-			Folders:  []*treeFolderJSON{},
+			DriveID:    n.driveID,
+			Name:       n.name,
+			Decision:   n.decision,
+			Owner:      n.originalOwnerName.String,
+			OwnerEmail: n.originalOwnerEmail.String,
+			Files:      n.directFiles,
+			Subtree:    n.subtree,
+			Folders:    []*treeFolderJSON{},
 		}
 		for _, c := range n.children {
 			if c.typ == typeFolder {
@@ -319,6 +332,13 @@ type fileItemJSON struct {
 	Name     string `json:"name"`
 	Type     string `json:"type"`
 	Decision string `json:"decision"`
+	// Owner/OwnerEmail are the file's original owner (before any
+	// ownership-transfer hand-off); empty when the snapshot has no record.
+	Owner      string `json:"owner"`
+	OwnerEmail string `json:"ownerEmail"`
+	// LastModified is the recorded last-content-change time (RFC3339), empty
+	// when no crawl has recorded one.
+	LastModified string `json:"lastModified"`
 }
 
 func (s *reviewServer) handleFiles(w http.ResponseWriter, r *http.Request) {
@@ -328,7 +348,8 @@ func (s *reviewServer) handleFiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rows, err := s.db.Query(fmt.Sprintf(`
-		SELECT n.drive_id, n.name, n.type, n.decision
+		SELECT n.drive_id, n.name, n.type, n.decision,
+		       n.original_owner_display_name, n.original_owner_email, n.last_modified
 		FROM nodes n JOIN nodes p ON n.parent_id = p.id
 		WHERE p.drive_id = ? AND n.type <> '%s'
 		ORDER BY n.name COLLATE NOCASE, n.id`, typeFolder), folder)
@@ -339,11 +360,15 @@ func (s *reviewServer) handleFiles(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 	files := []fileItemJSON{}
 	for rows.Next() {
-		var f fileItemJSON
-		if err := rows.Scan(&f.DriveID, &f.Name, &f.Type, &f.Decision); err != nil {
+		var (
+			f                          fileItemJSON
+			owner, ownerEmail, modTime sql.NullString
+		)
+		if err := rows.Scan(&f.DriveID, &f.Name, &f.Type, &f.Decision, &owner, &ownerEmail, &modTime); err != nil {
 			httpError(w, err)
 			return
 		}
+		f.Owner, f.OwnerEmail, f.LastModified = owner.String, ownerEmail.String, modTime.String
 		files = append(files, f)
 	}
 	if err := rows.Err(); err != nil {

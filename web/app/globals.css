@@ -113,6 +113,11 @@ html, body {
 }
 .crumbs { font-size: .8rem; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .crumbs b { color: inherit; }
+.folder-owner {
+  font-size: .78rem; color: var(--muted); margin-top: -.25rem;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.folder-owner b { color: light-dark(#333, #ddd); font-weight: 600; }
 .file-stats { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
 .stat {
   font-size: .76rem; border-radius: 1rem; padding: .1rem .6rem; font-weight: 600;
@@ -128,6 +133,16 @@ html, body {
 }
 .bulk button.bk:hover { background: var(--green); color: #fff; border-color: var(--green); }
 .bulk button.bd:hover { background: var(--red); color: #fff; border-color: var(--red); }
+
+/* Per-file original owner and recorded modification date, right-aligned just
+   before the mark buttons (the auto margin here replaces .actions'). */
+.file-meta {
+  display: flex; align-items: baseline; gap: .6rem; margin-left: auto; padding-left: .5rem;
+  flex: none; color: var(--muted); font-size: .74rem; white-space: nowrap;
+}
+.file-meta .owner { max-width: 11rem; overflow: hidden; text-overflow: ellipsis; }
+.file-meta .mtime { font-variant-numeric: tabular-nums; }
+.file-meta + .actions { margin-left: .55rem; }
 
 .file-list { overflow: auto; padding: .4rem; flex: 1; }
 .file-empty { color: var(--muted); padding: 2rem; text-align: center; }
