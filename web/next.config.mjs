@@ -9,6 +9,13 @@ const nextConfig = {
   async rewrites() {
     return [{ source: '/api/:path*', destination: `${REVIEW_API}/api/:path*` }];
   },
+
+  // `next dev` only serves its dev-only assets (/_next/*, HMR) to origins it
+  // was started on. When the UI is reached through an ngrok tunnel the browser
+  // sends the tunnel host instead of localhost, so allow ngrok's domains too —
+  // see scripts/share-review.sh. This is a development-only setting; access is
+  // gated at the ngrok edge by ngrok/traffic-policy.yml.
+  allowedDevOrigins: ['*.ngrok.app', '*.ngrok-free.app', '*.ngrok.dev', '*.ngrok.io'],
 };
 
 export default nextConfig;

@@ -1,0 +1,46 @@
+# Traffic policy for exposing the review UI (Next dev server on :3000) to the
+# internet through ngrok. Authentication happens at the ngrok edge, so nothing
+# unauthenticated ever reaches the Next server or the Go API behind it.
+#
+# Used by scripts/share-review.sh.
+
+on_http_request:
+  # 1. Force a Google sign-in. `provider: google` uses ngrok's managed OAuth
+  #    application, so there is no client_id/client_secret to configure and no
+  #    redirect URI to register in the Google Cloud console.
+  - actions:
+      - type: oauth
+        config:
+          provider: google
+          # Re-authenticate periodically so a link that leaks does not stay
+          # usable indefinitely.
+          idle_session_timeout: 8h
+          max_session_duration: 24h
+
+  # 2. Reject anyone who authenticated with an account outside the org. The
+  #    oauth action has no domain allowlist of its own, so the check is an
+  #    expression over the verified identity it produced.
+  #
+  #    The regex is case-insensitive and anchored with `$`, and `[.]` matches a
+  #    literal dot, so only addresses genuinely ending in
+  #    `@directactioneverywhere.com` pass. An empty or missing email fails the
+  #    match and is therefore denied — the rule is fail-closed.
+  - expressions:
+      - '!actions.ngrok.oauth.identity.email.matches("(?i)@directactioneverywhere[.]com$")'
+    actions:
+      - type: custom-response
+        config:
+          status_code: 403
+          headers:
+            content-type: text/html
+          body: |
+            <!doctype html>
+            <title>Access denied</title>
+            <body style="font:16px/1.5 system-ui;max-width:34rem;margin:15vh auto;padding:0 1.5rem">
+              <h1 style="font-size:1.25rem">Access denied</h1>
+              <p>This tool is restricted to <strong>@directactioneverywhere.com</strong>
+              accounts. You signed in as
+              <strong>${actions.ngrok.oauth.identity.email}</strong>.</p>
+              <p>If you have an org account, open this link again in a private
+              window (or sign out of Google) and pick that account instead.</p>
+            </body>

@@ -20,3 +20,5 @@ The keep/delete review UI is a Next.js app in [web/](web/) that talks to the Go 
 drive-cleanup review          # API
 cd web && npm run dev         # UI on http://localhost:3000
 ```
+
+To share that running UI over the internet, use `scripts/share-review.sh`.

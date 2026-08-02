@@ -247,6 +247,64 @@ to teammates for review. Note it includes every crawled node, so the file is
 large (tens of MB for tens of thousands of nodes); it opens fine locally and
 compresses well for sending.
 
+#### Sharing the live UI over the internet
+
+`export-review` produces a read-only snapshot. To let a teammate *make*
+decisions, `scripts/share-review.sh` publishes the running UI through an ngrok
+tunnel that requires a Google sign-in and accepts only
+`@directactioneverywhere.com` accounts:
+
+```sh
+drive-cleanup review              # terminal 1: the API on :8844
+cd web && npm run dev             # terminal 2: the UI on :3000
+scripts/share-review.sh           # terminal 3: the public tunnel
+```
+
+Authentication happens at the ngrok edge, configured by
+[ngrok/traffic-policy.yml](ngrok/traffic-policy.yml) — an unauthenticated or
+out-of-domain request never reaches Next or the Go API, and neither server's
+localhost binding changes. The policy uses ngrok's managed Google OAuth app, so
+there is no OAuth client to register; the domain restriction is a fail-closed
+CEL expression over the verified identity, and sessions expire after 8h idle /
+24h absolute.
+
+One-time setup: sign in at [ngrok](https://dashboard.ngrok.com/) and follow the
+setup instructions there to install the agent and run
+`ngrok config add-authtoken <token>`. Neither the binary nor the token survives
+a devcontainer rebuild, so expect to redo both; `share-review.sh` checks for
+each and points you here if either is missing.
+
+This works on ngrok's free plan — OAuth is included there. The limit that
+actually bites is [3 traffic identities (OAuth MAU) per
+month](https://ngrok.com/docs/pricing-limits/free-plan-limits/): distinct people
+signing in, counted per billing cycle. Up to three reviewers a month costs
+nothing; beyond that you need Hobbyist or pay-as-you-go. ngrok's docs do not say
+how the cap is enforced once reached, so if a fourth person cannot get in, check
+[usage](https://dashboard.ngrok.com/usage) before assuming the policy is broken.
+
+Free accounts also get one auto-assigned dev domain
+(`something.ngrok-free.app`) and it is the only domain they may use — *random*
+URLs are the paid feature now — so the link is already stable between runs.
+`NGROK_DOMAIN` is there for a reserved or custom domain on a paid plan:
+
+```sh
+NGROK_DOMAIN=dxe-drive-review.ngrok.app scripts/share-review.sh
+```
+
+Two things worth knowing before you rely on this:
+
+- The script does not take the gate on trust. Once the tunnel is up it requests
+  its own public URL anonymously, and if that returns HTTP 200 — the app being
+  reachable without signing in — it tears the tunnel down and refuses to print
+  the URL, rather than quietly publishing the Drive database.
+- Everyone who signs in shares one database with no per-user attribution, and
+  undo history is per-server and in-memory. Treat it as a tool for collaborators
+  you trust, not as a public app.
+
+On the free plan visitors also see ngrok's interstitial warning page once per
+browser (suppressed for 7 days after they click through). It is cosmetic and
+does not affect the sign-in gate.
+
 `check-edit-access` reads only the database and prints every node whose
 `can_edit` flag (Drive's `capabilities.canEdit`, captured during the crawl for
 the account that ran it) is false — the items you would be unable to move.
