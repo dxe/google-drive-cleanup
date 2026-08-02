@@ -176,6 +176,11 @@ drive-cleanup review
 # to teammates (same red/green/yellow coloring as the review UI)
 drive-cleanup export-review --out out/review.html
 
+# Snapshot the database to db-backups/drive-<yyyymmdd-hhmm>.db before doing
+# something risky; the optional description is appended to db-backups/log.txt
+drive-cleanup backup
+drive-cleanup backup before deleting the 2017 archive
+
 # Soft-delete everything marked delete: move it into the archive folder,
 # mirroring the original folder structure as "ARCH " replicas
 drive-cleanup archive
@@ -199,6 +204,16 @@ many items fail to move, the run aborts — an error burst means something
 systemic (wrong account, wrong config, revoked access), not per-item drift.
 Pass `--verbose`/`-v` to any command to log every item it touches instead of
 just progress and errors.
+
+`backup` copies the database into `db-backups/` (next to the database itself)
+as `drive-<yyyymmdd-hhmm>.db` in local time, and appends `<filename> -
+<description>` to `db-backups/log.txt`. Everything after the subcommand is the
+description, so it needs no quoting; a backup without one is still logged. The
+copy is taken with SQLite's `VACUUM INTO`, so it is a consistent single-file
+snapshot that includes anything still in the write-ahead log — no `-wal`/`-shm`
+files are needed to restore it, and it is safe to run while `review` is
+serving. It is the one command that does not apply pending schema migrations
+first: it captures the database as it is on disk. `db-backups/` is gitignored.
 
 `explore-owned-files` produces a single offline HTML file: an interactive,
 collapsible tree of every file and folder the account owns plus their ancestor
