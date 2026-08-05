@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -82,7 +83,39 @@ func runReview(dbPath, cfgPath, listen string) error {
 	mux.HandleFunc("/api/undo", s.handleUndo)
 
 	log.Printf("review UI listening on http://%s", listen)
-	return http.ListenAndServe(listen, mux)
+	return http.ListenAndServe(listen, logRequests(mux))
+}
+
+// logRequests logs one line per request so it is visible whether the UI (which
+// may be reached through the Next dev server or a tunnel) is actually talking
+// to this process.
+func logRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		log.Printf("%s %s %s -> %d (%s)", r.RemoteAddr, r.Method, r.URL.RequestURI(), rec.status, time.Since(start).Round(time.Millisecond))
+	})
+}
+
+// statusRecorder captures the response status code for the request log.
+type statusRecorder struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+}
+
+func (r *statusRecorder) WriteHeader(status int) {
+	if !r.wroteHeader {
+		r.status = status
+		r.wroteHeader = true
+	}
+	r.ResponseWriter.WriteHeader(status)
+}
+
+func (r *statusRecorder) Write(b []byte) (int, error) {
+	r.wroteHeader = true
+	return r.ResponseWriter.Write(b)
 }
 
 // reviewServer holds the open database and the in-memory undo stack. The undo
