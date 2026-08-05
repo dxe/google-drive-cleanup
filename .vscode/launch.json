@@ -23,6 +23,13 @@
         "uriFormat": "%s",
         "action": "openExternally"
       }
+    },
+    {
+      "name": "Share Review (ngrok)",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "scripts/share-review.sh",
+      "cwd": "${workspaceFolder}"
     }
   ],
   "compounds": [
