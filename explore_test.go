@@ -229,6 +229,11 @@ func TestBuildOwnerBreakdowns(t *testing.T) {
 	mustUpsert(t, db, node{driveID: "c", name: "c.txt", typ: typeBinary, mimeType: "text/plain",
 		ownerID:  nullString("999"),
 		parentID: sql.NullInt64{Int64: rootID, Valid: true}})
+	// Decisions: alice's two items are keep, bob's file is delete, c.txt is left
+	// undecided.
+	setDecision(t, db, "sub", decisionKeep)
+	setDecision(t, db, "a", decisionKeep)
+	setDecision(t, db, "b", decisionDelete)
 
 	roots, err := externalOwnedAndAncestors(db, []string{"example.com"})
 	if err != nil {
@@ -246,6 +251,13 @@ func TestBuildOwnerBreakdowns(t *testing.T) {
 	if got := sub["bob@vendor.io"]; got.Files != 1 {
 		t.Errorf("sub bob files = %d, want 1", got.Files)
 	}
+	// Decisions are tallied over the same items as Folders+Files.
+	if got := sub["alice@partner.org (Alice)"].decisionCounts; got != (decisionCounts{Keep: 1}) {
+		t.Errorf("sub alice decisions = %+v, want 1 keep", got)
+	}
+	if got := sub["bob@vendor.io"].decisionCounts; got != (decisionCounts{Delete: 1}) {
+		t.Errorf("sub bob decisions = %+v, want 1 delete", got)
+	}
 
 	// Root's breakdown pools descendants: alice owns Sub (folder) + a.pdf, bob
 	// owns b.doc, id:999 owns c.txt.
@@ -256,8 +268,36 @@ func TestBuildOwnerBreakdowns(t *testing.T) {
 	if got := root["id:999"]; got.Files != 1 {
 		t.Errorf("root id:999 files = %d, want 1", got.Files)
 	}
+	// Pooled decisions: both of alice's items are keep; c.txt is undecided.
+	if got := root["alice@partner.org (Alice)"].decisionCounts; got != (decisionCounts{Keep: 2}) {
+		t.Errorf("root alice decisions = %+v, want 2 keep", got)
+	}
+	if got := root["id:999"].decisionCounts; got != (decisionCounts{Undecided: 1}) {
+		t.Errorf("root id:999 decisions = %+v, want 1 undecided", got)
+	}
 	if len(byID["root"].breakdown) != 3 {
 		t.Errorf("root breakdown has %d owners, want 3", len(byID["root"].breakdown))
+	}
+
+	// A folder's breakdown rows decompose exactly the tally shown on its own row.
+	var sum decisionCounts
+	for _, r := range byID["root"].breakdown {
+		sum.addAll(r.decisionCounts)
+	}
+	if got := byID["root"].Desc(); got != sum {
+		t.Errorf("root breakdown sums to %+v, want the row tally %+v", sum, got)
+	}
+
+	// The popover script reads these keys off each row, so decisionCounts must
+	// flatten into the encoded object rather than nest.
+	js, err := ownerBreakdownJSON(roots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"folders":`, `"files":`, `"keep":`, `"delete":`, `"undecided":`} {
+		if !strings.Contains(string(js), want) {
+			t.Errorf("breakdown JSON missing %q: %s", want, js)
+		}
 	}
 
 	// Breakdown rows are ordered files-desc: alice and bob both have 1 file at
@@ -275,6 +315,57 @@ func TestBuildOwnerBreakdowns(t *testing.T) {
 		if n.breakdown != nil {
 			t.Errorf("per-account node %q unexpectedly has a breakdown", id)
 		}
+	}
+}
+
+func TestExploreDecisionStatus(t *testing.T) {
+	db := testDB(t)
+	buildExploreTree(t, db)
+	setDecision(t, db, "budget", decisionKeep)
+	setDecision(t, db, "plan", decisionDelete)
+	// Everything else — including the folders — is left undecided.
+
+	roots, _, err := ownedAndAncestors(db, "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := flatten(roots)
+
+	// Files color by their own decision, folders by the tally of the owned items
+	// beneath them (themselves included when they are owned).
+	want := map[string]string{
+		"budget": "keep",
+		"plan":   "delete",
+		// Finance is alice's, undecided, and holds one keep => pale green. bob's
+		// notes.txt is not in alice's tree, so it does not count.
+		"fin": "partial-keep",
+		// Shared is bob's, so only the delete beneath it counts => solid red.
+		"shared": "delete",
+		// Root is bob's too and spans a keep, a delete and undecided Finance
+		// => pale yellow.
+		"root": "partial-mixed",
+	}
+	for id, wantStatus := range want {
+		if got := byID[id].Status(); got != wantStatus {
+			t.Errorf("%s status = %q, want %q", id, got, wantStatus)
+		}
+	}
+
+	// Desc drops the folder's own contribution, so it matches the folder's
+	// ownedFolders/ownedFiles counts: Finance holds just budget.xlsx.
+	if got := byID["fin"].Desc(); got != (decisionCounts{Keep: 1}) {
+		t.Errorf("Finance Desc = %+v, want 1 keep", got)
+	}
+	// Root is not owned, so nothing is subtracted: Finance (undecided) plus the
+	// two files.
+	if got := byID["root"].Desc(); got != (decisionCounts{Keep: 1, Delete: 1, Undecided: 1}) {
+		t.Errorf("root Desc = %+v, want 1 keep / 1 delete / 1 undecided", got)
+	}
+	// The tally covers exactly the owned items the folder counts advertise.
+	root := byID["root"]
+	if got, want := root.Desc().Keep+root.Desc().Delete+root.Desc().Undecided,
+		root.OwnedFolders()+root.OwnedFiles(); got != want {
+		t.Errorf("root decision total = %d, want %d (owned folders + files)", got, want)
 	}
 }
 
@@ -297,6 +388,8 @@ func TestRunExploreOwnedFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	buildExploreTree(t, freshDB)
+	setDecision(t, freshDB, "budget", decisionKeep)
+	setDecision(t, freshDB, "plan", decisionDelete)
 	freshDB.Close()
 
 	outDir := filepath.Join(t.TempDir(), "out")
@@ -310,7 +403,10 @@ func TestRunExploreOwnedFiles(t *testing.T) {
 		t.Fatalf("expected output file: %v", err)
 	}
 	html := string(b)
-	for _, want := range []string{"alice@example.com", "budget.xlsx", "Finance", "plan.doc", "role=\"tree\""} {
+	for _, want := range []string{"alice@example.com", "budget.xlsx", "Finance", "plan.doc", "role=\"tree\"",
+		// The per-account report carries the export-review decision coloring.
+		`class="row st-keep"`, `class="row st-delete"`, `class="row st-partial-mixed"`,
+		`<span class="chip chip-keep">keep</span>`} {
 		if !strings.Contains(html, want) {
 			t.Errorf("HTML missing %q", want)
 		}

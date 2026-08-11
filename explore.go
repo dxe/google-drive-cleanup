@@ -19,15 +19,21 @@ var exploreCmd = &cobra.Command{
 owned by <account> (a Google email or owner id) in the context of the folder
 hierarchy that holds them. Ancestor folders are included so each owned item has
 a path; folders owned by the account are bold and every folder shows a count of
-the owned items beneath it. The tree is collapsible (collapsed by default) and
-keyboard-navigable. All CSS/JS is inlined so the file can be emailed as-is.
+the owned items beneath it. Rows carry the same keep/delete coloring as
+'export-review' — delete subtrees red, keep green, mixed yellow, pale for
+partially-decided ones — and folders show a ✓/✕/? tally of the decisions beneath
+them. The tree is collapsible (collapsed by default) and keyboard-navigable. All
+CSS/JS is inlined so the file can be emailed as-is.
 
 With no account argument, one HTML file is written per owner found in the
 database (skipping owners with neither an email nor an owner id).
 
 With --all-external (and no account argument), a single _all-external.html is
 written instead, combining every account whose owner is not on a configured
-internal domain into one tree with pooled file/folder counts.`,
+internal domain into one tree with pooled file/folder counts. There, each folder
+also gets a popover breaking its contents down per owner: how many folders and
+files each one owns beneath it, and how many of those are keep / delete /
+undecided.`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dbPath, _ := cmd.Flags().GetString("db")
@@ -166,8 +172,8 @@ func writeOwnedFilesHTML(db *sql.DB, account, outDir, crawlRoot string) (string,
 }
 
 // renderOwnedFilesHTML writes the ownership tree in roots to outPath, tallying
-// the pooled owned file/folder counts across every root. account and
-// displayName populate the report header.
+// the pooled owned file/folder counts across every root, split by keep/delete/
+// undecided decision. account and displayName populate the report header.
 func renderOwnedFilesHTML(outPath, account, displayName, crawlRoot string, roots []*exploreNode) error {
 	f, err := os.Create(outPath)
 	if err != nil {
@@ -175,17 +181,27 @@ func renderOwnedFilesHTML(outPath, account, displayName, crawlRoot string, roots
 	}
 	defer f.Close()
 
+	// Only owned items are tallied: the ancestor folders in the tree are there
+	// for context and belong to somebody else.
 	var totalFolders, totalFiles int
-	for _, r := range roots {
-		totalFolders += r.ownedFolders
-		totalFiles += r.ownedFiles
-		if r.owned {
-			if r.typ == typeFolder {
+	var folderTotals, fileTotals decisionCounts
+	var tally func(n *exploreNode)
+	tally = func(n *exploreNode) {
+		if n.owned {
+			if n.typ == typeFolder {
 				totalFolders++
+				folderTotals.add(n.decision, 1)
 			} else {
 				totalFiles++
+				fileTotals.add(n.decision, 1)
 			}
 		}
+		for _, c := range n.children {
+			tally(c)
+		}
+	}
+	for _, r := range roots {
+		tally(r)
 	}
 
 	breakdowns, err := ownerBreakdownJSON(roots)
@@ -198,6 +214,8 @@ func renderOwnedFilesHTML(outPath, account, displayName, crawlRoot string, roots
 		DisplayName:  displayName,
 		TotalFolders: totalFolders,
 		TotalFiles:   totalFiles,
+		FolderTotals: folderTotals,
+		FileTotals:   fileTotals,
 		CrawlRoot:    crawlRoot,
 		Roots:        roots,
 		Breakdowns:   breakdowns,
@@ -233,6 +251,10 @@ type exploreData struct {
 	DisplayName  string
 	TotalFolders int
 	TotalFiles   int
+	// FolderTotals/FileTotals split the owned folders and files above across
+	// keep / delete / undecided.
+	FolderTotals decisionCounts
+	FileTotals   decisionCounts
 	CrawlRoot    string
 	Roots        []*exploreNode
 	// Breakdowns is a JSON object mapping a folder's Drive ID to its per-owner
@@ -249,6 +271,34 @@ func (n *exploreNode) OwnedFiles() int          { return n.ownedFiles }
 func (n *exploreNode) Owned() bool              { return n.owned }
 func (n *exploreNode) DriveID() string          { return n.driveID }
 func (n *exploreNode) HasBreakdown() bool       { return len(n.breakdown) > 0 }
+func (n *exploreNode) Decision() string         { return n.decision }
+
+// Status returns the coloring class suffix, matching export-review: folders
+// color by the decision tally of the owned items beneath them, files by their
+// own decision.
+func (n *exploreNode) Status() string {
+	if n.typ == typeFolder {
+		return reviewStatus(n.subtree)
+	}
+	switch n.decision {
+	case decisionKeep:
+		return "keep"
+	case decisionDelete:
+		return "delete"
+	default:
+		return "todo"
+	}
+}
+
+// Desc returns the subtree decision tally excluding the node itself — the counts
+// shown on a folder row, decomposed per owner by that folder's popover.
+func (n *exploreNode) Desc() decisionCounts {
+	d := n.subtree
+	if n.owned {
+		d.add(n.decision, -1)
+	}
+	return d
+}
 
 // ownerBreakdownJSON encodes every folder's per-owner breakdown into a JSON
 // object keyed by Drive ID, for the inline popover script. Folders without a
@@ -303,24 +353,34 @@ const exploreHTML = `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Owned files — {{.Account}}</title>
 <style>
-  :root { color-scheme: light dark; }
+  :root { color-scheme: light dark;
+          --red: #e53935; --green: #43a047; --yellow: #f9a825; }
   body { font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
          margin: 0; padding: 1.5rem; line-height: 1.5; }
   header { margin-bottom: 1rem; }
   h1 { font-size: 1.25rem; margin: 0 0 .25rem; }
   .sub { color: #666; font-size: .9rem; }
   .hint { color: #888; font-size: .8rem; margin-top: .5rem; }
+  .legend { display: flex; flex-wrap: wrap; gap: .4rem 1rem; margin-top: .6rem; font-size: .8rem; color: #555; }
+  .legend .sw { display: inline-block; width: .85rem; height: .85rem; border-radius: .2rem;
+                vertical-align: -.12rem; margin-right: .3rem; border: 1px solid #8884; }
   ul { list-style: none; margin: 0; padding-left: 1.25rem; }
   ul[role=tree] { padding-left: 0; }
   li { margin: 0; }
   .row { display: flex; align-items: center; gap: .35rem; padding: .1rem .35rem;
          border-radius: .3rem; cursor: pointer; outline: none; }
-  .row:hover { background: #00000010; }
-  /* focus-within so the row stays highlighted when its link has focus too */
-  .row:focus, .row:focus-within { background: #1a73e8; color: #fff; }
-  .row:focus .name, .row:focus-within .name { color: #fff; }
-  .row:focus .twisty, .row:focus-within .twisty,
-  .row:focus .counts, .row:focus-within .counts { color: #d6e4ff; }
+  .row:hover { filter: brightness(0.96); }
+  /* An outline rather than a background, so the decision coloring stays visible.
+     focus-within so the row stays highlighted when its link has focus too. */
+  .row:focus, .row:focus-within { outline: 2px solid #1a73e8; outline-offset: -2px; }
+  /* Decision coloring, identical to the export-review reports. */
+  .st-delete         { background: color-mix(in srgb, var(--red) 22%, transparent); }
+  .st-partial-delete { background: color-mix(in srgb, var(--red) 9%, transparent); }
+  .st-keep           { background: color-mix(in srgb, var(--green) 22%, transparent); }
+  .st-partial-keep   { background: color-mix(in srgb, var(--green) 9%, transparent); }
+  .st-mixed          { background: color-mix(in srgb, var(--yellow) 26%, transparent); }
+  .st-partial-mixed  { background: color-mix(in srgb, var(--yellow) 11%, transparent); }
+  .st-todo           { background: transparent; }
   .twisty { width: 1rem; display: inline-block; text-align: center; color: #888;
             cursor: pointer; user-select: none; flex: none; }
   .twisty.leaf { visibility: hidden; }
@@ -328,20 +388,26 @@ const exploreHTML = `<!DOCTYPE html>
   .name { text-decoration: none; color: inherit; cursor: pointer; }
   .name:hover { text-decoration: underline; }
   .owned > .row .name { font-weight: 700; }
+  .chip { font-size: .65rem; font-weight: 700; text-transform: uppercase; border-radius: .25rem;
+          padding: 0 .3rem; flex: none; letter-spacing: .03em; }
+  .chip-keep   { background: var(--green); color: #fff; }
+  .chip-delete { background: var(--red); color: #fff; }
   .ext-link { color: #888; display: inline-flex; align-items: center; margin-left: .2rem;
               opacity: .55; flex: none; text-decoration: none; }
   .ext-link:hover { opacity: 1; }
-  .row:focus .ext-link, .row:focus-within .ext-link { color: #d6e4ff; opacity: .75; }
-  .counts { color: #777; font-size: .8rem; margin-left: .4rem; white-space: nowrap; }
+  .counts { color: #777; font-size: .8rem; margin-left: .4rem; white-space: nowrap;
+            font-variant-numeric: tabular-nums; }
+  .counts .ck { color: var(--green); }
+  .counts .cd { color: var(--red); }
+  .counts .cu { color: #888; }
   .owners-btn { color: #888; background: none; border: none; padding: 0 .15rem; margin-left: .1rem;
                 display: inline-flex; align-items: center; opacity: .55; flex: none; cursor: pointer; }
   .owners-btn:hover { opacity: 1; }
-  .row:focus .owners-btn, .row:focus-within .owners-btn { color: #d6e4ff; opacity: .75; }
   /* collapsed by default: hide child lists unless the li is expanded */
   li > ul { display: none; }
   li[aria-expanded=true] > ul { display: block; }
   /* per-owner breakdown popover, positioned in JS */
-  #owner-popover { position: fixed; z-index: 10; max-width: min(90vw, 30rem); max-height: 60vh; overflow: auto;
+  #owner-popover { position: fixed; z-index: 10; max-width: min(92vw, 42rem); max-height: 60vh; overflow: auto;
                    background: Canvas; color: CanvasText; border: 1px solid #8888; border-radius: .4rem;
                    box-shadow: 0 4px 16px #0004; padding: .5rem .6rem; font-size: .85rem; }
   #owner-popover[hidden] { display: none; }
@@ -350,12 +416,36 @@ const exploreHTML = `<!DOCTYPE html>
   #owner-popover th, #owner-popover td { text-align: left; padding: .1rem .5rem .1rem 0; white-space: nowrap; }
   #owner-popover td.num, #owner-popover th.num { text-align: right; padding-right: 0; padding-left: 1rem; font-variant-numeric: tabular-nums; }
   #owner-popover thead th { color: #888; font-weight: 500; border-bottom: 1px solid #8884; }
+  /* Truncate long owner labels (title carries the full text) so the count
+     columns always stay in view. */
+  #owner-popover td.owner { max-width: 20rem; overflow: hidden; text-overflow: ellipsis; }
+  #owner-popover .ck { color: var(--green); }
+  #owner-popover .cd { color: var(--red); }
+  #owner-popover .cu { color: #888; }
+  /* Divider between the "what they own" and "how it's decided" column groups. */
+  #owner-popover td.split, #owner-popover th.split { border-left: 1px solid #8884; padding-left: .55rem; }
 </style>
 </head>
 <body>
 <header>
   <h1>Files &amp; folders owned by {{.Account}}{{if .DisplayName}} ({{.DisplayName}}){{end}}</h1>
   <div class="sub">📁 {{.TotalFolders}} folders &nbsp; 📄 {{.TotalFiles}} files owned. Bold = owned by this account.</div>
+  <div class="sub">
+    Owned folders: <b>{{.FolderTotals.Keep}}</b> keep · <b>{{.FolderTotals.Delete}}</b> delete · <b>{{.FolderTotals.Undecided}}</b> undecided
+    &nbsp;|&nbsp;
+    Owned files: <b>{{.FileTotals.Keep}}</b> keep · <b>{{.FileTotals.Delete}}</b> delete · <b>{{.FileTotals.Undecided}}</b> undecided
+  </div>
+  <div class="legend">
+    <span><span class="sw" style="background:color-mix(in srgb, var(--red) 22%, transparent)"></span>delete (whole subtree)</span>
+    <span><span class="sw" style="background:color-mix(in srgb, var(--green) 22%, transparent)"></span>keep</span>
+    <span><span class="sw" style="background:color-mix(in srgb, var(--yellow) 26%, transparent)"></span>mixed: keep and delete, nothing left undecided</span>
+    <span><span class="sw" style="background:color-mix(in srgb, var(--yellow) 11%, transparent)"></span>partly mixed: keep and delete, some still undecided</span>
+    <span><span class="sw" style="background:color-mix(in srgb, var(--red) 9%, transparent)"></span>/<span class="sw" style="background:color-mix(in srgb, var(--green) 9%, transparent); margin-left:.3rem"></span>partially decided</span>
+    <span><span class="sw"></span>undecided</span>
+  </div>
+  <div class="hint">Folder rows count the owned items beneath them — 📁 folders, 📄 files — then how those
+    same items are marked: <span style="color:var(--green)">✓ keep</span> · <span style="color:var(--red)">✕ delete</span> · ? undecided.
+    Row colors follow that tally; only items shown in this report are counted.</div>
   <div class="hint">Click a ▶ or folder name to expand. Keyboard: ↑/↓ move, →/← expand/collapse, Enter or Space toggles.</div>
   <div class="hint"><a href="https://drive.google.com/drive/search?q=owner:me%20parent:{{.CrawlRoot}}%20-type:folders" target="_blank" rel="noopener">View my files in Drive</a></div>
 </header>
@@ -369,11 +459,12 @@ const exploreHTML = `<!DOCTYPE html>
 
 {{define "node"}}
 <li role="treeitem"{{if .Owned}} class="owned"{{end}}{{if .Children}} aria-expanded="false"{{end}}>
-  <div class="row" tabindex="-1">
+  <div class="row st-{{.Status}}" tabindex="-1">
     {{if .Children}}<span class="twisty" aria-hidden="true">▶</span>{{else}}<span class="twisty leaf" aria-hidden="true">▶</span>{{end}}
     <span class="icon">{{if isFolder .}}📁{{else}}📄{{end}}</span>
     {{if isFolder .}}<span class="name">{{.Name}}</span><a class="ext-link" href="{{driveURL .}}" target="_blank" rel="noopener" title="Open in Google Drive" tabindex="-1"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg></a>{{else}}<a class="name" href="{{driveURL .}}" target="_blank" rel="noopener">{{.Name}}</a>{{end}}
-    {{if isFolder .}}<span class="counts">📁 {{.OwnedFolders}} &nbsp; 📄 {{.OwnedFiles}}</span>{{end}}
+    {{if .Decision}}<span class="chip chip-{{.Decision}}">{{.Decision}}</span>{{end}}
+    {{if isFolder .}}<span class="counts">📁 {{.OwnedFolders}} &nbsp; 📄 {{.OwnedFiles}}</span>{{with .Desc}}<span class="counts"><span class="ck">✓{{.Keep}}</span> <span class="cd">✕{{.Delete}}</span> <span class="cu">?{{.Undecided}}</span></span>{{end}}{{end}}
     {{if .HasBreakdown}}<button type="button" class="owners-btn" data-node="{{.DriveID}}" title="Show owners of items in this folder" aria-label="Show owners" tabindex="-1"><svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></button>{{end}}
   </div>
   {{if .Children}}
@@ -484,13 +575,26 @@ const exploreHTML = `<!DOCTYPE html>
     h.textContent = rowsData.length + (rowsData.length === 1 ? ' external owner' : ' external owners') + ' in this folder';
     popover.appendChild(h);
 
+    // Owner, then what they own by type, then how those items are decided.
+    var COLS = [
+      {head: '📁', key: 'folders', cls: '',   title: 'folders owned'},
+      {head: '📄', key: 'files',   cls: '',   title: 'files owned'},
+      {head: '✓',  key: 'keep',    cls: 'ck split', title: 'marked keep'},
+      {head: '✕',  key: 'delete',  cls: 'cd', title: 'marked delete'},
+      {head: '?',  key: 'undecided', cls: 'cu', title: 'undecided'}
+    ];
+
     var table = document.createElement('table');
     var thead = document.createElement('thead');
     var htr = document.createElement('tr');
-    ['Owner', '📁', '📄'].forEach(function (label, i) {
+    var owner = document.createElement('th');
+    owner.textContent = 'Owner';
+    htr.appendChild(owner);
+    COLS.forEach(function (c) {
       var th = document.createElement('th');
-      th.textContent = label;
-      if (i > 0) th.className = 'num';
+      th.textContent = c.head;
+      th.title = c.title;
+      th.className = 'num ' + c.cls;
       htr.appendChild(th);
     });
     thead.appendChild(htr);
@@ -500,16 +604,16 @@ const exploreHTML = `<!DOCTYPE html>
     rowsData.forEach(function (r) {
       var tr = document.createElement('tr');
       var name = document.createElement('td');
+      name.className = 'owner';
       name.textContent = r.label;
-      var folders = document.createElement('td');
-      folders.className = 'num';
-      folders.textContent = r.folders;
-      var files = document.createElement('td');
-      files.className = 'num';
-      files.textContent = r.files;
+      name.title = r.label;
       tr.appendChild(name);
-      tr.appendChild(folders);
-      tr.appendChild(files);
+      COLS.forEach(function (c) {
+        var td = document.createElement('td');
+        td.className = 'num ' + c.cls;
+        td.textContent = r[c.key];
+        tr.appendChild(td);
+      });
       tbody.appendChild(tr);
     });
     table.appendChild(tbody);

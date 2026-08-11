@@ -818,6 +818,13 @@ type exploreNode struct {
 	children []*exploreNode
 	// The node's recorded owner, used to build per-owner breakdowns.
 	ownerEmail, ownerID, ownerDisplay sql.NullString
+	// decision is the node's keep/delete state as marked in the review UI
+	// (decisionNone when undecided).
+	decision string
+	// subtree tallies decisions over the owned items in this node's subtree, the
+	// node itself included when it is owned. Drives the red/green/yellow
+	// coloring. See computeExploreDecisions.
+	subtree decisionCounts
 	// ownedFolders/ownedFiles count owned descendants in this node's subtree
 	// (excluding the node itself), split by type. Only meaningful for folders.
 	ownedFolders int
@@ -829,11 +836,15 @@ type exploreNode struct {
 }
 
 // personCount is one row of a folder's per-owner breakdown: how many folders and
-// files a single owner owns within that folder's subtree.
+// files a single owner owns within that folder's subtree, and how those items
+// are split across keep / delete / undecided.
 type personCount struct {
 	Label   string `json:"label"`
 	Folders int    `json:"folders"`
 	Files   int    `json:"files"`
+	// decisionCounts is embedded (and so flattens into the JSON the popover
+	// script reads) and covers the same items as Folders+Files.
+	decisionCounts
 }
 
 // ownerMatcher decides, for a node's recorded owner, whether the node counts as
@@ -885,7 +896,8 @@ func externalOwnedAndAncestors(db *sql.DB, internalDomains []string) (roots []*e
 // no included parent), the first display name the matcher surfaces, and
 // per-folder owned-descendant counts. Roots is empty when nothing matches.
 func ownedAndAncestorsMatching(db *sql.DB, match ownerMatcher) (roots []*exploreNode, displayName string, err error) {
-	rows, err := db.Query(`SELECT id, drive_id, name, type, parent_id, owner_email, owner_id, owner_display_name FROM nodes`)
+	rows, err := db.Query(`SELECT id, drive_id, name, type, parent_id, owner_email, owner_id, owner_display_name,
+		decision FROM nodes`)
 	if err != nil {
 		return nil, "", err
 	}
@@ -897,7 +909,8 @@ func ownedAndAncestorsMatching(db *sql.DB, match ownerMatcher) (roots []*explore
 			n                   exploreNode
 			email, oid, display sql.NullString
 		)
-		if err := rows.Scan(&n.rowID, &n.driveID, &n.name, &n.typ, &n.parentID, &email, &oid, &display); err != nil {
+		if err := rows.Scan(&n.rowID, &n.driveID, &n.name, &n.typ, &n.parentID, &email, &oid, &display,
+			&n.decision); err != nil {
 			return nil, "", err
 		}
 		n.ownerEmail, n.ownerID, n.ownerDisplay = email, oid, display
@@ -947,6 +960,7 @@ func ownedAndAncestorsMatching(db *sql.DB, match ownerMatcher) (roots []*explore
 	for _, r := range roots {
 		sortChildren(r)
 		countOwned(r)
+		computeExploreDecisions(r)
 	}
 	sortNodes(roots)
 	return roots, displayName, nil
@@ -993,12 +1007,30 @@ func countOwned(n *exploreNode) (folders, files int) {
 	return folders, files
 }
 
+// computeExploreDecisions fills in each node's subtree decision tally bottom-up.
+// Only *owned* nodes are counted — the ancestor folders in the tree belong to
+// somebody else and are there for context — so a folder's tally covers exactly
+// the items its ownedFolders/ownedFiles counts and its per-owner breakdown do.
+// The coloring derived from these tallies therefore describes the owned items
+// the report shows, not the whole Drive folder.
+func computeExploreDecisions(n *exploreNode) decisionCounts {
+	var c decisionCounts
+	if n.owned {
+		c.add(n.decision, 1)
+	}
+	for _, ch := range n.children {
+		c.addAll(computeExploreDecisions(ch))
+	}
+	n.subtree = c
+	return c
+}
+
 // buildOwnerBreakdowns fills each folder node's breakdown with the per-owner
-// counts of the owned items in its subtree (excluding the folder itself),
-// mirroring what `owners --folder <that folder>` reports but restricted to the
-// owned set the tree was built from (external accounts, for the all-external
-// report). Rows are ordered files-desc, then total-desc, then label, matching
-// the owners report.
+// counts of the owned items in its subtree (excluding the folder itself), split
+// by type and by keep/delete/undecided decision, mirroring what
+// `owners --folder <that folder>` reports but restricted to the owned set the
+// tree was built from (external accounts, for the all-external report). Rows are
+// ordered files-desc, then total-desc, then label, matching the owners report.
 func buildOwnerBreakdowns(roots []*exploreNode) {
 	for _, r := range roots {
 		accumulateOwners(r)
@@ -1010,7 +1042,7 @@ func buildOwnerBreakdowns(roots []*exploreNode) {
 // descendants-only breakdown on n.breakdown along the way.
 func accumulateOwners(n *exploreNode) map[string]*personCount {
 	agg := make(map[string]*personCount)
-	add := func(key, label string, folder bool) {
+	add := func(key, label string, folder bool, decision string) {
 		e := agg[key]
 		if e == nil {
 			e = &personCount{Label: label}
@@ -1021,6 +1053,7 @@ func accumulateOwners(n *exploreNode) map[string]*personCount {
 		} else {
 			e.Files++
 		}
+		e.add(decision, 1)
 	}
 	for _, c := range n.children {
 		for key, v := range accumulateOwners(c) {
@@ -1031,6 +1064,7 @@ func accumulateOwners(n *exploreNode) map[string]*personCount {
 			}
 			e.Folders += v.Folders
 			e.Files += v.Files
+			e.addAll(v.decisionCounts)
 		}
 	}
 	// At this point agg holds descendants only, which is exactly the folder's
@@ -1040,7 +1074,7 @@ func accumulateOwners(n *exploreNode) map[string]*personCount {
 	}
 	if n.owned {
 		key, label := ownerKeyLabel(n)
-		add(key, label, n.typ == typeFolder)
+		add(key, label, n.typ == typeFolder, n.decision)
 	}
 	return agg
 }

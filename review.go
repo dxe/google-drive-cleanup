@@ -160,6 +160,13 @@ func (c *decisionCounts) add(dec string, n int) {
 	}
 }
 
+// addAll accumulates another tally into c.
+func (c *decisionCounts) addAll(o decisionCounts) {
+	c.Keep += o.Keep
+	c.Delete += o.Delete
+	c.Undecided += o.Undecided
+}
+
 // reviewNode is one node of the in-memory decision forest, shared by the tree
 // endpoint and the export-review renderer.
 type reviewNode struct {
@@ -255,10 +262,7 @@ func computeReviewCounts(n *reviewNode) decisionCounts {
 	var c decisionCounts
 	c.add(n.decision, 1)
 	for _, ch := range n.children {
-		sub := computeReviewCounts(ch)
-		c.Keep += sub.Keep
-		c.Delete += sub.Delete
-		c.Undecided += sub.Undecided
+		c.addAll(computeReviewCounts(ch))
 		if ch.typ != typeFolder {
 			n.directFiles.add(ch.decision, 1)
 		}
