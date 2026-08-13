@@ -1160,6 +1160,135 @@ func TestDeleteStaleNodesUnderDeepStaleBelowDetachedSurvivor(t *testing.T) {
 	}
 }
 
+// Pruning copies each removed row to pruned_nodes first, so the work a crawl
+// cannot rebuild from Drive (a review decision, the parent it was last seen in)
+// survives a prune that turns out to have been wrong.
+func TestDeleteStaleNodesBacksUpPrunedRows(t *testing.T) {
+	db := testDB(t)
+	const cutoff = "2026-06-01T00:00:00Z"
+	old, fresh := "2026-05-01T00:00:00Z", "2026-06-15T00:00:00Z"
+
+	rootID, _, _, _ := mustUpsert(t, db, node{driveID: "root", name: "Root", typ: typeFolder, mimeType: folderMimeType})
+	staleDirID, _, _, _ := mustUpsert(t, db, node{driveID: "staleDir", name: "Gone", typ: typeFolder, mimeType: folderMimeType,
+		parentID: sql.NullInt64{Int64: rootID, Valid: true}})
+	mustUpsert(t, db, node{driveID: "staleChild", name: "gone.txt", typ: typeBinary, mimeType: "application/x",
+		parentID: sql.NullInt64{Int64: staleDirID, Valid: true}})
+	mustUpsert(t, db, node{driveID: "keep", name: "kept.txt", typ: typeBinary, mimeType: "application/x",
+		parentID: sql.NullInt64{Int64: rootID, Valid: true}})
+	if _, err := db.Exec(`UPDATE nodes SET decision = 'keep' WHERE drive_id = 'staleChild'`); err != nil {
+		t.Fatal(err)
+	}
+
+	setCrawledAt(t, db, "root", fresh)
+	setCrawledAt(t, db, "keep", fresh)
+	setCrawledAt(t, db, "staleDir", old)
+	setCrawledAt(t, db, "staleChild", old)
+
+	if _, err := deleteStaleNodes(db, cutoff); err != nil {
+		t.Fatal(err)
+	}
+
+	var backedUp []string
+	rows, err := db.Query(`SELECT drive_id FROM pruned_nodes ORDER BY drive_id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		backedUp = append(backedUp, id)
+	}
+	rows.Close()
+	if got, want := strings.Join(backedUp, ","), "staleChild,staleDir"; got != want {
+		t.Errorf("pruned_nodes drive_ids = %q, want %q (survivors must not be backed up)", got, want)
+	}
+
+	// The backed-up row carries the review decision and the parent it was last
+	// seen in, resolved to a Drive ID (row ids do not survive a re-crawl).
+	var decision, prunedBy, crawledAt string
+	var parentDriveID sql.NullString
+	if err := db.QueryRow(`
+		SELECT decision, pruned_by, crawled_at, parent_drive_id
+		FROM pruned_nodes WHERE drive_id = 'staleChild'`).
+		Scan(&decision, &prunedBy, &crawledAt, &parentDriveID); err != nil {
+		t.Fatal(err)
+	}
+	if decision != "keep" {
+		t.Errorf("backed-up decision = %q, want %q", decision, "keep")
+	}
+	if prunedBy != prunedByCrawl {
+		t.Errorf("pruned_by = %q, want %q", prunedBy, prunedByCrawl)
+	}
+	if crawledAt != old {
+		t.Errorf("backed-up crawled_at = %q, want %q", crawledAt, old)
+	}
+	if parentDriveID.String != "staleDir" {
+		t.Errorf("parent_drive_id = %v, want %q", parentDriveID, "staleDir")
+	}
+
+	// A node re-crawled and pruned again appends a second row: the table is an
+	// append-only history, not a keyed snapshot.
+	mustUpsert(t, db, node{driveID: "staleChild", name: "gone.txt", typ: typeBinary, mimeType: "application/x"})
+	setCrawledAt(t, db, "staleChild", old)
+	if _, err := deleteStaleNodes(db, cutoff); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pruned_nodes WHERE drive_id = 'staleChild'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("pruned_nodes rows for staleChild = %d, want 2 (one per prune)", n)
+	}
+}
+
+// A --folder re-index backs up its pruned rows the same way, tagged with the
+// sweep that removed them.
+func TestDeleteStaleNodesUnderBacksUpPrunedRows(t *testing.T) {
+	db := testDB(t)
+	const cutoff = "2026-06-01T00:00:00Z"
+	old, fresh := "2026-05-01T00:00:00Z", "2026-06-15T00:00:00Z"
+
+	aID, _, _, _ := mustUpsert(t, db, node{driveID: "A", name: "A", typ: typeFolder, mimeType: folderMimeType})
+	mustUpsert(t, db, node{driveID: "aStale", name: "gone.txt", typ: typeBinary, mimeType: "application/x",
+		parentID: sql.NullInt64{Int64: aID, Valid: true}})
+	// Stale, but outside the re-indexed subtree: not pruned, so not backed up.
+	mustUpsert(t, db, node{driveID: "B", name: "b.txt", typ: typeBinary, mimeType: "application/x"})
+
+	setCrawledAt(t, db, "A", fresh)
+	setCrawledAt(t, db, "aStale", old)
+	setCrawledAt(t, db, "B", old)
+
+	if _, err := deleteStaleNodesUnder(db, "A", cutoff); err != nil {
+		t.Fatal(err)
+	}
+
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pruned_nodes`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("pruned_nodes rows = %d, want 1 (only the in-scope stale node)", n)
+	}
+	var driveID, prunedBy string
+	var parentDriveID sql.NullString
+	if err := db.QueryRow(`SELECT drive_id, pruned_by, parent_drive_id FROM pruned_nodes`).
+		Scan(&driveID, &prunedBy, &parentDriveID); err != nil {
+		t.Fatal(err)
+	}
+	if driveID != "aStale" {
+		t.Errorf("backed-up drive_id = %q, want %q", driveID, "aStale")
+	}
+	if prunedBy != prunedByCrawlFolder {
+		t.Errorf("pruned_by = %q, want %q", prunedBy, prunedByCrawlFolder)
+	}
+	if parentDriveID.String != "A" {
+		t.Errorf("parent_drive_id = %v, want %q", parentDriveID, "A")
+	}
+}
+
 func TestWipeCrawlSnapshot(t *testing.T) {
 	db := testDB(t)
 	rootID, _, _, _ := mustUpsert(t, db, node{driveID: "root", name: "Root", typ: typeFolder, mimeType: folderMimeType})

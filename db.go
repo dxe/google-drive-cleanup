@@ -1218,11 +1218,57 @@ func wipeCrawlSnapshot(db *sql.DB) error {
 	return tx.Commit()
 }
 
+// Values recorded in pruned_nodes.pruned_by: which stale-row sweep removed the
+// row (a whole-tree crawl, or a --folder re-index).
+const (
+	prunedByCrawl       = "crawl"
+	prunedByCrawlFolder = "crawl_folder"
+)
+
+// backupNodes copies into pruned_nodes every nodes row matching whereSQL — an
+// expression over the alias n, with its own placeholders bound from args —
+// before the caller deletes them. Nothing reads pruned_nodes; it is a safety net
+// for a prune that turns out to be wrong (a node whose row carries a review
+// decision or archive bookkeeping that Drive cannot supply again).
+//
+// Call it as the first statement of the deleting transaction, before any row is
+// detached or removed, so the copy records the tree as the crawl found it.
+func backupNodes(tx *sql.Tx, prunedBy, whereSQL string, args ...any) error {
+	_, err := tx.Exec(`
+		INSERT INTO pruned_nodes (
+			pruned_at, pruned_by,
+			node_id, drive_id, name, type, mime_type,
+			owner_email, owner_id, owner_display_name,
+			parent_id, parent_drive_id, shortcut_target_id, children_done, can_edit,
+			crawled_at, decision, last_modified,
+			original_owner_id, original_owner_display_name, original_owner_email,
+			manual_transfer_performed, original_parent_drive_id, archive_folder_drive_id,
+			delete_skipped)
+		SELECT
+			?, ?,
+			n.id, n.drive_id, n.name, n.type, n.mime_type,
+			n.owner_email, n.owner_id, n.owner_display_name,
+			n.parent_id, (SELECT p.drive_id FROM nodes p WHERE p.id = n.parent_id),
+			n.shortcut_target_id, n.children_done, n.can_edit,
+			n.crawled_at, n.decision, n.last_modified,
+			n.original_owner_id, n.original_owner_display_name, n.original_owner_email,
+			n.manual_transfer_performed, n.original_parent_drive_id, n.archive_folder_drive_id,
+			n.delete_skipped
+		FROM nodes n WHERE `+whereSQL,
+		append([]any{now(), prunedBy}, args...)...)
+	if err != nil {
+		return fmt.Errorf("backing up nodes about to be pruned: %w", err)
+	}
+	return nil
+}
+
 // deleteStaleNodes removes every node not re-observed since sessionStart (its
 // crawled_at predates the current crawl session), i.e. items that no longer
 // exist under the root, together with the auxiliary rows that referenced them.
-// It is only safe to call after a crawl completes fully: a partial crawl has
-// not re-observed every live node yet. Returns the number of nodes removed.
+// Each removed row is first copied to pruned_nodes (see backupNodes) so a wrong
+// prune is recoverable; the auxiliary rows are not backed up. It is only safe to
+// call after a crawl completes fully: a partial crawl has not re-observed every
+// live node yet. Returns the number of nodes removed.
 func deleteStaleNodes(db *sql.DB, sessionStart string) (int64, error) {
 	tx, err := db.Begin()
 	if err != nil {
@@ -1230,6 +1276,12 @@ func deleteStaleNodes(db *sql.DB, sessionStart string) (int64, error) {
 	}
 	defer tx.Rollback()
 	if _, err := tx.Exec(`PRAGMA defer_foreign_keys = ON`); err != nil {
+		return 0, err
+	}
+	// Back up before the detach below rewrites any parent_id, so pruned_nodes
+	// records the parentage the crawl actually saw.
+	if err := backupNodes(tx, prunedByCrawl,
+		`n.crawled_at < ? AND n.original_parent_drive_id IS NULL`, sessionStart); err != nil {
 		return 0, err
 	}
 	// A surviving node whose first-discovered parent is going away (a
@@ -1284,8 +1336,9 @@ func pruneOrphanedAuxRows(tx *sql.Tx) error {
 // deleteStaleNodesUnder is the subtree-scoped counterpart of deleteStaleNodes,
 // used by a --folder re-index: it removes only the nodes within the subtree
 // rooted at subfolderDriveID that were not re-observed since cutoff, leaving the
-// rest of the snapshot alone. Like deleteStaleNodes it is only safe after the
-// subtree has been fully re-listed. Returns the number of nodes removed.
+// rest of the snapshot alone. Removed rows are copied to pruned_nodes first,
+// exactly as in deleteStaleNodes. Like deleteStaleNodes it is only safe after
+// the subtree has been fully re-listed. Returns the number of nodes removed.
 func deleteStaleNodesUnder(db *sql.DB, subfolderDriveID, cutoff string) (int64, error) {
 	tx, err := db.Begin()
 	if err != nil {
@@ -1307,6 +1360,13 @@ func deleteStaleNodesUnder(db *sql.DB, subfolderDriveID, cutoff string) (int64, 
 			SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
 		)
 		SELECT id FROM subtree`, subfolderDriveID); err != nil {
+		return 0, err
+	}
+	// Back up before the detach below rewrites any parent_id, so pruned_nodes
+	// records the parentage the re-index actually saw.
+	if err := backupNodes(tx, prunedByCrawlFolder,
+		`n.id IN (SELECT id FROM scoped_subtree)
+		   AND n.crawled_at < ? AND n.original_parent_drive_id IS NULL`, cutoff); err != nil {
 		return 0, err
 	}
 	// A surviving node whose first-discovered parent (within the subtree) is
