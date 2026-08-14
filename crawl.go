@@ -344,7 +344,7 @@ func runCrawl(dbPath, cfgPath string, refresh, wipe bool, subfolder string, conc
 				return fmt.Errorf("removing stale rows from the previous crawl: %w", err)
 			}
 			if removed > 0 {
-				log.Printf("removed %d stale node(s) not seen in this crawl (backed up to pruned_nodes)", removed)
+				log.Printf("pruned %d node(s) no longer under the root (backed up to pruned_nodes)", removed)
 			}
 		}
 		log.Printf("crawl complete: %d folders remaining (children_done=0), %d files seen this run", remaining, c.fileCount.Load())
@@ -433,7 +433,7 @@ func (c *crawler) runScopedCrawl(ctx context.Context, subfolder string) error {
 				return fmt.Errorf("removing stale rows under %q: %w", rel, err)
 			}
 			if removed > 0 {
-				log.Printf("removed %d stale node(s) not seen under %q this run (backed up to pruned_nodes)", removed, rel)
+				log.Printf("pruned %d node(s) no longer under %q (backed up to pruned_nodes)", removed, rel)
 			}
 		}
 		log.Printf("re-index complete: %d folders remaining (children_done=0) under %q, %d files seen this run", remaining, rel, c.fileCount.Load())

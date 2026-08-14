@@ -1231,8 +1231,8 @@ const (
 // for a prune that turns out to be wrong (a node whose row carries a review
 // decision or archive bookkeeping that Drive cannot supply again).
 //
-// Call it as the first statement of the deleting transaction, before any row is
-// detached or removed, so the copy records the tree as the crawl found it.
+// Call it before any row is detached or removed, so the copy records the tree as
+// the crawl found it.
 func backupNodes(tx *sql.Tx, prunedBy, whereSQL string, args ...any) error {
 	_, err := tx.Exec(`
 		INSERT INTO pruned_nodes (
@@ -1264,51 +1264,142 @@ func backupNodes(tx *sql.Tx, prunedBy, whereSQL string, args ...any) error {
 
 // deleteStaleNodes removes every node not re-observed since sessionStart (its
 // crawled_at predates the current crawl session), i.e. items that no longer
-// exist under the root, together with the auxiliary rows that referenced them.
-// Each removed row is first copied to pruned_nodes (see backupNodes) so a wrong
-// prune is recoverable; the auxiliary rows are not backed up. It is only safe to
-// call after a crawl completes fully: a partial crawl has not re-observed every
-// live node yet. Returns the number of nodes removed.
+// exist under the root, together with everything beneath them and the auxiliary
+// rows that referenced them. Each removed row is first copied to pruned_nodes
+// (see backupNodes) so a wrong prune is recoverable; the auxiliary rows are not
+// backed up. It is only safe to call after a crawl completes fully: a partial
+// crawl has not re-observed every live node yet. Returns the number of nodes
+// removed.
 func deleteStaleNodes(db *sql.DB, sessionStart string) (int64, error) {
+	return pruneStaleNodes(db, prunedByCrawl, sessionStart, "")
+}
+
+// stalePredicate is the SQL test for "this row is stale", over the given table
+// alias: not re-observed since the sweep's cutoff, and not archived. It takes
+// one placeholder (the cutoff). Archived rows (original_parent_drive_id set) are
+// exempt from pruning: when the archive tree is crawled (the normal case) they
+// are re-observed and fresh anyway, but if the archive section was removed or
+// misconfigured this keeps a full crawl from destroying the archival records
+// that restore and delete depend on. A row whose item truly vanished from Drive
+// self-heals later: delete treats a 404 as already deleted and removes the row.
+//
+// scoped adds the subtree restriction used by a --folder re-index, which must
+// leave everything outside the re-indexed subtree alone; it requires the
+// scoped_subtree temp table to exist.
+func stalePredicate(alias string, scoped bool) string {
+	return alias + `.crawled_at < ? AND ` + alias + `.original_parent_drive_id IS NULL` +
+		scopeClause(alias, scoped)
+}
+
+// pruneStaleNodes is the shared implementation of deleteStaleNodes and
+// deleteStaleNodesUnder: it removes the rows stale as of cutoff plus everything
+// beneath them, backing each one up to pruned_nodes under the prunedBy label.
+// subfolder scopes the sweep to one subtree (a --folder re-index); "" sweeps the
+// whole snapshot.
+//
+// The prune cascades because a stale folder's children are not necessarily stale
+// themselves: a folder left half-listed by an earlier crawl stays in the pending
+// queue and is listed again on the next run — refreshing its children — even
+// when the folder has since been moved or deleted out of the crawl root and so
+// is never re-observed through its own parent. Deleting only the folder would
+// strand those fresh children as top-level roots that no later crawl ever visits
+// again.
+func pruneStaleNodes(db *sql.DB, prunedBy, cutoff, subfolder string) (int64, error) {
+	scoped := subfolder != ""
 	tx, err := db.Begin()
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
+	// nodes.parent_id self-references nodes; defer the check so deleting a whole
+	// subtree at once does not trip on parent-before-child ordering.
 	if _, err := tx.Exec(`PRAGMA defer_foreign_keys = ON`); err != nil {
 		return 0, err
 	}
-	// Back up before the detach below rewrites any parent_id, so pruned_nodes
-	// records the parentage the crawl actually saw.
-	if err := backupNodes(tx, prunedByCrawl,
-		`n.crawled_at < ? AND n.original_parent_drive_id IS NULL`, sessionStart); err != nil {
+
+	if scoped {
+		// Snapshot the subtree membership before mutating anything: the rescue and
+		// detach steps below sever parent links, which would otherwise hide
+		// still-deeper rows from a recursive walk recomputed afterwards. A rollback
+		// drops this temp table with the rest of the tx.
+		if _, err := tx.Exec(`
+			CREATE TEMP TABLE scoped_subtree AS
+			WITH RECURSIVE subtree(id) AS (
+				SELECT id FROM nodes WHERE drive_id = ?
+				UNION ALL
+				SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
+			)
+			SELECT id FROM subtree`, subfolder); err != nil {
+			return 0, err
+		}
+	}
+
+	// Rescue the multi-parent case before the cascade is computed. A node Drive
+	// reports under several parents keeps its first-discovered one in parent_id;
+	// if that parent goes stale while the node itself was re-observed through
+	// another (surviving) parent, the node still exists in the tree and must not
+	// be swept away with its old parent's subtree. Reparenting it onto the
+	// surviving parent both saves it and keeps the cascade below from reaching
+	// it — and, since the walk descends through parent_id, spares its subtree too.
+	if _, err := tx.Exec(`
+		UPDATE nodes SET parent_id = (
+			SELECT p.id FROM extra_parents ep JOIN nodes p ON p.drive_id = ep.parent_drive_id
+			WHERE ep.node_drive_id = nodes.drive_id AND NOT (`+stalePredicate("p", scoped)+`)
+			LIMIT 1)
+		WHERE NOT (`+stalePredicate("nodes", scoped)+`)
+		  AND parent_id IN (SELECT n.id FROM nodes n WHERE `+stalePredicate("n", scoped)+`)
+		  AND EXISTS (
+			SELECT 1 FROM extra_parents ep JOIN nodes p ON p.drive_id = ep.parent_drive_id
+			WHERE ep.node_drive_id = nodes.drive_id AND NOT (`+stalePredicate("p", scoped)+`))`,
+		cutoff, cutoff, cutoff, cutoff); err != nil {
 		return 0, err
 	}
-	// A surviving node whose first-discovered parent is going away (a
-	// re-discovered multi-parent item whose original parent vanished) would
-	// dangle; detach it to a root rather than block the delete. Archived rows
-	// (original_parent_drive_id set) survive the sweep below even when stale,
-	// so they too must be detached when their parent is pruned.
+
+	// The prune set: every stale row, plus every descendant of one. The walk
+	// stops at archived rows, so an archived item parked under a stale folder
+	// keeps its own subtree (it is detached below instead). UNION rather than
+	// UNION ALL so a parent_id cycle terminates.
+	if _, err := tx.Exec(`
+		CREATE TEMP TABLE prune_set AS
+		WITH RECURSIVE doomed(id) AS (
+			SELECT n.id FROM nodes n WHERE `+stalePredicate("n", scoped)+`
+			UNION
+			SELECT c.id FROM nodes c JOIN doomed d ON c.parent_id = d.id
+			WHERE c.original_parent_drive_id IS NULL`+scopeClause("c", scoped)+`
+		)
+		SELECT id FROM doomed`, cutoff); err != nil {
+		return 0, err
+	}
+
+	// Back up before anything is detached or deleted, so pruned_nodes records the
+	// parentage the crawl actually saw.
+	if err := backupNodes(tx, prunedBy, `n.id IN (SELECT id FROM prune_set)`); err != nil {
+		return 0, err
+	}
+
+	// Whatever survives above a pruned row would dangle on the foreign key; only
+	// rows the cascade deliberately skipped (archived ones) can be in that
+	// position, so detach them to a root rather than block the delete.
 	if _, err := tx.Exec(`
 		UPDATE nodes SET parent_id = NULL
-		WHERE (crawled_at >= ? OR original_parent_drive_id IS NOT NULL)
-		  AND parent_id IN (SELECT id FROM nodes
-		                    WHERE crawled_at < ? AND original_parent_drive_id IS NULL)`,
-		sessionStart, sessionStart); err != nil {
+		WHERE id NOT IN (SELECT id FROM prune_set)
+		  AND parent_id IN (SELECT id FROM prune_set)`); err != nil {
 		return 0, err
 	}
-	// Archived rows are exempt from pruning: when the archive tree is crawled
-	// (the normal case) they are re-observed and fresh anyway, but if the
-	// archive section was removed or misconfigured this keeps a full crawl from
-	// destroying the archival records that restore and delete depend on. A row
-	// whose item truly vanished from Drive self-heals later: delete treats a
-	// 404 as already deleted and removes the row.
-	res, err := tx.Exec(
-		`DELETE FROM nodes WHERE crawled_at < ? AND original_parent_drive_id IS NULL`, sessionStart)
+
+	res, err := tx.Exec(`DELETE FROM nodes WHERE id IN (SELECT id FROM prune_set)`)
 	if err != nil {
 		return 0, err
 	}
 	removed, _ := res.RowsAffected()
+	if _, err := tx.Exec(`DROP TABLE prune_set`); err != nil {
+		return 0, err
+	}
+	if scoped {
+		if _, err := tx.Exec(`DROP TABLE scoped_subtree`); err != nil {
+			return 0, err
+		}
+	}
 	if err := pruneOrphanedAuxRows(tx); err != nil {
 		return 0, err
 	}
@@ -1316,6 +1407,16 @@ func deleteStaleNodes(db *sql.DB, sessionStart string) (int64, error) {
 		return 0, err
 	}
 	return removed, nil
+}
+
+// scopeClause is the subtree restriction of stalePredicate on its own, for the
+// cascade step — which selects descendants regardless of their crawled_at but
+// must still stay inside a --folder re-index's subtree. Takes no placeholder.
+func scopeClause(alias string, scoped bool) string {
+	if !scoped {
+		return ""
+	}
+	return ` AND ` + alias + `.id IN (SELECT id FROM scoped_subtree)`
 }
 
 // pruneOrphanedAuxRows deletes folder_permissions and extra_parents rows whose
@@ -1335,73 +1436,13 @@ func pruneOrphanedAuxRows(tx *sql.Tx) error {
 
 // deleteStaleNodesUnder is the subtree-scoped counterpart of deleteStaleNodes,
 // used by a --folder re-index: it removes only the nodes within the subtree
-// rooted at subfolderDriveID that were not re-observed since cutoff, leaving the
-// rest of the snapshot alone. Removed rows are copied to pruned_nodes first,
-// exactly as in deleteStaleNodes. Like deleteStaleNodes it is only safe after
-// the subtree has been fully re-listed. Returns the number of nodes removed.
+// rooted at subfolderDriveID that were not re-observed since cutoff (and
+// whatever sits beneath them), leaving the rest of the snapshot alone. Removed
+// rows are copied to pruned_nodes first, exactly as in deleteStaleNodes. Like
+// deleteStaleNodes it is only safe after the subtree has been fully re-listed.
+// Returns the number of nodes removed.
 func deleteStaleNodesUnder(db *sql.DB, subfolderDriveID, cutoff string) (int64, error) {
-	tx, err := db.Begin()
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback()
-	if _, err := tx.Exec(`PRAGMA defer_foreign_keys = ON`); err != nil {
-		return 0, err
-	}
-	// Snapshot the subtree membership before mutating anything. Detaching a
-	// survivor below (next statement) severs its parent link, which would
-	// otherwise hide still-deeper stale rows from a recursive walk recomputed
-	// after the detach. A rollback drops this temp table with the rest of the tx.
-	if _, err := tx.Exec(`
-		CREATE TEMP TABLE scoped_subtree AS
-		WITH RECURSIVE subtree(id) AS (
-			SELECT id FROM nodes WHERE drive_id = ?
-			UNION ALL
-			SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
-		)
-		SELECT id FROM subtree`, subfolderDriveID); err != nil {
-		return 0, err
-	}
-	// Back up before the detach below rewrites any parent_id, so pruned_nodes
-	// records the parentage the re-index actually saw.
-	if err := backupNodes(tx, prunedByCrawlFolder,
-		`n.id IN (SELECT id FROM scoped_subtree)
-		   AND n.crawled_at < ? AND n.original_parent_drive_id IS NULL`, cutoff); err != nil {
-		return 0, err
-	}
-	// A surviving node whose first-discovered parent (within the subtree) is
-	// going away — a re-discovered multi-parent item whose original parent
-	// vanished — would dangle; detach it to a root rather than block the delete.
-	// Archived rows are kept even when stale (see deleteStaleNodes), so they are
-	// detached too when their parent is pruned.
-	if _, err := tx.Exec(`
-		UPDATE nodes SET parent_id = NULL
-		WHERE id IN (SELECT id FROM scoped_subtree)
-		  AND (crawled_at >= ? OR original_parent_drive_id IS NOT NULL)
-		  AND parent_id IN (
-			SELECT s.id FROM scoped_subtree s JOIN nodes n ON n.id = s.id
-			WHERE n.crawled_at < ? AND n.original_parent_drive_id IS NULL
-		  )`, cutoff, cutoff); err != nil {
-		return 0, err
-	}
-	// Archived rows are exempt, mirroring deleteStaleNodes.
-	res, err := tx.Exec(`
-		DELETE FROM nodes WHERE id IN (SELECT id FROM scoped_subtree)
-		  AND crawled_at < ? AND original_parent_drive_id IS NULL`, cutoff)
-	if err != nil {
-		return 0, err
-	}
-	removed, _ := res.RowsAffected()
-	if _, err := tx.Exec(`DROP TABLE scoped_subtree`); err != nil {
-		return 0, err
-	}
-	if err := pruneOrphanedAuxRows(tx); err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	return removed, nil
+	return pruneStaleNodes(db, prunedByCrawlFolder, cutoff, subfolderDriveID)
 }
 
 // updateSubtreeOwner overwrites the owner fields for every node in the subtree

@@ -972,31 +972,90 @@ func TestDeleteStaleNodes(t *testing.T) {
 	}
 }
 
-// A surviving node whose first-discovered parent goes stale is detached to a
-// root rather than left dangling (or blocking the delete on the foreign key).
-func TestDeleteStaleNodesReparentsSurvivor(t *testing.T) {
+// The prune cascades: a fresh child of a stale folder goes with it. A folder
+// left half-listed by an earlier crawl is listed again on the next run — which
+// refreshes its children — even after it has been moved or deleted out of the
+// crawl root, so "fresh" does not mean "still reachable from the root". Left
+// behind, such a child becomes a top-level root no later crawl ever visits.
+func TestDeleteStaleNodesCascadesToDescendants(t *testing.T) {
 	db := testDB(t)
 	const cutoff = "2026-06-01T00:00:00Z"
+	old, fresh := "2026-05-01T00:00:00Z", "2026-06-15T00:00:00Z"
 
 	staleParentID, _, _, _ := mustUpsert(t, db, node{driveID: "staleParent", name: "Gone", typ: typeFolder, mimeType: folderMimeType})
-	mustUpsert(t, db, node{driveID: "survivor", name: "moved.txt", typ: typeBinary, mimeType: "application/x",
+	freshChildID, _, _, _ := mustUpsert(t, db, node{driveID: "freshChild", name: "Listed Again", typ: typeFolder, mimeType: folderMimeType,
 		parentID: sql.NullInt64{Int64: staleParentID, Valid: true}})
+	mustUpsert(t, db, node{driveID: "grandchild", name: "deep.txt", typ: typeBinary, mimeType: "application/x",
+		parentID: sql.NullInt64{Int64: freshChildID, Valid: true}})
 
-	setCrawledAt(t, db, "staleParent", "2026-05-01T00:00:00Z")
-	setCrawledAt(t, db, "survivor", "2026-06-15T00:00:00Z")
+	setCrawledAt(t, db, "staleParent", old)
+	setCrawledAt(t, db, "freshChild", fresh)
+	setCrawledAt(t, db, "grandchild", fresh)
 
-	if _, err := deleteStaleNodes(db, cutoff); err != nil {
+	removed, err := deleteStaleNodes(db, cutoff)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := nodeTypeByDriveID(db, "staleParent"); err != sql.ErrNoRows {
-		t.Errorf("stale parent should be gone, err=%v", err)
+	if removed != 3 {
+		t.Errorf("removed = %d, want 3 (the stale folder and both descendants)", removed)
+	}
+	for _, id := range []string{"staleParent", "freshChild", "grandchild"} {
+		if _, err := nodeTypeByDriveID(db, id); err != sql.ErrNoRows {
+			t.Errorf("%q should have been pruned with its stale ancestor, err=%v", id, err)
+		}
+	}
+	// Everything swept by the cascade is backed up, not just the stale row.
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pruned_nodes`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Errorf("pruned_nodes rows = %d, want 3", n)
+	}
+}
+
+// The cascade must not sweep away a multi-parent node that is still reachable:
+// it keeps its first-discovered parent in parent_id, so when that parent goes
+// stale the node is reparented onto the surviving parent recorded in
+// extra_parents, which spares its subtree too.
+func TestDeleteStaleNodesRescuesMultiParentSurvivor(t *testing.T) {
+	db := testDB(t)
+	const cutoff = "2026-06-01T00:00:00Z"
+	old, fresh := "2026-05-01T00:00:00Z", "2026-06-15T00:00:00Z"
+
+	liveParentID, _, _, _ := mustUpsert(t, db, node{driveID: "liveParent", name: "Live", typ: typeFolder, mimeType: folderMimeType})
+	staleParentID, _, _, _ := mustUpsert(t, db, node{driveID: "staleParent", name: "Gone", typ: typeFolder, mimeType: folderMimeType})
+	survivorID, _, _, _ := mustUpsert(t, db, node{driveID: "survivor", name: "Shared", typ: typeFolder, mimeType: folderMimeType,
+		parentID: sql.NullInt64{Int64: staleParentID, Valid: true}})
+	mustUpsert(t, db, node{driveID: "survivorChild", name: "kept.txt", typ: typeBinary, mimeType: "application/x",
+		parentID: sql.NullInt64{Int64: survivorID, Valid: true}})
+	tx, _ := db.Begin()
+	if err := recordExtraParent(tx, "survivor", "liveParent"); err != nil {
+		t.Fatal(err)
+	}
+	tx.Commit()
+
+	setCrawledAt(t, db, "liveParent", fresh)
+	setCrawledAt(t, db, "staleParent", old)
+	setCrawledAt(t, db, "survivor", fresh)
+	setCrawledAt(t, db, "survivorChild", fresh)
+
+	removed, err := deleteStaleNodes(db, cutoff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 1 {
+		t.Errorf("removed = %d, want 1 (only the stale parent)", removed)
 	}
 	var parent sql.NullInt64
 	if err := db.QueryRow(`SELECT parent_id FROM nodes WHERE drive_id = 'survivor'`).Scan(&parent); err != nil {
-		t.Fatal(err)
+		t.Fatalf("multi-parent survivor should have been kept: %v", err)
 	}
-	if parent.Valid {
-		t.Errorf("survivor parent_id = %v, want NULL after its parent was removed", parent)
+	if parent.Int64 != liveParentID {
+		t.Errorf("survivor parent_id = %v, want %d (its surviving extra parent)", parent, liveParentID)
+	}
+	if _, err := nodeTypeByDriveID(db, "survivorChild"); err != nil {
+		t.Errorf("the rescued node's subtree should have been spared: %v", err)
 	}
 }
 
@@ -1114,17 +1173,19 @@ func TestDeleteStaleNodesUnder(t *testing.T) {
 	}
 }
 
-// A stale node deep beneath a survivor whose own (stale) parent is being deleted
-// must still be pruned: the subtree is snapshotted before the survivor is
-// detached, so severing its parent link does not hide descendants from the sweep.
-func TestDeleteStaleNodesUnderDeepStaleBelowDetachedSurvivor(t *testing.T) {
+// A stale node deep beneath a rescued survivor whose own (stale) parent is being
+// deleted must still be pruned: the subtree is snapshotted before the survivor
+// is reparented, so severing its old parent link does not hide descendants from
+// the sweep.
+func TestDeleteStaleNodesUnderDeepStaleBelowRescuedSurvivor(t *testing.T) {
 	db := testDB(t)
 	const cutoff = "2026-06-01T00:00:00Z"
 	old, fresh := "2026-05-01T00:00:00Z", "2026-06-15T00:00:00Z"
 
 	// S ── staleParent ── survivor ── deepStale
-	// survivor is re-observed (fresh) but keeps staleParent as first-discovered
-	// parent; staleParent and deepStale vanished from Drive.
+	// survivor is re-observed (fresh) through S, a second parent, but keeps
+	// staleParent as first-discovered parent; staleParent and deepStale vanished
+	// from Drive.
 	sID, _, _, _ := mustUpsert(t, db, node{driveID: "S", name: "S", typ: typeFolder, mimeType: folderMimeType})
 	spID, _, _, _ := mustUpsert(t, db, node{driveID: "staleParent", name: "Gone", typ: typeFolder, mimeType: folderMimeType,
 		parentID: sql.NullInt64{Int64: sID, Valid: true}})
@@ -1132,6 +1193,11 @@ func TestDeleteStaleNodesUnderDeepStaleBelowDetachedSurvivor(t *testing.T) {
 		parentID: sql.NullInt64{Int64: spID, Valid: true}})
 	mustUpsert(t, db, node{driveID: "deepStale", name: "deep.txt", typ: typeBinary, mimeType: "application/x",
 		parentID: sql.NullInt64{Int64: survID, Valid: true}})
+	tx, _ := db.Begin()
+	if err := recordExtraParent(tx, "survivor", "S"); err != nil {
+		t.Fatal(err)
+	}
+	tx.Commit()
 
 	setCrawledAt(t, db, "S", fresh)
 	setCrawledAt(t, db, "staleParent", old)
@@ -1150,13 +1216,14 @@ func TestDeleteStaleNodesUnderDeepStaleBelowDetachedSurvivor(t *testing.T) {
 			t.Errorf("%q should have been deleted, err=%v", id, err)
 		}
 	}
-	// The survivor is kept and detached to a root, mirroring deleteStaleNodes.
+	// The survivor is kept, reparented onto the extra parent it was re-observed
+	// through, mirroring deleteStaleNodes.
 	var parent sql.NullInt64
 	if err := db.QueryRow(`SELECT parent_id FROM nodes WHERE drive_id = 'survivor'`).Scan(&parent); err != nil {
 		t.Fatal(err)
 	}
-	if parent.Valid {
-		t.Errorf("survivor parent_id = %v, want NULL after its stale parent was removed", parent)
+	if parent.Int64 != sID {
+		t.Errorf("survivor parent_id = %v, want %d after its stale parent was removed", parent, sID)
 	}
 }
 
