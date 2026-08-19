@@ -1243,7 +1243,7 @@ func backupNodes(tx *sql.Tx, prunedBy, whereSQL string, args ...any) error {
 			crawled_at, decision, last_modified,
 			original_owner_id, original_owner_display_name, original_owner_email,
 			manual_transfer_performed, original_parent_drive_id, archive_folder_drive_id,
-			delete_skipped)
+			delete_skipped, externals_folder_drive_id, evicted_from_drive_id)
 		SELECT
 			?, ?,
 			n.id, n.drive_id, n.name, n.type, n.mime_type,
@@ -1253,7 +1253,7 @@ func backupNodes(tx *sql.Tx, prunedBy, whereSQL string, args ...any) error {
 			n.crawled_at, n.decision, n.last_modified,
 			n.original_owner_id, n.original_owner_display_name, n.original_owner_email,
 			n.manual_transfer_performed, n.original_parent_drive_id, n.archive_folder_drive_id,
-			n.delete_skipped
+			n.delete_skipped, n.externals_folder_drive_id, n.evicted_from_drive_id
 		FROM nodes n WHERE `+whereSQL,
 		append([]any{now(), prunedBy}, args...)...)
 	if err != nil {
@@ -1275,20 +1275,23 @@ func deleteStaleNodes(db *sql.DB, sessionStart string) (int64, error) {
 }
 
 // stalePredicate is the SQL test for "this row is stale", over the given table
-// alias: not re-observed since the sweep's cutoff, and not archived. It takes
-// one placeholder (the cutoff). Archived rows (original_parent_drive_id set) are
-// exempt from pruning: when the archive tree is crawled (the normal case) they
-// are re-observed and fresh anyway, but if the archive section was removed or
-// misconfigured this keeps a full crawl from destroying the archival records
-// that restore and delete depend on. A row whose item truly vanished from Drive
+// alias: not re-observed since the sweep's cutoff, and neither archived nor
+// evicted. It takes one placeholder (the cutoff). Archived rows
+// (original_parent_drive_id set) are exempt from pruning: when the archive tree
+// is crawled (the normal case) they are re-observed and fresh anyway, but if the
+// archive section was removed or misconfigured this keeps a full crawl from
+// destroying the archival records that restore and delete depend on. Evicted
+// rows (evicted_from_drive_id set) are exempt for the same reason: the externals
+// tree is only crawled when it sits inside the crawl root, and the row is what
+// records where the item came from. A row whose item truly vanished from Drive
 // self-heals later: delete treats a 404 as already deleted and removes the row.
 //
 // scoped adds the subtree restriction used by a --folder re-index, which must
 // leave everything outside the re-indexed subtree alone; it requires the
 // scoped_subtree temp table to exist.
 func stalePredicate(alias string, scoped bool) string {
-	return alias + `.crawled_at < ? AND ` + alias + `.original_parent_drive_id IS NULL` +
-		scopeClause(alias, scoped)
+	return alias + `.crawled_at < ? AND ` + alias + `.original_parent_drive_id IS NULL AND ` +
+		alias + `.evicted_from_drive_id IS NULL` + scopeClause(alias, scoped)
 }
 
 // pruneStaleNodes is the shared implementation of deleteStaleNodes and
@@ -1356,16 +1359,16 @@ func pruneStaleNodes(db *sql.DB, prunedBy, cutoff, subfolder string) (int64, err
 	}
 
 	// The prune set: every stale row, plus every descendant of one. The walk
-	// stops at archived rows, so an archived item parked under a stale folder
-	// keeps its own subtree (it is detached below instead). UNION rather than
-	// UNION ALL so a parent_id cycle terminates.
+	// stops at archived and evicted rows, so an archived item parked under a stale
+	// folder keeps its own subtree (it is detached below instead). UNION rather
+	// than UNION ALL so a parent_id cycle terminates.
 	if _, err := tx.Exec(`
 		CREATE TEMP TABLE prune_set AS
 		WITH RECURSIVE doomed(id) AS (
 			SELECT n.id FROM nodes n WHERE `+stalePredicate("n", scoped)+`
 			UNION
 			SELECT c.id FROM nodes c JOIN doomed d ON c.parent_id = d.id
-			WHERE c.original_parent_drive_id IS NULL`+scopeClause("c", scoped)+`
+			WHERE c.original_parent_drive_id IS NULL AND c.evicted_from_drive_id IS NULL`+scopeClause("c", scoped)+`
 		)
 		SELECT id FROM doomed`, cutoff); err != nil {
 		return 0, err
@@ -1378,8 +1381,8 @@ func pruneStaleNodes(db *sql.DB, prunedBy, cutoff, subfolder string) (int64, err
 	}
 
 	// Whatever survives above a pruned row would dangle on the foreign key; only
-	// rows the cascade deliberately skipped (archived ones) can be in that
-	// position, so detach them to a root rather than block the delete.
+	// rows the cascade deliberately skipped (archived and evicted ones) can be in
+	// that position, so detach them to a root rather than block the delete.
 	if _, err := tx.Exec(`
 		UPDATE nodes SET parent_id = NULL
 		WHERE id NOT IN (SELECT id FROM prune_set)
@@ -1553,8 +1556,12 @@ type archiveTarget struct {
 	originalParent sql.NullString
 	// archiveFolder is the folder's cached replica Drive ID (folders only).
 	archiveFolder sql.NullString
-	deleteSkipped bool
-	depth         int
+	// externalsFolder is the folder's cached replica Drive ID inside the
+	// externals tree (folders only), the evict-externals counterpart of
+	// archiveFolder.
+	externalsFolder sql.NullString
+	deleteSkipped   bool
+	depth           int
 }
 
 // archiveTargetQuery is the shared SELECT for archiveTarget rows. depths ranks
@@ -1574,7 +1581,7 @@ const archiveTargetQuery = `
 	)
 	SELECT n.id, n.drive_id, n.name, n.type, p.drive_id, n.owner_email, n.owner_id,
 	       n.can_edit, n.original_parent_drive_id, n.archive_folder_drive_id,
-	       n.delete_skipped, COALESCE(d.depth, 0)
+	       n.externals_folder_drive_id, n.delete_skipped, COALESCE(d.depth, 0)
 	FROM nodes n
 	LEFT JOIN nodes p ON p.id = n.parent_id
 	LEFT JOIN depths d ON d.id = n.id
@@ -1591,7 +1598,7 @@ func scanArchiveTargets(rows *sql.Rows) ([]archiveTarget, error) {
 		)
 		if err := rows.Scan(&t.rowID, &t.driveID, &t.name, &t.typ, &t.parentDriveID,
 			&t.ownerEmail, &t.ownerID, &canEdit, &t.originalParent, &t.archiveFolder,
-			&skippedInt, &t.depth); err != nil {
+			&t.externalsFolder, &skippedInt, &t.depth); err != nil {
 			return nil, err
 		}
 		t.canEdit = canEdit != 0
@@ -1670,8 +1677,9 @@ func foldersWithReplicas(db *sql.DB) ([]archiveTarget, error) {
 
 // folderChainToRoot returns the folder rows from just below the root down to
 // folderDriveID (inclusive) — the ancestors whose replicas must exist before a
-// child of folderDriveID can be archived. Empty when folderDriveID is a root
-// itself (its replica is the archive root). Cycle-guarded like nodePath.
+// child of folderDriveID can be archived, or evicted into the externals tree.
+// Empty when folderDriveID is a root itself (its replica is the archive or
+// externals root). Cycle-guarded like nodePath.
 func folderChainToRoot(db *sql.DB, folderDriveID string) ([]archiveTarget, error) {
 	var chain []archiveTarget
 	seen := make(map[string]bool)
@@ -1686,10 +1694,11 @@ func folderChainToRoot(db *sql.DB, folderDriveID string) ([]archiveTarget, error
 			parent sql.NullString
 		)
 		err := db.QueryRow(`
-			SELECT n.id, n.drive_id, n.name, n.archive_folder_drive_id, p.drive_id
+			SELECT n.id, n.drive_id, n.name, n.archive_folder_drive_id,
+			       n.externals_folder_drive_id, p.drive_id
 			FROM nodes n LEFT JOIN nodes p ON p.id = n.parent_id
 			WHERE n.drive_id = ?`, cur).
-			Scan(&t.rowID, &t.driveID, &t.name, &t.archiveFolder, &parent)
+			Scan(&t.rowID, &t.driveID, &t.name, &t.archiveFolder, &t.externalsFolder, &parent)
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("folder %s not found in database while walking ancestors of %s", cur, folderDriveID)
 		}
@@ -1781,6 +1790,14 @@ func setArchiveFolder(db *sql.DB, folderDriveID, replicaDriveID string) error {
 // clearArchiveFolder drops a folder's replica cache after the replica is pruned.
 func clearArchiveFolder(db *sql.DB, folderDriveID string) error {
 	_, err := db.Exec(`UPDATE nodes SET archive_folder_drive_id = NULL WHERE drive_id = ?`, folderDriveID)
+	return err
+}
+
+// setExternalsFolder caches a folder's externals-tree replica Drive ID (see the
+// externals_folder_drive_id migration comment).
+func setExternalsFolder(db *sql.DB, folderDriveID, replicaDriveID string) error {
+	_, err := db.Exec(`UPDATE nodes SET externals_folder_drive_id = ? WHERE drive_id = ?`,
+		replicaDriveID, folderDriveID)
 	return err
 }
 
@@ -1878,4 +1895,78 @@ func reparentNode(tx *sql.Tx, driveID string, parentRowID int64) (bool, error) {
 	}
 	n, err := res.RowsAffected()
 	return n > 0, err
+}
+
+// --- evict-externals persistence ---
+
+// evictNode is one node of the subtree evict-externals inspects: enough to tell
+// whose it is, whether a review decision still blocks the run, and whether an
+// externally-owned folder is an empty "leaf" that can leave with nothing but a
+// shortcut inside it.
+type evictNode struct {
+	rowID       int64
+	driveID     string
+	name        string
+	typ         string
+	decision    string
+	ownerEmail  sql.NullString
+	ownerID     sql.NullString
+	parentRowID sql.NullInt64
+	// parentDriveID is the recorded parent's Drive ID. Invalid only for the
+	// subtree root itself when it is also a crawl root.
+	parentDriveID sql.NullString
+	canEdit       bool
+	depth         int // hops below the subtree root, which is itself 0
+}
+
+// subtreeNodes returns every node in the subtree rooted at rootDriveID
+// (inclusive), shallowest first. evict-externals walks the whole subtree in
+// memory — it has to relate each node to its children and its ancestors, which
+// is far easier in Go than in SQL, and a single subtree of one Drive fits
+// comfortably.
+func subtreeNodes(db *sql.DB, rootDriveID string) ([]evictNode, error) {
+	rows, err := db.Query(`
+		WITH RECURSIVE subtree(id, depth) AS (
+			SELECT id, 0 FROM nodes WHERE drive_id = ?
+			UNION ALL
+			SELECT n.id, s.depth + 1 FROM nodes n JOIN subtree s ON n.parent_id = s.id
+		)
+		SELECT n.id, n.drive_id, n.name, n.type, n.decision, n.owner_email, n.owner_id,
+		       n.parent_id, p.drive_id, n.can_edit, s.depth
+		FROM nodes n
+		JOIN subtree s ON s.id = n.id
+		LEFT JOIN nodes p ON p.id = n.parent_id
+		ORDER BY s.depth, n.id`, rootDriveID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []evictNode
+	for rows.Next() {
+		var (
+			n       evictNode
+			canEdit int
+		)
+		if err := rows.Scan(&n.rowID, &n.driveID, &n.name, &n.typ, &n.decision,
+			&n.ownerEmail, &n.ownerID, &n.parentRowID, &n.parentDriveID, &canEdit,
+			&n.depth); err != nil {
+			return nil, err
+		}
+		n.canEdit = canEdit != 0
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
+// markEvicted records that evict-externals moved an item into the externals
+// tree: the folder it came out of is stamped (first value wins, so a re-run
+// cannot overwrite the true origin) and the row is reparented under the replica
+// folder's row, so the snapshot keeps describing where the item actually lives.
+func markEvicted(tx *sql.Tx, driveID, fromParentDriveID string, replicaRowID int64) error {
+	_, err := tx.Exec(`
+		UPDATE nodes SET
+			evicted_from_drive_id = COALESCE(evicted_from_drive_id, ?),
+			parent_id = ?
+		WHERE drive_id = ?`, fromParentDriveID, replicaRowID, driveID)
+	return err
 }

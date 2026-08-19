@@ -1,0 +1,1047 @@
+package main
+
+// The evict-externals command prepares one folder of the crawled tree to be
+// moved into a shared drive.
+//
+// A shared drive can only hold items the org owns. Drive does let you drag a
+// folder in that contains items you do not own — up to 25 of them — but what it
+// does with those items is take them out of the folder entirely and drop them in
+// their own owners' My Drives, where we can no longer see them, let alone move
+// them. Past 25 it refuses the move outright. Either way the outcome is bad: the
+// files are lost to us, or the folder cannot go.
+//
+// So we move them ourselves, first, and into somewhere we keep access to. Every
+// externally-owned item comes out of the subtree and into a parallel "externals"
+// tree we own (config externals.root), where it stays visible, stays shared with
+// the same people, and stays available to the ordinary pack/unpack migration
+// later on if its owner ever hands it over. The folder can then go to the shared
+// drive with nothing left in it that Drive would scatter:
+//
+//	unowned file    -> moved into the externals tree (config externals.root),
+//	                   leaving a shortcut to it behind in its original folder
+//	unowned folder  -> moved into the externals tree as it stands, once it is
+//	                   an empty "leaf" (see below); no shortcut is created,
+//	                   because reclaim-folders already left one behind
+//
+// "Unowned" means what it means everywhere else in this tool: an owner that is
+// neither the running account nor on one of the configured internal-domains.
+// There is no 25-item ceiling on this — it is our own moves, one file at a time.
+//
+// Two things must be settled before any of that is safe, so both are refused up
+// front rather than worked around:
+//
+//   - Anything still marked delete has to be archived first. Those items are
+//     unwanted, may well be unowned, and archiving them is both the cheaper and
+//     the correct way to get them out of the subtree.
+//   - An unowned folder still holding content has to go through reclaim-folders
+//     first. Moving such a folder out would drag its contents — quite possibly
+//     owned ones — along with it. After reclaim-folders each of their folders is
+//     empty except for the "(new) <name>" shortcut pointing at the replacement,
+//     and a folder like that carries nothing but itself.
+//
+// The externals tree mirrors the crawl root's folder structure, so an evicted
+// file keeps its original location and name, and each replica folder gets the
+// original's sharing copied onto it, so everybody who could reach the file
+// before still can. Only the ancestor folders that actually receive something
+// are created; the tree never fills up with empty placeholders.
+//
+// The snapshot is updated as the moves happen — replica folders and the
+// shortcuts left behind become nodes rows, moved items are reparented under
+// their replica and stamped with evicted_from_drive_id — so later runs and a
+// re-crawl see where things really are.
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"log"
+	"os"
+	"strings"
+	"sync"
+
+	"github.com/spf13/cobra"
+	"golang.org/x/time/rate"
+	"google.golang.org/api/drive/v3"
+)
+
+var evictExternalsCmd = &cobra.Command{
+	Use:   "evict-externals <folder_id>",
+	Short: "Move externally-owned items out of a folder so it can go to a shared drive",
+	Long: `Move every externally-owned file and emptied externally-owned folder out of
+<folder_id> (a crawled folder under the crawl root) and into the externals
+folder (config externals.root), so what is left in the subtree is owned by the
+org and the whole folder can be moved into a shared drive.
+
+Why bother, rather than just dragging the folder in: a shared drive cannot hold
+items the org does not own. Drive tolerates up to 25 such items in a folder
+being moved in, and "tolerates" means it pulls them out of the folder and drops
+them into their own owners' My Drives — out of our sight and out of our reach.
+More than 25 and it refuses the move altogether. Evicting them first avoids
+both: they land in a folder WE own, still shared with the same people, still
+visible, and still available to the normal pack/unpack migration later if their
+owner ever hands them over. There is no 25-item limit on this — these are our
+own moves, one file at a time.
+
+"Externally owned" means the same here as everywhere else in this tool: an
+owner that is neither the account running the command nor on one of the
+configured internal-domains.
+
+The run refuses to start, changing nothing, if either of these is outstanding:
+
+  * anything in the subtree is still marked delete — run archive first, so
+    those unwanted (and possibly unowned) items are out of the way instead of
+    being evicted as if they were worth keeping;
+  * an externally-owned folder in the subtree still holds content — run
+    reclaim-folders <owner> first. Moving such a folder out would take its
+    contents with it. A folder that is empty, or that holds nothing but a
+    single shortcut (the "(new) <name>" link reclaim-folders leaves pointing at
+    the replacement), carries nothing but itself and is fine.
+
+What then happens, for each item:
+
+  1. Externally-owned files move into their folder's replica inside the
+     externals tree, and a shortcut to the moved file is created in the folder
+     it came from, so the file is still reachable from where it used to be.
+  2. Externally-owned leaf folders move into their parent's replica, once a
+     live check confirms they are still empty (or still hold just the one
+     shortcut). No shortcut is created for them: reclaim-folders already left
+     a "(new) <name>" link inside them pointing at the folder that took over,
+     and that link travels with the folder.
+
+The externals tree replicates the crawl root's folder structure, under the
+originals' own names, so an evicted file keeps its original location and name.
+Each replica folder gets the original folder's sharing copied onto it, WITHOUT
+sending anybody a notification email, so everyone who could reach the file
+before still can; only the grants the replica does not already inherit are
+created, and roles are compared, so a folder that widens an inherited grant is
+matched. Only ancestor folders that actually receive something are created.
+
+externals.root must be a regular My-Drive folder — a shared drive cannot hold
+externally-owned files, which is the entire point — and it may sit inside the
+crawl root (recommended: evicted files then stay searchable from the crawl
+root, stay in the snapshot on every crawl, and stay migratable). It may not sit
+inside <folder_id> itself: moving that subtree to a shared drive would take the
+externals tree along with it.
+
+The database is updated as the run goes — replica folders and the shortcuts
+become nodes rows, and every moved item is reparented under its replica and
+stamped with where it came from — so the snapshot keeps describing where things
+actually live. Re-crawl afterwards to pick up anything created since the last
+crawl.
+
+This command requires the full Drive scope. If the cached token.json only has
+read-only access, the tool re-runs consent automatically to obtain it.`,
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		dbPath, _ := cmd.Flags().GetString("db")
+		cfgPath, _ := cmd.Flags().GetString("config")
+		dryRun, _ := cmd.Flags().GetBool("dry-run")
+		maxErrors, _ := cmd.Flags().GetInt("max-errors")
+		concurrency, _ := cmd.Flags().GetInt("concurrency")
+		return runEvictExternals(dbPath, cfgPath, args[0], dryRun, maxErrors, concurrency)
+	},
+}
+
+func init() {
+	evictExternalsCmd.Flags().Bool("dry-run", false, "report what would be evicted without changing anything (read-only scope)")
+	evictExternalsCmd.Flags().Int("max-errors", 5, "abort once more than this many items fail")
+	evictExternalsCmd.Flags().Int("concurrency", defaultMoveConcurrency, "how many item moves to run in parallel (all still share the global rate limiter)")
+}
+
+// maxBlockerExamples bounds how many offending items a refusal lists by name.
+// The counts in the message are complete; the examples are there to point at
+// where to look.
+const maxBlockerExamples = 20
+
+// evictStats holds a run's tallies. The file phase updates them from its worker
+// pool, so they are guarded by mu; the shared error budget (embedded) carries
+// the failure count and abort logic.
+type evictStats struct {
+	*errorBudget
+	mu        sync.Mutex
+	files     int
+	folders   int
+	shortcuts int
+	grants    int
+	skipped   int
+}
+
+func (s *evictStats) file()       { s.mu.Lock(); s.files++; s.mu.Unlock() }
+func (s *evictStats) folder()     { s.mu.Lock(); s.folders++; s.mu.Unlock() }
+func (s *evictStats) shortcut()   { s.mu.Lock(); s.shortcuts++; s.mu.Unlock() }
+func (s *evictStats) grant(n int) { s.mu.Lock(); s.grants += n; s.mu.Unlock() }
+func (s *evictStats) skip()       { s.mu.Lock(); s.skipped++; s.mu.Unlock() }
+
+func (s *evictStats) fileCount() int { s.mu.Lock(); defer s.mu.Unlock(); return s.files }
+
+// externallyOwned reports whether a node's recorded owner sits outside the org:
+// not the running account, and not on one of the configured internal domains.
+// This is classifyOwner's test with "mine" and "another internal account"
+// collapsed — for a move into a shared drive the only thing that matters is
+// whether the org owns the item. A node with no recorded owner counts as
+// external, exactly as classifyOwner treats one: an owner we could not read is
+// not an owner we can vouch for, and evicting it (leaving a shortcut behind) is
+// the recoverable mistake, whereas leaving it in place blocks the move.
+func externallyOwned(n evictNode, me *drive.User, internalDomains []string) bool {
+	if n.ownerEmail.Valid && strings.EqualFold(n.ownerEmail.String, me.EmailAddress) {
+		return false
+	}
+	if n.ownerID.Valid && me.PermissionId != "" && n.ownerID.String == me.PermissionId {
+		return false
+	}
+	return !isInternalEmail(n.ownerEmail, internalDomains)
+}
+
+// ownerLabelOf names a node's owner for a message, falling back to the Drive
+// user id and then to "(unknown owner)".
+func ownerLabelOf(n evictNode) string {
+	switch {
+	case n.ownerEmail.Valid:
+		return n.ownerEmail.String
+	case n.ownerID.Valid:
+		return "id:" + n.ownerID.String
+	default:
+		return "(unknown owner)"
+	}
+}
+
+// isLeafFolder reports whether an externally-owned folder can be moved out
+// whole: it holds nothing, or nothing but a single shortcut. That shortcut is
+// reclaim-folders' "(new) <name>" link to the folder that took over, which is
+// merely a pointer and takes no content with it.
+func isLeafFolder(children []evictNode) bool {
+	switch len(children) {
+	case 0:
+		return true
+	case 1:
+		return children[0].typ == typeShortcut
+	default:
+		return false
+	}
+}
+
+// evictPlan is what one run has decided to do, worked out entirely from the
+// snapshot before any Drive call that changes something.
+type evictPlan struct {
+	files   []evictNode // externally-owned files to move, each leaving a shortcut behind
+	folders []evictNode // externally-owned leaf folders to move as they stand
+}
+
+// planEviction works out what to evict from the subtree, or returns the refusal
+// that has to be dealt with first. nodes is the whole subtree, shallowest
+// first, with its root at index 0.
+func planEviction(nodes []evictNode, me *drive.User, internalDomains []string, subtreePath string) (evictPlan, error) {
+	var plan evictPlan
+	if len(nodes) == 0 {
+		return plan, fmt.Errorf("the subtree is empty in the database; re-run crawl")
+	}
+	root := nodes[0]
+	children := make(map[int64][]evictNode, len(nodes))
+	for _, n := range nodes[1:] {
+		if n.parentRowID.Valid {
+			children[n.parentRowID.Int64] = append(children[n.parentRowID.Int64], n)
+		}
+	}
+
+	// The folder being prepared has to be ours to hand over in the first place;
+	// nothing below it can fix that.
+	if externallyOwned(root, me, internalDomains) {
+		if !root.ownerEmail.Valid {
+			return plan, fmt.Errorf("the snapshot records no owner email for %q (%s), so there is no telling whether it can go into a shared drive at all; re-crawl, and if the owner is still unknown check the folder by hand",
+				root.name, root.driveID)
+		}
+		return plan, fmt.Errorf("%q (%s) is itself owned by %s, so it cannot be moved into a shared drive at all; run `drive-cleanup reclaim-folders %s --folder %s` first to replace it with a folder you own, then prepare that replacement instead",
+			root.name, root.driveID, root.ownerEmail.String, root.ownerEmail.String, root.driveID)
+	}
+
+	// Refusal 1: anything still marked delete. Archiving is both the cheaper and
+	// the correct way to get unwanted items out of the subtree, and an unwanted
+	// file that happens to be unowned must not be dressed up with a shortcut as
+	// if it were worth keeping.
+	var doomed []evictNode
+	for _, n := range nodes {
+		if n.decision == decisionDelete {
+			doomed = append(doomed, n)
+		}
+	}
+	if len(doomed) > 0 {
+		return plan, fmt.Errorf("%d item(s) in %s are still marked delete; run `drive-cleanup archive --folder %s` first so they are out of the subtree instead of being evicted into the externals tree:\n%s",
+			len(doomed), subtreeLabel(subtreePath, root), root.driveID, itemExamples(doomed))
+	}
+
+	// Refusal 2: externally-owned folders that still hold content. Moving one out
+	// would take everything inside it — owned material included — along with it.
+	var stuffed []evictNode
+	for _, n := range nodes {
+		if n.typ != typeFolder || n.rowID == root.rowID || !externallyOwned(n, me, internalDomains) {
+			continue
+		}
+		if isLeafFolder(children[n.rowID]) {
+			plan.folders = append(plan.folders, n)
+		} else {
+			stuffed = append(stuffed, n)
+		}
+	}
+	if len(stuffed) > 0 {
+		return plan, fmt.Errorf("%d externally-owned folder(s) in %s still hold content, so evicting them would take their contents along; run `drive-cleanup reclaim-folders` for %s first (see --folder %s to scope it), then re-run:\n%s",
+			len(stuffed), subtreeLabel(subtreePath, root), ownerList(stuffed), root.driveID, itemExamples(stuffed))
+	}
+
+	// The leaf folders leave as they stand, so anything inside one of them (at
+	// most that single shortcut) travels with it rather than being evicted in its
+	// own right.
+	leaving := make(map[int64]bool, len(plan.folders))
+	for _, f := range plan.folders {
+		leaving[f.rowID] = true
+	}
+	for _, n := range nodes {
+		if n.typ == typeFolder || n.rowID == root.rowID || !externallyOwned(n, me, internalDomains) {
+			continue
+		}
+		if n.parentRowID.Valid && leaving[n.parentRowID.Int64] {
+			continue
+		}
+		plan.files = append(plan.files, n)
+	}
+	return plan, nil
+}
+
+// subtreeLabel names the subtree in a message: its path under the crawl root
+// when there is one, else the folder's own name.
+func subtreeLabel(subtreePath string, root evictNode) string {
+	if subtreePath != "" {
+		return fmt.Sprintf("%q", subtreePath)
+	}
+	return fmt.Sprintf("%q", root.name)
+}
+
+// itemExamples renders up to maxBlockerExamples offending items as indented
+// lines, with a count of whatever did not fit.
+func itemExamples(nodes []evictNode) string {
+	var b strings.Builder
+	for i, n := range nodes {
+		if i == maxBlockerExamples {
+			fmt.Fprintf(&b, "  ... and %d more\n", len(nodes)-i)
+			break
+		}
+		fmt.Fprintf(&b, "  %-10s %s (%s)  [owner: %s]\n", n.typ, n.name, n.driveID, ownerLabelOf(n))
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// ownerList renders the distinct owners of the given nodes, in first-seen
+// order, for a message telling the user whom to run reclaim-folders for.
+func ownerList(nodes []evictNode) string {
+	seen := make(map[string]bool, len(nodes))
+	var owners []string
+	for _, n := range nodes {
+		label := ownerLabelOf(n)
+		if !seen[label] {
+			seen[label] = true
+			owners = append(owners, label)
+		}
+	}
+	return strings.Join(owners, ", ")
+}
+
+func runEvictExternals(dbPath, cfgPath, folderID string, dryRun bool, maxErrors, concurrency int) error {
+	cfg, err := loadConfig(cfgPath)
+	if err != nil {
+		return err
+	}
+	if err := cfg.Externals.Root.validate("externals.root"); err != nil {
+		return fmt.Errorf("%s: %w", cfgPath, err)
+	}
+
+	db, err := openDB(dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	crawlRoot, err := crawlRootDriveID(db)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("database is empty; run crawl first")
+	}
+	if err != nil {
+		return err
+	}
+	// Evicting moves live files based on the snapshot; a config root that no
+	// longer matches what was crawled means every ownership and parent decision
+	// could be wrong. Same refusal as archive and reclaim-folders.
+	if crawlRoot != cfg.Crawl.Root.ID {
+		return fmt.Errorf("crawl root in config (%s, %q) does not match the root in the database (%s); crawl.root.id changed since the last crawl — re-run `drive-cleanup crawl` to rebuild the snapshot before evicting externals",
+			cfg.Crawl.Root.ID, cfg.Crawl.Root.Name, crawlRoot)
+	}
+	if cfg.Externals.Root.ID == crawlRoot {
+		return fmt.Errorf("externals.root.id equals crawl.root.id (%s); the externals folder must be a folder of its own", crawlRoot)
+	}
+	if cfg.Archive.Root.configured() && cfg.Externals.Root.ID == cfg.Archive.Root.ID {
+		return fmt.Errorf("externals.root.id equals archive.root.id (%s); evicted files are being kept, archived ones are on their way out — they must not share a folder", cfg.Externals.Root.ID)
+	}
+
+	typ, err := nodeTypeByDriveID(db, folderID)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("folder %s not found in the database; it must be a folder crawled under the crawl root", folderID)
+	}
+	if err != nil {
+		return err
+	}
+	if typ != typeFolder {
+		return fmt.Errorf("%s is a %s, not a folder", folderID, typ)
+	}
+	if inside, err := nodeInSubtree(db, crawlRoot, folderID); err != nil {
+		return err
+	} else if !inside {
+		return fmt.Errorf("folder %s is not under the crawl root; evict-externals only acts on the crawled tree", folderID)
+	}
+	// An externals root inside the crawl root is crawled like anything else, so a
+	// folder of it can be named here by mistake. Evicting out of the externals
+	// tree into a deeper corner of itself is never what anyone means; the check is
+	// free because the target has to be crawled to get this far.
+	if inside, err := nodeInSubtree(db, cfg.Externals.Root.ID, folderID); err != nil {
+		return err
+	} else if inside {
+		return fmt.Errorf("folder %s is inside the externals folder %s (%q); that tree is where evicted items live, not something to prepare for a shared drive",
+			folderID, cfg.Externals.Root.ID, cfg.Externals.Root.Name)
+	}
+	subtreePath, err := subtreeRelativePath(db, folderID)
+	if err != nil {
+		return err
+	}
+
+	// A stale snapshot would hide both the items to evict and the content that
+	// makes an unowned folder unsafe to move, so an incomplete crawl is fatal
+	// here rather than a warning.
+	if pending, err := countPendingFolders(db, folderID); err != nil {
+		return err
+	} else if pending > 0 {
+		return fmt.Errorf("the crawl is incomplete (%d folder(s) under %s not fully listed); the database may be missing items. Re-run crawl first", pending, folderID)
+	}
+
+	nodes, err := subtreeNodes(db, folderID)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := cancelOnSignal()
+	defer cancel()
+
+	// A dry run only reads, so request the narrower scope — previewing never
+	// forces a write-scope re-consent.
+	driveScope := drive.DriveScope
+	if dryRun {
+		driveScope = drive.DriveReadonlyScope
+	}
+	svc, err := newDriveService(ctx, driveScope)
+	if err != nil {
+		return err
+	}
+	about, err := svc.About.Get().Fields("user").Context(ctx).Do()
+	if err != nil {
+		return fmt.Errorf("fetching current user info: %w", err)
+	}
+	me := about.User
+
+	plan, err := planEviction(nodes, me, cfg.InternalDomains, subtreePath)
+	if err != nil {
+		return err
+	}
+	if len(plan.files)+len(plan.folders) == 0 {
+		fmt.Fprintf(os.Stderr, "Nothing in %s is owned outside the org; it is ready to move to a shared drive.\n",
+			subtreeLabel(subtreePath, nodes[0]))
+		return nil
+	}
+
+	externalsFolder, err := getConfiguredFolder(ctx, svc, cfg.Externals.Root, "externals.root")
+	if err != nil {
+		return err
+	}
+	if externalsFolder.DriveId != "" {
+		return fmt.Errorf("externals folder %s is in a shared drive (%s); it must be a regular My-Drive folder — evicted files are owned by third parties, which is exactly what a shared drive cannot hold", externalsFolder.Id, externalsFolder.DriveId)
+	}
+	// Inside the subtree being prepared, the externals tree would be dragged into
+	// the shared drive along with it, taking every file this command just rescued.
+	if externalsFolder.Id == folderID {
+		return fmt.Errorf("externals folder %s (%q) is the folder you are preparing; it must be somewhere else", externalsFolder.Id, externalsFolder.Name)
+	}
+	if inside, err := folderInsideRoot(ctx, svc, externalsFolder, folderID); err != nil {
+		return fmt.Errorf("checking the externals folder against %s: %w", folderID, err)
+	} else if inside {
+		return fmt.Errorf("externals folder %s (%q) is inside the folder you are preparing (%s); move it outside that subtree — inside, moving the subtree into a shared drive would take the evicted files along with it",
+			externalsFolder.Id, externalsFolder.Name, folderID)
+	}
+	if inside, err := folderInsideRoot(ctx, svc, externalsFolder, crawlRoot); err != nil {
+		return fmt.Errorf("checking the externals folder against the crawl root: %w", err)
+	} else if !inside {
+		log.Printf("NOTE externals folder %q (%s) is outside the crawl root, so no crawl visits it; evicted items keep their rows (they are exempt from stale-row pruning) but their new location is never refreshed",
+			externalsFolder.Name, externalsFolder.Id)
+	}
+
+	if dryRun {
+		fmt.Fprintf(os.Stderr, "DRY RUN: no changes will be made. Would evict %d file(s) and %d emptied folder(s) owned outside the org out of %s into %q, leaving %d shortcut(s) behind.\n",
+			len(plan.files), len(plan.folders), subtreeLabel(subtreePath, nodes[0]), externalsFolder.Name, plan.shortcutCount())
+	} else {
+		fmt.Fprintf(os.Stderr, "About to evict %d file(s) and %d emptied folder(s) owned outside the org out of %s into %q (%s), replicating their folders (with their sharing) and leaving %d shortcut(s) behind.\n",
+			len(plan.files), len(plan.folders), subtreeLabel(subtreePath, nodes[0]), externalsFolder.Name, externalsFolder.Id, plan.shortcutCount())
+		if !promptYesNo("Continue? [y/N] ") {
+			fmt.Fprintln(os.Stderr, "Aborted.")
+			return nil
+		}
+	}
+
+	// All Drive calls below share this one limiter; it — not the worker count —
+	// is the quota safety cap (see pack).
+	limiter := rate.NewLimiter(rate.Limit(20), 20)
+	rec := &opLog{db: db, account: me.EmailAddress, command: "evict-externals"}
+
+	moveCtx, moveCancel := context.WithCancel(ctx)
+	defer moveCancel()
+	stats := &evictStats{errorBudget: &errorBudget{cmd: "evict-externals", maxErrors: maxErrors, cancel: moveCancel}}
+
+	e := &evictor{
+		db: db, svc: svc, limiter: limiter, rec: rec, me: me, stats: stats,
+		externalsRootID:   externalsFolder.Id,
+		externalsRootName: externalsFolder.Name,
+		root:              replicaRef{driveID: externalsFolder.Id},
+		verified:          make(map[string]replicaRef),
+	}
+
+	// Resolve every replica folder up front, sequentially: the concurrent move
+	// phase then only reads the cache, so a replica can never be created twice. A
+	// dry run skips this entirely (it would create folders) and previews instead.
+	if dryRun {
+		e.preview(moveCtx, plan)
+		fmt.Fprintf(os.Stderr, "\nWould evict %d file(s) and %d folder(s) into %q, creating %d shortcut(s) and copying %d grant(s) onto replica folders.\n",
+			len(plan.files), len(plan.folders), externalsFolder.Name, plan.shortcutCount(), stats.grants)
+		return nil
+	}
+
+	rootRow, err := upsertReplicaRow(db, externalsFolder.Id, externalsFolder.Name, sql.NullInt64{}, me.EmailAddress)
+	if err != nil {
+		return fmt.Errorf("recording the externals root: %w", err)
+	}
+	e.root.rowID = rootRow
+	for _, parent := range plan.parentDriveIDs() {
+		if err := moveCtx.Err(); err != nil {
+			return err
+		}
+		if _, err := e.resolve(moveCtx, parent); err != nil {
+			return fmt.Errorf("preparing the externals replica of folder %s: %w", parent, err)
+		}
+	}
+
+	prog := newProgress()
+
+	// Phase A: files, concurrently. Each one moves into its folder's replica and
+	// then gets a shortcut left behind where it used to be.
+	forEachConcurrent(moveCtx, concurrency, plan.files, func(n evictNode) {
+		prog.tick("evict-externals: %d/%d file(s) evicted", stats.fileCount(), len(plan.files))
+		e.evictFile(moveCtx, n)
+	})
+	if ctx.Err() != nil {
+		log.Printf("interrupted: %d file(s) and %d folder(s) evicted, %d skipped, %d failed",
+			stats.files, stats.folders, stats.skipped, stats.failed)
+		return ctx.Err()
+	}
+	if stats.aborted {
+		return stats.err
+	}
+
+	// Phase B: the emptied folders, sequentially — each one is checked live
+	// first, and a folder that has gained content since the crawl is left alone
+	// rather than dragging it out of the subtree.
+	for _, n := range plan.folders {
+		if moveCtx.Err() != nil {
+			break
+		}
+		e.evictFolder(moveCtx, n)
+	}
+	if ctx.Err() != nil {
+		log.Printf("interrupted: %d file(s) and %d folder(s) evicted, %d skipped, %d failed",
+			stats.files, stats.folders, stats.skipped, stats.failed)
+		return ctx.Err()
+	}
+	if stats.aborted {
+		return stats.err
+	}
+
+	log.Printf("done: %d file(s) and %d folder(s) evicted into %q, %d shortcut(s) created, %d grant(s) copied onto replica folders, %d skipped, %d failed",
+		stats.files, stats.folders, externalsFolder.Name, stats.shortcuts, stats.grants, stats.skipped, stats.failed)
+	if stats.failed > 0 {
+		return fmt.Errorf("%d item(s) failed; re-run evict-externals to retry", stats.failed)
+	}
+	fmt.Fprintf(os.Stderr, "%s now holds only items the org owns, as far as the snapshot knows. Re-crawl and re-run to confirm before moving it into a shared drive.\n",
+		subtreeLabel(subtreePath, nodes[0]))
+	return nil
+}
+
+// shortcutCount is how many shortcuts the plan would leave behind: one per
+// evicted file, except for files that are themselves shortcuts (Drive shortcuts
+// cannot point at other shortcuts) and any whose original folder is unrecorded.
+func (p evictPlan) shortcutCount() int {
+	n := 0
+	for _, f := range p.files {
+		if f.typ != typeShortcut && f.parentDriveID.Valid {
+			n++
+		}
+	}
+	return n
+}
+
+// parentDriveIDs returns the distinct folders whose replicas the plan needs: the
+// parent of every file, and the parent of every leaf folder.
+func (p evictPlan) parentDriveIDs() []string {
+	seen := make(map[string]bool)
+	var out []string
+	add := func(n evictNode) {
+		if p := n.parentDriveID; p.Valid && !seen[p.String] {
+			seen[p.String] = true
+			out = append(out, p.String)
+		}
+	}
+	for _, n := range p.files {
+		add(n)
+	}
+	for _, n := range p.folders {
+		add(n)
+	}
+	return out
+}
+
+// evictor carries everything one run needs: the Drive client and its shared rate
+// limiter, the audit-log recorder, who we are, and the replica folders resolved
+// so far.
+type evictor struct {
+	db                *sql.DB
+	svc               *drive.Service
+	limiter           *rate.Limiter
+	rec               *opLog
+	me                *drive.User
+	stats             *evictStats
+	externalsRootID   string
+	externalsRootName string
+
+	// root is the externals root as a replica: its nodes row is only inserted on
+	// a real run, so rowID is zero in a dry run.
+	root replicaRef
+
+	// verified maps an original folder's Drive ID to its live-verified replica
+	// for this run. Written only by resolve, which runs sequentially before the
+	// concurrent phase, and read-only thereafter.
+	verified map[string]replicaRef
+}
+
+// resolve returns the replica folder that the contents of the original folder
+// parentDriveID belong in, creating any missing replicas along the way. The
+// crawl root's replica is the externals root itself.
+func (e *evictor) resolve(ctx context.Context, parentDriveID string) (replicaRef, error) {
+	if ref, ok := e.verified[parentDriveID]; ok {
+		return ref, nil
+	}
+	chain, err := folderChainToRoot(e.db, parentDriveID)
+	if err != nil {
+		return replicaRef{}, err
+	}
+	cur := e.root
+	for _, folder := range chain {
+		if cur, err = e.ensure(ctx, folder, cur); err != nil {
+			return replicaRef{}, err
+		}
+	}
+	e.verified[parentDriveID] = cur
+	return cur, nil
+}
+
+// ensure returns the live replica of one original folder under parentReplica,
+// resolving in order: the cached id (verified live; a trashed or deleted replica
+// is re-created), an existing same-named folder we own (adopted, so re-runs and
+// crashes never duplicate), or a newly created one. Either way the original's
+// sharing is copied onto it, which is a no-op once it is already there.
+func (e *evictor) ensure(ctx context.Context, folder archiveTarget, parentReplica replicaRef) (replicaRef, error) {
+	if ref, ok := e.verified[folder.driveID]; ok {
+		return ref, nil
+	}
+	var replica *drive.File
+	if folder.externalsFolder.Valid {
+		f, err := getFileState(ctx, e.svc, e.limiter, folder.externalsFolder.String)
+		switch {
+		case isNotFound(err):
+			// Cached replica no longer exists; fall through and re-create.
+		case err != nil:
+			return replicaRef{}, fmt.Errorf("verifying cached replica %s of %q: %w", folder.externalsFolder.String, folder.name, err)
+		case !f.Trashed:
+			replica = f
+		}
+	}
+	if replica == nil {
+		// Only a candidate we own counts: a same-named folder owned by somebody
+		// else is a folder that happens to share the name, not our replica.
+		matches, err := findChildrenNamed(ctx, e.svc, e.limiter, parentReplica.driveID, folder.name, folderMimeType,
+			"id, name, owners(emailAddress, permissionId)")
+		if err != nil {
+			return replicaRef{}, fmt.Errorf("looking up replica %q: %w", folder.name, err)
+		}
+		for _, m := range matches {
+			if ownedByAccount(m, e.me.EmailAddress) {
+				replica = m
+				break
+			}
+		}
+	}
+	if replica == nil {
+		f, err := e.rec.createFolder(ctx, e.svc, e.limiter, parentReplica.driveID, folder.name)
+		if err != nil {
+			return replicaRef{}, fmt.Errorf("creating replica %q under %s: %w", folder.name, parentReplica.driveID, err)
+		}
+		detailf("OK created replica %q (%s) under %s", folder.name, f.Id, parentReplica.driveID)
+		replica = f
+	}
+
+	// The originals' sharing is what keeps an evicted file reachable by everyone
+	// who could reach it before — including the people a folder gives more access
+	// to than its parent does, since only the grants the replica does not already
+	// inherit are created. A failure here is logged against the error budget but
+	// does not stop the eviction: a file nobody but us can see beats a file
+	// stranded in a subtree that cannot move.
+	perms, copied, err := copyMissingPermissions(ctx, e.svc, e.limiter, e.rec,
+		folder.driveID, folder.name, replica.Id, folder.name, e.me, e.stats.fail)
+	if err != nil {
+		e.stats.fail("ERROR copying the sharing of %q (%s) onto its replica %s: %v", folder.name, folder.driveID, replica.Id, err)
+	}
+	e.stats.grant(copied)
+
+	rowID, err := upsertReplicaRow(e.db, replica.Id, folder.name, sql.NullInt64{Int64: parentReplica.rowID, Valid: true}, e.me.EmailAddress)
+	if err != nil {
+		return replicaRef{}, err
+	}
+	if perms != nil {
+		if err := e.recordReplicaPermissions(replica.Id, perms); err != nil {
+			return replicaRef{}, err
+		}
+	}
+	if err := setExternalsFolder(e.db, folder.driveID, replica.Id); err != nil {
+		return replicaRef{}, err
+	}
+	ref := replicaRef{driveID: replica.Id, rowID: rowID}
+	e.verified[folder.driveID] = ref
+	return ref, nil
+}
+
+// recordReplicaPermissions writes a replica folder's sharing, as it stands after
+// the copy, into folder_permissions — that table is what tells a later run (or a
+// human) who could reach a folder.
+func (e *evictor) recordReplicaPermissions(replicaDriveID string, perms []*drive.Permission) error {
+	tx, err := e.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := replacePermissions(tx, replicaDriveID, permissionRows(perms)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// evictFile moves one externally-owned file into its folder's replica and leaves
+// a shortcut to it behind where it used to be. The move is optimistic (one
+// files.update, no pre-read); a failure is diagnosed from the item's live state,
+// archive-style.
+func (e *evictor) evictFile(ctx context.Context, n evictNode) {
+	replica, ok := e.verified[n.parentDriveID.String]
+	if !ok { // resolved up front; missing means the pre-phase was interrupted
+		return
+	}
+	err := e.rec.moveFile(ctx, e.svc, e.limiter, n.driveID, replica.driveID, n.parentDriveID.String)
+	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		f, gerr := getFileState(ctx, e.svc, e.limiter, n.driveID)
+		if ctx.Err() != nil {
+			return
+		}
+		switch {
+		case isNotFound(gerr):
+			log.Printf("SKIP %q (%s): no longer exists", n.name, n.driveID)
+			e.stats.skip()
+			return
+		case gerr != nil:
+			e.stats.fail("ERROR %q (%s): move failed (%v) and live lookup failed (%v)", n.name, n.driveID, err, gerr)
+			return
+		case f.Trashed:
+			log.Printf("SKIP %q (%s): trashed since the crawl", n.name, n.driveID)
+			e.stats.skip()
+			return
+		case hasParent(f, replica.driveID):
+			// Already in the replica — a crash between a previous run's move and
+			// its bookkeeping. Finish the bookkeeping now.
+			detailf("OK %q (%s): already in the externals replica", n.name, n.driveID)
+		default:
+			// The recorded parent is stale (the file moved since the crawl); retry
+			// from its live parents.
+			if merr := e.rec.moveFile(ctx, e.svc, e.limiter, n.driveID, replica.driveID, strings.Join(f.Parents, ",")); merr != nil {
+				if ctx.Err() == nil {
+					e.stats.fail("ERROR moving %q (%s) into the externals tree: %v", n.name, n.driveID, merr)
+				}
+				return
+			}
+			detailf("OK %q (%s) -> externals tree (from live parent %v)", n.name, n.driveID, f.Parents)
+		}
+	} else {
+		detailf("OK %s %q (%s) -> externals tree", n.typ, n.name, n.driveID)
+	}
+	e.stats.file()
+
+	// A shortcut in the file's old place keeps it reachable from where people
+	// expect it. Drive shortcuts cannot point at other shortcuts, so an evicted
+	// shortcut gets none — there is nothing to lose, since a shortcut is itself
+	// only a pointer and whatever it pointed at has not moved.
+	var shortcut *drive.File
+	switch {
+	case n.typ == typeShortcut:
+		detailf("no shortcut left behind for %q (%s): it is itself a shortcut", n.name, n.driveID)
+	case !n.parentDriveID.Valid:
+		log.Printf("WARN no shortcut left behind for %q (%s): its original folder is not recorded", n.name, n.driveID)
+	default:
+		sc, err := e.ensureShortcut(ctx, n.parentDriveID.String, n.name, n.driveID)
+		if err != nil {
+			// Cosmetic next to the move: spend the budget on it but carry on to the
+			// bookkeeping, so the snapshot still matches what really happened.
+			e.stats.fail("ERROR creating a shortcut to %q (%s) in the folder it came from (%s): %v", n.name, n.driveID, n.parentDriveID.String, err)
+		} else {
+			shortcut = sc
+			e.stats.shortcut()
+			detailf("OK created shortcut %q (%s) in %s", sc.Name, sc.Id, n.parentDriveID.String)
+		}
+	}
+
+	if err := e.record(n, replica, shortcut); err != nil {
+		e.stats.fail("ERROR recording the eviction of %q (%s): %v", n.name, n.driveID, err)
+	}
+}
+
+// evictFolder moves one externally-owned leaf folder into its parent's replica,
+// as it stands. A live check comes first: the snapshot said the folder was empty
+// (or held nothing but a shortcut), and if that has changed since the crawl the
+// folder is left alone rather than carrying content out of the subtree.
+func (e *evictor) evictFolder(ctx context.Context, n evictNode) {
+	replica, ok := e.verified[n.parentDriveID.String]
+	if !ok {
+		return
+	}
+	children, err := listChildren(ctx, e.svc, e.limiter, n.driveID, "nextPageToken, files(id, name, mimeType)")
+	if err != nil {
+		if isNotFound(err) {
+			log.Printf("SKIP folder %q (%s): no longer exists", n.name, n.driveID)
+			e.stats.skip()
+			return
+		}
+		if ctx.Err() == nil {
+			e.stats.fail("ERROR listing folder %q (%s) before evicting it: %v", n.name, n.driveID, err)
+		}
+		return
+	}
+	if !liveLeaf(children) {
+		log.Printf("SKIP folder %q (%s): it holds %d item(s) on Drive, so evicting it would take them out of the subtree; re-crawl and run reclaim-folders for %s, then re-run",
+			n.name, n.driveID, len(children), ownerLabelOf(n))
+		e.stats.skip()
+		return
+	}
+
+	if err := e.rec.moveFile(ctx, e.svc, e.limiter, n.driveID, replica.driveID, n.parentDriveID.String); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		f, gerr := getFileState(ctx, e.svc, e.limiter, n.driveID)
+		switch {
+		case ctx.Err() != nil:
+			return
+		case isNotFound(gerr):
+			log.Printf("SKIP folder %q (%s): no longer exists", n.name, n.driveID)
+			e.stats.skip()
+			return
+		case gerr != nil:
+			e.stats.fail("ERROR folder %q (%s): move failed (%v) and live lookup failed (%v)", n.name, n.driveID, err, gerr)
+			return
+		case f.Trashed:
+			log.Printf("SKIP folder %q (%s): trashed since the crawl", n.name, n.driveID)
+			e.stats.skip()
+			return
+		case hasParent(f, replica.driveID):
+			detailf("OK folder %q (%s): already in the externals replica", n.name, n.driveID)
+		default:
+			if merr := e.rec.moveFile(ctx, e.svc, e.limiter, n.driveID, replica.driveID, strings.Join(f.Parents, ",")); merr != nil {
+				if ctx.Err() == nil {
+					e.stats.fail("ERROR moving folder %q (%s) into the externals tree: %v", n.name, n.driveID, merr)
+				}
+				return
+			}
+			detailf("OK folder %q (%s) -> externals tree (from live parent %v)", n.name, n.driveID, f.Parents)
+		}
+	} else {
+		detailf("OK folder %q (%s) -> externals tree", n.name, n.driveID)
+	}
+	e.stats.folder()
+
+	// No shortcut: reclaim-folders already left a "(new) <name>" link inside this
+	// folder pointing at the folder that took its contents over, and that link
+	// travels with it. Links and bookmarks aimed at the folder keep working too —
+	// its Drive ID does not change when it moves.
+	if err := e.record(n, replica, nil); err != nil {
+		e.stats.fail("ERROR recording the eviction of folder %q (%s): %v", n.name, n.driveID, err)
+	}
+}
+
+// liveLeaf is isLeafFolder over a live Drive listing: nothing, or nothing but a
+// single shortcut.
+func liveLeaf(children []*drive.File) bool {
+	switch len(children) {
+	case 0:
+		return true
+	case 1:
+		return children[0].MimeType == shortcutMimeType
+	default:
+		return false
+	}
+}
+
+// ensureShortcut returns the shortcut named name inside parentID that points at
+// targetID, creating it if it is not there yet — so a re-run adopts the one an
+// earlier run left instead of piling up duplicates.
+func (e *evictor) ensureShortcut(ctx context.Context, parentID, name, targetID string) (*drive.File, error) {
+	matches, err := findChildrenNamed(ctx, e.svc, e.limiter, parentID, name, shortcutMimeType,
+		"id, name, mimeType, shortcutDetails(targetId)")
+	if err != nil {
+		return nil, err
+	}
+	for _, m := range matches {
+		if isShortcutTo(m, targetID) {
+			return m, nil
+		}
+	}
+	return e.rec.createShortcut(ctx, e.svc, e.limiter, parentID, name, targetID)
+}
+
+// record writes one eviction into the snapshot, in a single transaction: the
+// moved item is stamped with the folder it came out of and reparented under its
+// replica, and the shortcut left in its place (when there is one) becomes a
+// nodes row in the folder it came from.
+func (e *evictor) record(n evictNode, replica replicaRef, shortcut *drive.File) error {
+	tx, err := e.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := markEvicted(tx, n.driveID, n.parentDriveID.String, replica.rowID); err != nil {
+		return err
+	}
+	if shortcut != nil && n.parentRowID.Valid {
+		if _, _, _, _, err := upsertNode(tx, node{
+			driveID: shortcut.Id, name: shortcut.Name, typ: typeShortcut, mimeType: shortcutMimeType,
+			ownerEmail: nullString(e.me.EmailAddress), ownerID: nullString(e.me.PermissionId),
+			ownerDisplay: nullString(e.me.DisplayName), shortcutTarget: nullString(n.driveID),
+			parentID: n.parentRowID, canEdit: true,
+		}, true); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// preview reports what a dry run would do, without creating a replica folder or
+// moving anything. Destinations come from the snapshot's paths.
+//
+// Counting the sharing that would be recreated takes a little care. On a real
+// run each replica is created inside its parent replica and so inherits
+// everything the parent provides, which is why only a small delta ever gets
+// copied — but in a dry run those parent replicas do not exist to be asked. So
+// the run is simulated instead: start from what the externals root itself
+// provides and walk down the chain, adding each folder's own extra grants to the
+// running set as it goes. What each level adds is what a real run would create
+// there. An ancestor shared by several files is measured once.
+func (e *evictor) preview(ctx context.Context, plan evictPlan) {
+	destination := func(n evictNode) string {
+		rel, err := subtreeRelativePath(e.db, n.parentDriveID.String)
+		if err != nil || rel == "" {
+			return e.externalsRootName
+		}
+		return e.externalsRootName + "/" + rel
+	}
+	for _, n := range plan.files {
+		log.Printf("WOULD move %s %q (%s), owned by %s, into %q and leave a shortcut to it behind",
+			n.typ, n.name, n.driveID, ownerLabelOf(n), destination(n))
+	}
+	for _, n := range plan.folders {
+		log.Printf("WOULD move emptied folder %q (%s), owned by %s, into %q (no shortcut: reclaim-folders' own link travels with it)",
+			n.name, n.driveID, ownerLabelOf(n), destination(n))
+	}
+
+	rootPerms, err := listPermissions(ctx, e.svc, e.limiter, e.externalsRootID)
+	if err != nil {
+		log.Printf("WARN listing the sharing of %q (%s): %v; not previewing what would be copied onto replica folders",
+			e.externalsRootName, e.externalsRootID, err)
+		return
+	}
+	rootProvides := roleRanks(rootPerms)
+	// provides maps an original folder to what its replica would end up
+	// providing, inherited grants included.
+	provides := make(map[string]map[string]int)
+	for _, parent := range plan.parentDriveIDs() {
+		if ctx.Err() != nil {
+			return
+		}
+		chain, err := folderChainToRoot(e.db, parent)
+		if err != nil {
+			log.Printf("WARN previewing the replica chain of %s: %v", parent, err)
+			continue
+		}
+		have := rootProvides
+		for _, folder := range chain {
+			if known, seen := provides[folder.driveID]; seen {
+				have = known
+				continue
+			}
+			perms, err := listPermissions(ctx, e.svc, e.limiter, folder.driveID)
+			if err != nil {
+				log.Printf("WARN previewing the sharing of %q (%s): %v", folder.name, folder.driveID, err)
+				break // without this folder's grants the levels below cannot be estimated
+			}
+			next := make(map[string]int, len(have)+len(perms))
+			for k, rank := range have {
+				next[k] = rank
+			}
+			copied := 0
+			for _, p := range perms {
+				if !shouldCopyPermission(p, e.me) {
+					continue
+				}
+				key, rank := permissionKey(p), permissionRoleRank(p.Role)
+				if next[key] >= rank {
+					continue // the replica would already provide at least this much
+				}
+				next[key] = rank
+				copied++
+			}
+			if copied > 0 {
+				log.Printf("WOULD copy %d grant(s) from %q (%s) onto its replica under %q",
+					copied, folder.name, folder.driveID, e.externalsRootName)
+				e.stats.grant(copied)
+			}
+			provides[folder.driveID] = next
+			have = next
+		}
+	}
+}
+
+// roleRanks reduces a permission list to the best role rank each grantee holds,
+// the form permission sets are compared in.
+func roleRanks(perms []*drive.Permission) map[string]int {
+	out := make(map[string]int, len(perms))
+	for _, p := range perms {
+		if rank := permissionRoleRank(p.Role); rank > out[permissionKey(p)] {
+			out[permissionKey(p)] = rank
+		}
+	}
+	return out
+}

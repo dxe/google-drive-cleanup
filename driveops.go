@@ -602,3 +602,117 @@ func findChildrenNamed(ctx context.Context, svc *drive.Service, limiter *rate.Li
 	}
 	return list.Files, nil
 }
+
+// permissionsToCopy returns the grants on sourceID that baselineID does not
+// already provide at an equal or stronger role, together with baselineID's own
+// grants. baselineID is the destination folder when it exists, and — when it
+// does not yet — the parent it would be created in: Drive reports a My-Drive
+// folder's inherited grants alongside its own, so the parent's set is exactly
+// what a new child would start with.
+//
+// Comparing roles, not just grantees, is what makes a folder that widens an
+// inherited grant (say a subfolder shared with "anyone" as writer inside a
+// parent shared as reader) come out the same on the copy. me is the account
+// running the tool, whose own grants are never worth copying.
+//
+// Shared by reclaim-folders (recreating a folder's sharing on the replacement it
+// owns) and evict-externals (recreating it on the externals-tree replica).
+func permissionsToCopy(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, sourceID, baselineID string, me *drive.User) (missing, baseline []*drive.Permission, err error) {
+	sourcePerms, err := listPermissions(ctx, svc, limiter, sourceID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("listing permissions on %s: %w", sourceID, err)
+	}
+	baseline, err = listPermissions(ctx, svc, limiter, baselineID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("listing permissions on %s: %w", baselineID, err)
+	}
+	have := make(map[string]int, len(baseline))
+	for _, p := range baseline {
+		if rank := permissionRoleRank(p.Role); rank > have[permissionKey(p)] {
+			have[permissionKey(p)] = rank
+		}
+	}
+	for _, p := range sourcePerms {
+		if !shouldCopyPermission(p, me) {
+			continue
+		}
+		if have[permissionKey(p)] >= permissionRoleRank(p.Role) {
+			continue // already at least this much access
+		}
+		missing = append(missing, p)
+	}
+	return missing, baseline, nil
+}
+
+// copyMissingPermissions recreates the source folder's sharing on a destination
+// folder the running account owns, so nobody who reached the content through a
+// grant on the source loses it when the content moves there. Notification email
+// is suppressed throughout (see copyPermission) — this re-creates access
+// somebody already had, and mailing everyone about it would be noise at best.
+//
+// Only what the destination does not already provide is created, which keeps a
+// re-run a no-op and avoids piling direct grants on top of identical inherited
+// ones. The owner grant is skipped (we own the destination), as is any grant
+// naming us, and grants whose user or group Drive reports as deleted. Returns the
+// permissions the destination ends up with, for the snapshot, and how many were
+// created. Individual grant failures go to fail (the caller's error budget) and
+// do not stop the rest.
+func copyMissingPermissions(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, rec *opLog, sourceID, sourceName, destID, destName string, me *drive.User, fail func(format string, args ...any)) ([]*drive.Permission, int, error) {
+	missing, final, err := permissionsToCopy(ctx, svc, limiter, sourceID, destID, me)
+	if err != nil {
+		return nil, 0, err
+	}
+	copied := 0
+	for _, p := range missing {
+		created, err := rec.copyPermission(ctx, svc, limiter, destID, p)
+		if err != nil {
+			fail("ERROR copying the %s %s grant from %q onto %q (%s): %v",
+				p.Role, permissionKey(p), sourceName, destName, destID, err)
+			continue
+		}
+		detailf("OK copied %s %s onto %q (%s)", p.Role, permissionKey(p), destName, destID)
+		final = append(final, created)
+		copied++
+	}
+	return final, copied, nil
+}
+
+// permissionRoleRank orders Drive's roles from least to most access, so a copy
+// can tell an upgrade from a no-op. An unrecognised role ranks below every
+// known one, so it is copied rather than silently assumed to be covered.
+func permissionRoleRank(role string) int {
+	switch role {
+	case "reader":
+		return 1
+	case "commenter":
+		return 2
+	case "writer":
+		return 3
+	case "fileOrganizer":
+		return 4
+	case "organizer":
+		return 5
+	case "owner":
+		return 6
+	default:
+		return 0
+	}
+}
+
+// shouldCopyPermission reports whether one of a source folder's grants is worth
+// recreating on a folder me owns.
+func shouldCopyPermission(p *drive.Permission, me *drive.User) bool {
+	switch {
+	case p.Deleted:
+		return false // the user or group behind it no longer exists
+	case p.Role == "owner":
+		return false // ownership is not transferable this way, and ours is already ours
+	case p.Type == "user" && (p.Id == me.PermissionId || strings.EqualFold(p.EmailAddress, me.EmailAddress)):
+		return false // we own the destination; a grant to ourselves adds nothing
+	case (p.Type == "user" || p.Type == "group") && p.EmailAddress == "":
+		return false // nobody to grant it to
+	case p.Type == "domain" && p.Domain == "":
+		return false
+	}
+	return true
+}

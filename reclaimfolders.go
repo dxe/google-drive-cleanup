@@ -461,7 +461,7 @@ func (r *reclaimer) replace(ctx context.Context, t reclaimTarget, path string) (
 		if ours != nil {
 			baseline = ours.Id
 		}
-		missing, _, err := r.permissionsToCopy(ctx, f.Id, baseline)
+		missing, _, err := permissionsToCopy(ctx, r.svc, r.limiter, f.Id, baseline, r.me)
 		if err != nil {
 			return res, err
 		}
@@ -546,113 +546,13 @@ func (r *reclaimer) ensureShortcut(ctx context.Context, parentID, name, targetID
 	return r.rec.createShortcut(ctx, r.svc, r.limiter, parentID, name, targetID)
 }
 
-// permissionsToCopy returns the grants on their folder that baselineID does not
-// already provide at an equal or stronger role, together with baselineID's own
-// grants. baselineID is the replacement folder when it exists, and in a dry run
-// the parent it would be created in — Drive reports a My-Drive folder's
-// inherited grants alongside its own, so the parent's set is exactly what the
-// replacement would start with.
-//
-// Comparing roles, not just grantees, is what makes a folder that widens an
-// inherited grant (say a subfolder shared with "anyone" as writer inside a
-// parent shared as reader) come out the same on the replacement.
-func (r *reclaimer) permissionsToCopy(ctx context.Context, theirsID, baselineID string) (missing, baseline []*drive.Permission, err error) {
-	theirPerms, err := listPermissions(ctx, r.svc, r.limiter, theirsID)
-	if err != nil {
-		return nil, nil, fmt.Errorf("listing permissions on %s: %w", theirsID, err)
-	}
-	baseline, err = listPermissions(ctx, r.svc, r.limiter, baselineID)
-	if err != nil {
-		return nil, nil, fmt.Errorf("listing permissions on %s: %w", baselineID, err)
-	}
-	have := make(map[string]int, len(baseline))
-	for _, p := range baseline {
-		if rank := permissionRoleRank(p.Role); rank > have[permissionKey(p)] {
-			have[permissionKey(p)] = rank
-		}
-	}
-	for _, p := range theirPerms {
-		if !r.shouldCopyPermission(p) {
-			continue
-		}
-		if have[permissionKey(p)] >= permissionRoleRank(p.Role) {
-			continue // already at least this much access
-		}
-		missing = append(missing, p)
-	}
-	return missing, baseline, nil
-}
-
 // copyFolderPermissions recreates their folder's sharing on our replacement, so
 // nobody who reached the content through a grant on the old folder loses it
-// when the content moves. Notification email is suppressed throughout (see
-// copyPermission) — this re-creates access somebody already had, and mailing
-// everyone about it would be noise at best.
-//
-// Only what the replacement does not already provide is created, which keeps a
-// re-run a no-op and avoids piling direct grants on top of identical inherited
-// ones. The owner grant is skipped (we own the replacement), as is any grant
-// naming us, and grants whose user or group Drive reports as deleted. Returns
-// the permissions our folder ends up with, for the snapshot, and how many were
-// created.
+// when the content moves. Returns the permissions our folder ends up with, for
+// the snapshot, and how many were created. See copyMissingPermissions for what
+// is copied and what is deliberately left alone.
 func (r *reclaimer) copyFolderPermissions(ctx context.Context, theirs, ours *drive.File) ([]*drive.Permission, int, error) {
-	missing, final, err := r.permissionsToCopy(ctx, theirs.Id, ours.Id)
-	if err != nil {
-		return nil, 0, err
-	}
-	copied := 0
-	for _, p := range missing {
-		created, err := r.rec.copyPermission(ctx, r.svc, r.limiter, ours.Id, p)
-		if err != nil {
-			r.stats.fail("ERROR copying the %s %s grant from %q onto %q (%s): %v",
-				p.Role, permissionKey(p), theirs.Name, ours.Name, ours.Id, err)
-			continue
-		}
-		detailf("OK copied %s %s onto %q (%s)", p.Role, permissionKey(p), ours.Name, ours.Id)
-		final = append(final, created)
-		copied++
-	}
-	return final, copied, nil
-}
-
-// permissionRoleRank orders Drive's roles from least to most access, so a copy
-// can tell an upgrade from a no-op. An unrecognised role ranks below every
-// known one, so it is copied rather than silently assumed to be covered.
-func permissionRoleRank(role string) int {
-	switch role {
-	case "reader":
-		return 1
-	case "commenter":
-		return 2
-	case "writer":
-		return 3
-	case "fileOrganizer":
-		return 4
-	case "organizer":
-		return 5
-	case "owner":
-		return 6
-	default:
-		return 0
-	}
-}
-
-// shouldCopyPermission reports whether one of their folder's grants is worth
-// recreating on ours.
-func (r *reclaimer) shouldCopyPermission(p *drive.Permission) bool {
-	switch {
-	case p.Deleted:
-		return false // the user or group behind it no longer exists
-	case p.Role == "owner":
-		return false // ownership is not transferable this way, and ours is already ours
-	case p.Type == "user" && (p.Id == r.me.PermissionId || strings.EqualFold(p.EmailAddress, r.me.EmailAddress)):
-		return false // we own the replacement; a grant to ourselves adds nothing
-	case (p.Type == "user" || p.Type == "group") && p.EmailAddress == "":
-		return false // nobody to grant it to
-	case p.Type == "domain" && p.Domain == "":
-		return false
-	}
-	return true
+	return copyMissingPermissions(ctx, r.svc, r.limiter, r.rec, theirs.Id, theirs.Name, ours.Id, ours.Name, r.me, r.stats.fail)
 }
 
 // isShortcutTo reports whether f is a Drive shortcut pointing at targetID.

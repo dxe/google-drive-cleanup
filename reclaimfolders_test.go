@@ -347,7 +347,7 @@ func TestShouldCopyPermission(t *testing.T) {
 		{"domain with no domain", &drive.Permission{Type: "domain", Role: "reader"}, false},
 	}
 	for _, c := range cases {
-		if got := r.shouldCopyPermission(c.p); got != c.want {
+		if got := shouldCopyPermission(c.p, r.me); got != c.want {
 			t.Errorf("%s: shouldCopyPermission = %v, want %v", c.name, got, c.want)
 		}
 	}

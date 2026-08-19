@@ -102,6 +102,9 @@ can add settings without colliding:
   },
   "archive": {
     "root": { "id": "1ArChIvE...", "name": "Archive root" }
+  },
+  "externals": {
+    "root": { "id": "1ExTeRnAl...", "name": "zz Externally-owned files" }
   }
 }
 ```
@@ -112,6 +115,17 @@ crawl root — inside it, the archive would inherit the crawl root's sharing, an
 `archive` refuses to run. When configured, `crawl` also crawls the archive tree
 (after the crawl root) so archived files stay in the snapshot; the review UI,
 `keep-recent`, and `export-review` exclude it from decision marking.
+
+`externals.root` (optional; required by `evict-externals`) is the My-Drive
+folder externally-owned files are moved into to clear a subtree for a shared
+drive. It must be a regular My-Drive folder — a shared drive cannot hold
+externally-owned files, which is the whole point — and must not be the crawl
+root or the archive root. Unlike `archive.root` it **may** sit inside the crawl
+root, and that is the recommended place: evicted files then stay searchable from
+the crawl root, stay in the snapshot on every crawl (no separate tree to crawl),
+and stay migratable by `pack`/`unpack`. It must not sit inside the subtree you
+are preparing, though — moving that subtree into a shared drive would take the
+externals tree along with it, and `evict-externals` refuses to run in that case.
 
 `migration.dropoff-folder` is required by `archive` and `delete` as well as by
 `pack`/`unpack`: both route internally-owned items through the shared drive it
@@ -197,10 +211,15 @@ drive-cleanup restore 1AbCdEfGh...
 # owned by you, moving the contents and the sharing across
 drive-cleanup reclaim-folders alice@example.com
 drive-cleanup reclaim-folders alice@example.com --folder 1AbCdEfGh...  # only that subtree
+
+# Clear a folder of externally-owned items so it can be moved to a shared
+# drive: they go to the externals folder, each leaving a shortcut behind
+drive-cleanup evict-externals 1AbCdEfGh... --dry-run
+drive-cleanup evict-externals 1AbCdEfGh...
 ```
 
 The commands that change Drive — `pack`, `unpack`, `archive`, `delete`,
-`restore`, and `reclaim-folders` — accept `--dry-run`, which reports every `WOULD
+`restore`, `reclaim-folders`, and `evict-externals` — accept `--dry-run`, which reports every `WOULD
 move/create/delete` action without changing anything. A dry run authenticates
 with the read-only scope (so it never triggers a write-scope consent) and skips
 the confirmation prompt. Run one first to preview a step. They also accept
@@ -285,6 +304,91 @@ folders and shortcuts become `nodes` rows, the moved items are reparented, and
 the replacement's sharing is written to `folder_permissions` — so decisions and
 later `archive`/`delete` runs see where things really are. Re-crawl afterwards
 to pick up anything created since the last crawl.
+
+### Clearing a folder for a shared drive (`evict-externals`)
+
+A shared drive can only hold items the org owns, which makes an
+externally-owned file inside a folder a problem the moment you want to move that
+folder into one. Drive's own handling is worse than useless: up to 25 such items
+it lets the move through and **takes those items out of the folder**, dropping
+them into their own owners' My Drives, where we can no longer see them, let
+alone migrate them later. Past 25 items it refuses the move outright.
+
+`evict-externals` gets ahead of that. It moves every externally-owned item out
+of the subtree itself, into a parallel **externals tree** (config
+`externals.root`) that *we* own — so the files stay visible, stay shared with
+the same people, and stay available to the ordinary `pack`/`unpack` migration if
+their owner ever hands them over. There is no 25-item ceiling on this: they are
+our own moves, one file at a time.
+
+```bash
+drive-cleanup evict-externals 1AbCdEfGh... --dry-run
+drive-cleanup evict-externals 1AbCdEfGh...
+```
+
+The argument is a crawled folder under the crawl root — the one you are about to
+move to a shared drive. "Externally owned" means what it means everywhere else
+here: an owner that is neither the account running the command nor on one of the
+configured `internal-domains`.
+
+**Two things must be settled first**, and the run refuses to start (changing
+nothing) until they are:
+
+1. **Nothing in the subtree may still be marked `delete`.** Run `archive
+   --folder <id>` first. Those items are unwanted and quite possibly unowned;
+   archiving is both the cheaper way to get them out of the subtree and the
+   honest one — evicting an unwanted file and leaving a shortcut to it would
+   dress it up as something worth keeping.
+2. **No externally-owned folder in the subtree may still hold content.** Run
+   `reclaim-folders <owner>` first (the refusal names the owners). Moving such a
+   folder out would take everything inside it — owned material included — along
+   with it. After `reclaim-folders` each of their folders is empty except for
+   the `(new) <name>` shortcut pointing at the replacement, and a folder like
+   that carries nothing but itself. Empty, or holding nothing but a single
+   shortcut, is the test.
+
+   The folder you pass must itself be owned by the org, too — nothing inside it
+   can fix a folder that cannot go to a shared drive at all.
+
+With those out of the way, every externally-owned folder left in the subtree is
+an empty leaf, and the run proceeds:
+
+* **Files** move into their folder's replica inside the externals tree, and a
+  shortcut to the moved file is created in the folder it came from, so it is
+  still reachable from where people expect it. (An evicted *shortcut* gets none
+  in return — Drive shortcuts cannot point at other shortcuts, and nothing is
+  lost: a shortcut is only a pointer, and what it pointed at has not moved.)
+* **Emptied folders** move into their parent's replica as they stand, once a
+  live listing confirms they really are still empty (or still hold just the one
+  shortcut) — a folder that has gained content since the crawl is skipped rather
+  than dragged out with it. No shortcut is created for them: `reclaim-folders`
+  already left a `(new) <name>` link inside pointing at the folder that took
+  over, and that link travels along. Links and bookmarks aimed at the folder
+  keep working regardless, since its Drive ID does not change when it moves.
+
+The externals tree mirrors the crawl root's folder structure under the
+originals' own names, so an evicted file keeps its original location and name.
+Only ancestor folders that actually receive something are created — the tree
+never fills up with empty placeholders. Each replica folder gets the original
+folder's sharing copied onto it, **without sending anybody a notification
+email**, so everyone who could reach the file before still can. Because the
+replicas are built top-down, each one inherits what its parent replica provides
+and only the delta is created; roles are compared, not just grantees, so a
+folder that gives someone *more* access than its parent does (write where the
+parent gave read) is matched by an explicit grant on the replica. A dry run
+cannot ask folders that do not exist yet what they inherit, so it simulates the
+same walk to estimate the counts.
+
+The snapshot is updated as the run goes — replica folders and the shortcuts
+become `nodes` rows, replica sharing is written to `folder_permissions`, and
+every moved item is reparented under its replica and stamped with
+`evicted_from_drive_id` — so later runs and the review UI see where things
+really are. Re-crawl afterwards to pick up anything created since the last
+crawl, and re-run to confirm the subtree is clean before you move it.
+
+Re-runs are safe: an existing replica folder is adopted rather than duplicated,
+an existing shortcut pointing at the right target is reused, and an item a
+previous run already moved is simply finished off in the database.
 
 ### Reviewing what to keep vs delete (`review` / `export-review`)
 
@@ -719,6 +823,11 @@ the exemption keeps a full crawl from destroying the archival records that
 `restore` and `delete` depend on. A row whose item truly vanished from Drive
 self-heals later: `delete` treats a 404 as already deleted and drops the row.
 
+**Evicted rows** (`evicted_from_drive_id` set) are exempt for the same reason.
+An externals tree inside the crawl root is crawled like anything else, but one
+placed outside it is never visited, and the row is the only record of where the
+item came from.
+
 The cutoff is persisted so an interrupted crawl **resumes the same session**
 instead of resetting it (which would delete everything written before the
 interruption). Cleanup runs only on a fully successful completion — never after
@@ -752,6 +861,8 @@ Single `nodes` table (SQLite, pure-Go `modernc.org/sqlite` driver):
 | `original_parent_drive_id` | Drive ID of the folder the item lived in before `archive` moved it; non-NULL means "archived" — the `restore` target and `delete` prerequisite |
 | `archive_folder_drive_id` | folders only: cached Drive ID of the folder's `ARCH ` replica in the archive tree; cleared when `delete` prunes the replica |
 | `delete_skipped` | 1 when `delete` skipped the archived item because it is externally owned (re-run with `--remove-unowned`) |
+| `externals_folder_drive_id` | folders only: cached Drive ID of the folder's replica in the externals tree, the `evict-externals` counterpart of `archive_folder_drive_id` |
+| `evicted_from_drive_id` | Drive ID of the folder the item lived in before `evict-externals` moved it into the externals tree; non-NULL means "evicted", and is where the shortcut left in its place lives |
 
 `parent_id` is deliberately the traversal parent, not `files.parents[0]`, so
 it always references a row we actually crawled — `path` walks this chain to

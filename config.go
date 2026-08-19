@@ -25,6 +25,7 @@ type config struct {
 	Owners          ownersConfig    `json:"owners"`
 	Migration       migrationConfig `json:"migration"`
 	Archive         archiveConfig   `json:"archive"`
+	Externals       externalsConfig `json:"externals"`
 }
 
 type crawlConfig struct {
@@ -113,6 +114,25 @@ type archiveConfig struct {
 	Root rootConfig `json:"root" doc:"a My-Drive folder outside the crawl root that archived (soft-deleted) files are moved into"`
 }
 
+// externalsConfig holds settings for the evict-externals command.
+type externalsConfig struct {
+	// Root is the folder evict-externals moves externally-owned files and
+	// emptied externally-owned folders into, recreating the crawl root's folder
+	// structure beneath it — same names as the originals, and with their sharing
+	// copied across, so an evicted file stays where its owner expects to find it
+	// and stays reachable by everyone who could reach it before.
+	//
+	// It must be a regular My-Drive folder, never in a shared drive (an
+	// externally-owned file is exactly what a shared drive cannot hold), and must
+	// not be the crawl root or the archive root. Unlike archive.root it MAY sit
+	// inside the crawl root, and that is the recommended place: the evicted files
+	// then stay searchable from the crawl root, stay in the snapshot on every
+	// crawl, and stay migratable by pack/unpack. Wherever it sits, it must not be
+	// inside the subtree being prepared — evict-externals refuses that, since
+	// moving that subtree to a shared drive would take the externals tree along.
+	Root rootConfig `json:"root" doc:"a My-Drive folder (inside the crawl root is fine) that externally-owned files are evicted into"`
+}
+
 func loadConfig(path string) (config, error) {
 	var cfg config
 	b, err := os.ReadFile(path)
@@ -171,7 +191,8 @@ func configTemplate() (string, error) {
 			OwnershipTransferAccounts:       []string{},
 			ManualOwnershipTransferAccounts: []string{},
 		},
-		Archive: archiveConfig{Root: folder("ARCHIVE")},
+		Archive:   archiveConfig{Root: folder("ARCHIVE")},
+		Externals: externalsConfig{Root: folder("EXTERNALS")},
 	}
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
