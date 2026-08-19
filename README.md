@@ -253,13 +253,19 @@ it. For each of their folders, shallowest first:
 3. their folder's sharing is copied onto yours, **without sending anybody a
    notification email**, so nobody loses access when the contents move;
 4. everything directly inside their folder moves into yours;
-5. a `(new) <name>` shortcut to your folder is left inside theirs, so anyone
-   who lands on the old folder finds the new one;
+5. a `(new) <name>` shortcut to your folder is left inside theirs — always, so
+   anyone who lands on the old folder finds the new one;
 6. if anything could not be moved, an `(old) <name>` shortcut back to their
    folder is created inside yours;
-7. their emptied folder is marked `delete`, or `keep` if a descendant that
-   stayed behind is marked keep — the same propagation the review UI applies,
-   so ancestors are re-decided and no kept item is left inside a delete subtree.
+7. their folder is marked `keep`, so it is never archived or deleted.
+
+Their emptied folder is deliberately left standing. It costs nothing, and with
+the `(new) <name>` shortcut inside it, every link and bookmark that points at
+the old folder goes on working and leads whoever follows it to the replacement.
+The keep uses the same propagation the review UI applies, so any leftovers still
+stuck inside are kept with it (leftovers already marked `delete` stay `delete`)
+and `delete` decisions on its ancestors are cleared — nothing kept is ever left
+inside a delete subtree.
 
 The sharing copy runs before anything moves, so nobody is locked out even
 briefly. The owner grant, grants naming you, and grants whose user or group

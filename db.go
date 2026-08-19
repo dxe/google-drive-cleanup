@@ -1879,26 +1879,3 @@ func reparentNode(tx *sql.Tx, driveID string, parentRowID int64) (bool, error) {
 	n, err := res.RowsAffected()
 	return n > 0, err
 }
-
-// queryRower is the QueryRow half of *sql.DB and *sql.Tx, so a helper can be
-// called either standalone or inside a caller's transaction.
-type queryRower interface {
-	QueryRow(query string, args ...any) *sql.Row
-}
-
-// subtreeHasKeep reports whether any node strictly below rowID is marked keep.
-// It decides what reclaim-folders leaves on a folder it emptied: keep when something
-// kept is still stuck inside, delete otherwise.
-func subtreeHasKeep(q queryRower, rowID int64) (bool, error) {
-	var n int
-	err := q.QueryRow(`
-		WITH RECURSIVE subtree(id) AS (
-			SELECT id FROM nodes WHERE id = ?
-			UNION ALL
-			SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
-		)
-		SELECT COUNT(*) FROM nodes
-		WHERE id IN (SELECT id FROM subtree) AND id <> ? AND decision = ?`,
-		rowID, rowID, decisionKeep).Scan(&n)
-	return n > 0, err
-}

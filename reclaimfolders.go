@@ -12,10 +12,14 @@ package main
 //
 // Anything that could not be moved stays in their folder, and our folder then
 // gets an "(old) <name>" shortcut back to it so the leftovers stay reachable.
+// That backwards shortcut is the only one that is conditional: the "(new)
+// <name>" shortcut in their folder is always there, and their folder itself is
+// always marked keep and never deleted, so links and bookmarks pointing at it
+// go on working and lead whoever follows them to the replacement.
+//
 // The snapshot is updated as the moves happen — the replacement folder and the
-// two shortcuts are inserted as nodes rows and the moved children reparented —
-// so the emptied folder's keep/delete decision (below) is computed against what
-// is really left inside it.
+// shortcuts are inserted as nodes rows and the moved children reparented — so
+// decisions and later archive/delete runs see where things really are.
 //
 // Folders are processed shallowest first, so a folder nested inside another
 // reclaimed folder is replaced after it has been carried across into the new
@@ -83,11 +87,12 @@ in the crawled tree (or under --folder, which is itself included):
      yours, so anyone who lands on the old folder finds the new one.
   6. If anything could not be moved, a shortcut "(old) <name>" is created
      inside your folder, pointing back at theirs.
-  7. Their folder's keep/delete decision is set from what is left inside it:
-     delete when it was emptied, otherwise keep if any descendant is marked
-     keep and delete if not. Marking it keep also marks its still-undecided
-     leftovers keep, exactly as clicking Keep on the folder in the review UI
-     does, and clears any delete decision on its ancestors.
+  7. Their folder is marked keep, so it is never archived or deleted. Their
+     emptied folder plus its "(new) <name>" shortcut is what keeps existing
+     links to the folder working and points people at the replacement. The
+     keep also marks their folder's still-undecided leftovers keep and clears
+     any delete decision on its ancestors, exactly as clicking Keep on the
+     folder in the review UI does.
 
 The sharing is copied before anything moves, so nobody is locked out even
 briefly. Drive reports a My-Drive folder's inherited grants alongside its own,
@@ -162,9 +167,8 @@ type reclaimResult struct {
 	theirsID string
 	oursID   string // empty only in a dry run, when the replacement does not exist yet
 	moved    int
-	left     int    // items that stayed behind in their folder
-	grants   int    // grants copied from their folder onto ours
-	decision string // the decision left on their folder ("" in a dry run)
+	left     int // items that stayed behind in their folder
+	grants   int // grants copied from their folder onto ours
 }
 
 func runReclaimFolders(dbPath, cfgPath, email, subfolder string, dryRun bool, maxErrors, concurrency int) error {
@@ -359,8 +363,7 @@ type reclaimer struct {
 // snapshot. A returned skipErr means the folder was deliberately left alone;
 // any other error means this folder failed and spends the error budget.
 // Failures moving individual items do not fail the folder — they are counted,
-// left behind, and reflected in the shortcut back to their folder and in the
-// decision the folder ends up with.
+// left behind, and reflected in the shortcut back to their folder.
 func (r *reclaimer) replace(ctx context.Context, t reclaimTarget, path string) (reclaimResult, error) {
 	res := reclaimResult{path: path, theirsID: t.driveID}
 
@@ -492,7 +495,7 @@ func (r *reclaimer) replace(ctx context.Context, t reclaimTarget, path string) (
 		}
 	}
 
-	if res.decision, err = r.record(t, f, ours, origName, parent, moved, backlink, leftoverLink, oursPerms); err != nil {
+	if err := r.record(t, f, ours, origName, parent, moved, backlink, leftoverLink, oursPerms); err != nil {
 		return res, fmt.Errorf("recording the replacement in the database: %w", err)
 	}
 	return res, nil
@@ -679,15 +682,14 @@ func (r *reclaimer) moveChildren(ctx context.Context, theirs, ours *drive.File, 
 }
 
 // record writes one replacement into the snapshot, in a single transaction: the
-// replacement folder and the two shortcuts become nodes rows, every item that
-// moved is reparented under the replacement, and their now-emptied folder gets
-// its keep/delete decision. Returns the decision left on their folder.
+// replacement folder and the shortcuts become nodes rows, every item that moved
+// is reparented under the replacement, and their emptied folder is marked keep.
 //
-// The decision reuses the review server's own propagation (markInTx), so the
-// invariants the review UI relies on survive: a delete cascades to whatever is
-// still stuck inside, a keep clears delete decisions on the ancestors, and
-// fully-decided ancestors are rolled back up either way.
-func (r *reclaimer) record(t reclaimTarget, theirs, ours *drive.File, origName, parentDriveID string, moved []string, backlink, leftoverLink *drive.File, oursPerms []*drive.Permission) (string, error) {
+// The keep reuses the review server's own propagation (markInTx), so the
+// invariants the review UI relies on survive: their folder's undecided
+// leftovers are kept with it, delete decisions on its ancestors are cleared so
+// it cannot sit inside a delete subtree, and ancestors are rolled back up.
+func (r *reclaimer) record(t reclaimTarget, theirs, ours *drive.File, origName, parentDriveID string, moved []string, backlink, leftoverLink *drive.File, oursPerms []*drive.Permission) error {
 	// Where the replacement sits in the snapshot. The live parent is normally
 	// the folder's recorded parent, but for a folder nested inside another
 	// reclaimed one it is the replacement created a step earlier; fall back to
@@ -700,17 +702,17 @@ func (r *reclaimer) record(t reclaimTarget, theirs, ours *drive.File, origName, 
 	case sql.ErrNoRows:
 		var ok bool
 		if parentRowID, ok, err = parentRowOf(r.db, t.driveID); err != nil {
-			return "", err
+			return err
 		} else if !ok {
-			return "", fmt.Errorf("folder %s has no recorded parent to place the replacement under", t.driveID)
+			return fmt.Errorf("folder %s has no recorded parent to place the replacement under", t.driveID)
 		}
 	default:
-		return "", err
+		return err
 	}
 
 	tx, err := r.db.Begin()
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer tx.Rollback()
 
@@ -726,7 +728,7 @@ func (r *reclaimer) record(t reclaimTarget, theirs, ours *drive.File, origName, 
 		canEdit:      true,
 	}, true)
 	if err != nil {
-		return "", err
+		return err
 	}
 
 	// Items created since the last crawl have no row to reparent; the
@@ -735,7 +737,7 @@ func (r *reclaimer) record(t reclaimTarget, theirs, ours *drive.File, origName, 
 	for _, id := range moved {
 		found, err := reparentNode(tx, id, oursRow)
 		if err != nil {
-			return "", err
+			return err
 		}
 		if !found {
 			unrecorded++
@@ -748,7 +750,7 @@ func (r *reclaimer) record(t reclaimTarget, theirs, ours *drive.File, origName, 
 			ownerDisplay: nullString(r.me.DisplayName), shortcutTarget: nullString(ours.Id),
 			parentID: sql.NullInt64{Int64: t.rowID, Valid: true}, canEdit: true,
 		}, true); err != nil {
-			return "", err
+			return err
 		}
 	}
 	if leftoverLink != nil {
@@ -758,43 +760,37 @@ func (r *reclaimer) record(t reclaimTarget, theirs, ours *drive.File, origName, 
 			ownerDisplay: nullString(r.me.DisplayName), shortcutTarget: nullString(theirs.Id),
 			parentID: sql.NullInt64{Int64: oursRow, Valid: true}, canEdit: true,
 		}, true); err != nil {
-			return "", err
+			return err
 		}
 	}
 	if unrecorded == 0 {
 		if err := markChildrenDone(tx, oursRow); err != nil {
-			return "", err
+			return err
 		}
 	}
 	// The replacement's sharing, as it stands after the copy — folder_permissions
 	// is what tells a later run (or a human) who could reach a folder.
 	if oursPerms != nil {
 		if err := replacePermissions(tx, ours.Id, permissionRows(oursPerms)); err != nil {
-			return "", err
+			return err
 		}
 	}
 
-	// Keep the emptied folder only if something kept is still inside it;
-	// otherwise it is dead weight and can be archived away. "preserve" is the
-	// review UI's default for a keep: descendant delete subtrees stay delete.
-	hasKeep, err := subtreeHasKeep(tx, t.rowID)
-	if err != nil {
-		return "", err
-	}
-	decision, onConflict := decisionDelete, ""
-	if hasKeep {
-		decision, onConflict = decisionKeep, "preserve"
-	}
+	// Their emptied folder is always kept, never deleted: it and the "(new)
+	// <name>" shortcut inside it are what stop links and bookmarks pointing at
+	// the old folder from breaking, and what lead whoever follows one to the
+	// replacement. "preserve" is the review UI's default for a keep, so anything
+	// left behind that was already marked delete stays delete.
 	rec := make(map[int64]string)
-	if _, err := markInTx(tx, t.driveID, decision, onConflict, rec); err != nil {
-		return "", err
+	if _, err := markInTx(tx, t.driveID, decisionKeep, "preserve", rec); err != nil {
+		return err
 	}
 	// The replacement inherits whatever its new contents say: all-delete makes it
 	// delete, anything else leaves it for the review UI to decide.
 	if err := rollupSelfAndAncestors(tx, oursRow, rec); err != nil {
-		return "", err
+		return err
 	}
-	return decision, tx.Commit()
+	return tx.Commit()
 }
 
 // printReclaimPairs writes the run's report to stdout: one block per folder
@@ -820,11 +816,10 @@ func printReclaimPairs(results []reclaimResult, theirEmail, ourEmail string, dry
 		case dryRun:
 			fmt.Printf("          %d item(s) would move, %d grant(s) would be copied\n", res.moved, res.grants)
 		case res.left > 0:
-			fmt.Printf("          %d item(s) moved, %d left behind, %d grant(s) copied; theirs marked %s\n",
-				res.moved, res.left, res.grants, res.decision)
+			fmt.Printf("          %d item(s) moved, %d left behind, %d grant(s) copied; theirs kept\n",
+				res.moved, res.left, res.grants)
 		default:
-			fmt.Printf("          %d item(s) moved, %d grant(s) copied; theirs marked %s\n",
-				res.moved, res.grants, res.decision)
+			fmt.Printf("          %d item(s) moved, %d grant(s) copied; theirs kept\n", res.moved, res.grants)
 		}
 	}
 }

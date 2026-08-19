@@ -88,31 +88,6 @@ func TestFoldersOwnedByScoped(t *testing.T) {
 	}
 }
 
-func TestSubtreeHasKeep(t *testing.T) {
-	db := testDB(t)
-	_, aID := buildReclaimTree(t, db)
-
-	if has, err := subtreeHasKeep(db, aID); err != nil {
-		t.Fatal(err)
-	} else if has {
-		t.Error("undecided subtree reports a keep")
-	}
-	setDecision(t, db, "b1", decisionKeep) // two levels down
-	if has, err := subtreeHasKeep(db, aID); err != nil {
-		t.Fatal(err)
-	} else if !has {
-		t.Error("keep on a nested descendant not seen")
-	}
-	// The folder's own decision does not count — only what is inside it.
-	setDecision(t, db, "b1", decisionNone)
-	setDecision(t, db, "A", decisionKeep)
-	if has, err := subtreeHasKeep(db, aID); err != nil {
-		t.Fatal(err)
-	} else if has {
-		t.Error("the folder's own keep counted as a descendant's")
-	}
-}
-
 func TestReparentNode(t *testing.T) {
 	db := testDB(t)
 	rootID, aID := buildReclaimTree(t, db)
@@ -212,8 +187,9 @@ func parentOf(t *testing.T, db *sql.DB, driveID string) int64 {
 }
 
 // TestReclaimRecordEmptied covers the common case: everything moved across, so
-// their folder is left holding nothing but the shortcut to ours and is marked
-// delete — without dragging the moved items down with it.
+// their folder is left holding nothing but the shortcut to ours. It is kept all
+// the same, so links pointing at it keep working — without dragging the moved
+// items into its decision.
 func TestReclaimRecordEmptied(t *testing.T) {
 	db := testDB(t)
 	rootID, aRow := buildReclaimTree(t, db)
@@ -224,12 +200,8 @@ func TestReclaimRecordEmptied(t *testing.T) {
 	ours := &drive.File{Id: "A-new", Name: "A"}
 	backlink := &drive.File{Id: "A-link", Name: "(new) A"}
 
-	dec, err := r.record(target, theirs, ours, "A", "root", []string{"a1", "B"}, backlink, nil, nil)
-	if err != nil {
+	if err := r.record(target, theirs, ours, "A", "root", []string{"a1", "B"}, backlink, nil, nil); err != nil {
 		t.Fatal(err)
-	}
-	if dec != decisionDelete {
-		t.Errorf("decision = %q, want %q", dec, decisionDelete)
 	}
 
 	// The replacement is recorded beside their folder, owned by us, and fully
@@ -258,28 +230,29 @@ func TestReclaimRecordEmptied(t *testing.T) {
 		t.Error("the (new) shortcut was not recorded inside their folder")
 	}
 
-	// Their folder and the shortcut left inside it are delete; the contents that
+	// Their folder and the shortcut left inside it are keep; the contents that
 	// moved out keep their own (undecided) decisions.
-	if got := decisionOf(t, db, "A"); got != decisionDelete {
-		t.Errorf("their folder = %q, want delete", got)
+	if got := decisionOf(t, db, "A"); got != decisionKeep {
+		t.Errorf("their folder = %q, want keep", got)
 	}
-	if got := decisionOf(t, db, "A-link"); got != decisionDelete {
-		t.Errorf("the (new) shortcut = %q, want delete (it goes with the folder)", got)
+	if got := decisionOf(t, db, "A-link"); got != decisionKeep {
+		t.Errorf("the (new) shortcut = %q, want keep (it goes with the folder)", got)
 	}
 	for _, id := range []string{"a1", "B", "b1"} {
 		if got := decisionOf(t, db, id); got != decisionNone {
-			t.Errorf("%s = %q, want undecided — it moved out before the delete", id, got)
+			t.Errorf("%s = %q, want undecided — it moved out before the keep", id, got)
 		}
 	}
 }
 
-// TestReclaimRecordKeepsStuckContent covers the other branch: nothing could be
-// moved and something inside is marked keep, so their folder is kept.
+// TestReclaimRecordKeepsStuckContent covers a folder nothing could be moved out
+// of: an earlier delete on it is replaced by the keep, its undecided leftovers
+// are kept with it, and a leftover already marked delete stays delete.
 func TestReclaimRecordKeepsStuckContent(t *testing.T) {
 	db := testDB(t)
 	_, aRow := buildReclaimTree(t, db)
-	setDecision(t, db, "b1", decisionKeep) // two levels down, still counts
 	setDecision(t, db, "A", decisionDelete)
+	setDecision(t, db, "b1", decisionDelete) // two levels down, already decided
 	r := testReclaimer(db)
 
 	target := reclaimTarget{rowID: aRow, driveID: "A", name: "A"}
@@ -287,15 +260,17 @@ func TestReclaimRecordKeepsStuckContent(t *testing.T) {
 	ours := &drive.File{Id: "A-new", Name: "A"}
 	leftoverLink := &drive.File{Id: "A-old-link", Name: "(old) A"}
 
-	dec, err := r.record(target, theirs, ours, "A", "root", nil, nil, leftoverLink, nil)
-	if err != nil {
+	if err := r.record(target, theirs, ours, "A", "root", nil, nil, leftoverLink, nil); err != nil {
 		t.Fatal(err)
-	}
-	if dec != decisionKeep {
-		t.Errorf("decision = %q, want %q", dec, decisionKeep)
 	}
 	if got := decisionOf(t, db, "A"); got != decisionKeep {
 		t.Errorf("their folder = %q, want keep", got)
+	}
+	if got := decisionOf(t, db, "a1"); got != decisionKeep {
+		t.Errorf("undecided leftover a1 = %q, want keep", got)
+	}
+	if got := decisionOf(t, db, "b1"); got != decisionDelete {
+		t.Errorf("already-deleted leftover b1 = %q, want delete", got)
 	}
 	// The shortcut back to their folder lives in ours.
 	var newRow int64
@@ -315,7 +290,7 @@ func TestReclaimRecordLeavesUncrawledChildrenPending(t *testing.T) {
 	_, aRow := buildReclaimTree(t, db)
 	r := testReclaimer(db)
 
-	if _, err := r.record(reclaimTarget{rowID: aRow, driveID: "A", name: "A"},
+	if err := r.record(reclaimTarget{rowID: aRow, driveID: "A", name: "A"},
 		&drive.File{Id: "A", Name: "(old) A"}, &drive.File{Id: "A-new", Name: "A"},
 		"A", "root", []string{"a1", "created-after-the-crawl"}, nil, nil, nil); err != nil {
 		t.Fatal(err)
@@ -390,7 +365,7 @@ func TestReclaimRecordStoresPermissions(t *testing.T) {
 		{Id: "p-alice", Type: "user", Role: "writer", EmailAddress: "alice@example.com"},
 		{Id: "p-domain", Type: "domain", Role: "reader", Domain: "example.com"},
 	}
-	if _, err := r.record(reclaimTarget{rowID: aRow, driveID: "A", name: "A"},
+	if err := r.record(reclaimTarget{rowID: aRow, driveID: "A", name: "A"},
 		&drive.File{Id: "A", Name: "(old) A"}, &drive.File{Id: "A-new", Name: "A"},
 		"A", "root", []string{"a1"}, nil, nil, perms); err != nil {
 		t.Fatal(err)
