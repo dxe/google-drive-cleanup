@@ -802,12 +802,19 @@ func canEditOf(f *drive.File) bool {
 // The list is empty for items whose permissions the crawling account cannot
 // read; we store what Drive returns.
 func permissionsOf(f *drive.File) []permission {
-	perms := make([]permission, 0, len(f.Permissions))
-	for _, p := range f.Permissions {
+	return permissionRows(f.Permissions)
+}
+
+// permissionRows converts Drive permissions into their stored form, dropping
+// nil entries. Shared by the crawl (from a file's expanded permissions) and by
+// reclaim-folders (from a permissions.list plus the grants it copied).
+func permissionRows(perms []*drive.Permission) []permission {
+	out := make([]permission, 0, len(perms))
+	for _, p := range perms {
 		if p == nil {
 			continue
 		}
-		perms = append(perms, permission{
+		out = append(out, permission{
 			permissionID:       p.Id,
 			typ:                p.Type,
 			role:               p.Role,
@@ -818,7 +825,7 @@ func permissionsOf(f *drive.File) []permission {
 			deleted:            p.Deleted,
 		})
 	}
-	return perms
+	return out
 }
 
 func nullString(s string) sql.NullString {

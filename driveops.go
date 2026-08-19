@@ -318,7 +318,10 @@ func listPermissions(ctx context.Context, svc *drive.Service, limiter *rate.Limi
 			return nil, err
 		}
 		call := svc.Permissions.List(fileID).
-			Fields("nextPageToken, permissions(id, type, emailAddress, role, deleted)").
+			// The full set the crawl records (see permissionFields): reclaim-folders needs
+			// domain and allowFileDiscovery to recreate a grant on its replacement
+			// folder, and the extra fields cost nothing to the revoke-only callers.
+			Fields("nextPageToken, permissions(id, type, emailAddress, domain, displayName, role, allowFileDiscovery, deleted)").
 			SupportsAllDrives(true).
 			PageSize(100).
 			Context(ctx)
@@ -365,6 +368,57 @@ func grantPermission(ctx context.Context, svc *drive.Service, limiter *rate.Limi
 		}).SupportsAllDrives(true).SendNotificationEmail(false).Context(ctx).Do()
 		return err
 	})
+}
+
+// copyPermission recreates one of a folder's grants on another item, returning
+// the permission it created. Notification email is suppressed for the user and
+// group grants that would otherwise trigger one; the domain and anyone grants
+// never notify, and the Drive API rejects the parameter on them, so it is not
+// sent there.
+//
+// Roles are copied verbatim. An "owner" grant cannot be recreated (ownership is
+// not transferable this way) and must be filtered out by the caller.
+func copyPermission(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, fileID string, p *drive.Permission) (*drive.Permission, error) {
+	want := &drive.Permission{
+		Type:         p.Type,
+		Role:         p.Role,
+		EmailAddress: p.EmailAddress,
+		Domain:       p.Domain,
+	}
+	if p.Type == "domain" || p.Type == "anyone" {
+		// allowFileDiscovery is meaningful only here, and false must go on the
+		// wire rather than being dropped as a zero value.
+		want.AllowFileDiscovery = p.AllowFileDiscovery
+		want.ForceSendFields = []string{"AllowFileDiscovery"}
+	}
+	var out *drive.Permission
+	err := withRetry(ctx, limiter, "permissions.create copy "+permissionKey(p), func() error {
+		call := svc.Permissions.Create(fileID, want).
+			SupportsAllDrives(true).
+			Fields("id, type, role, emailAddress, domain, displayName, allowFileDiscovery, deleted").
+			Context(ctx)
+		if p.Type == "user" || p.Type == "group" {
+			call = call.SendNotificationEmail(false)
+		}
+		created, err := call.Do()
+		out = created
+		return err
+	})
+	return out, err
+}
+
+// permissionKey identifies who a grant is for, ignoring its role and id, so the
+// same grantee can be recognised across two items. Emails and domains are
+// lower-cased; an "anyone" grant is keyed by its type alone.
+func permissionKey(p *drive.Permission) string {
+	switch p.Type {
+	case "user", "group":
+		return p.Type + ":" + strings.ToLower(p.EmailAddress)
+	case "domain":
+		return "domain:" + strings.ToLower(p.Domain)
+	default:
+		return p.Type
+	}
 }
 
 // revokePermission removes the permission with permissionID from fileID. Used
@@ -489,4 +543,62 @@ func isNotFound(err error) bool {
 		return apiErr.Code == 404
 	}
 	return false
+}
+
+// renameFile sets a new name on an item, retrying transient failures. Used by
+// reclaim-folders to prefix a folder it is replacing with "(old) ".
+func renameFile(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, fileID, name string) error {
+	return withRetry(ctx, limiter, "files.update rename "+fileID, func() error {
+		_, err := svc.Files.Update(fileID, &drive.File{Name: name}).
+			SupportsAllDrives(true).
+			Fields("id").
+			Context(ctx).Do()
+		return err
+	})
+}
+
+// createShortcut creates a Drive shortcut to targetID inside parentID. The
+// shortcut is a new file owned by the running account, so it can be placed in a
+// folder owned by somebody else as long as the account may add children there.
+func createShortcut(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, parentID, name, targetID string) (*drive.File, error) {
+	var out *drive.File
+	err := withRetry(ctx, limiter, "files.create shortcut "+name, func() error {
+		f, err := svc.Files.Create(&drive.File{
+			Name:            name,
+			MimeType:        shortcutMimeType,
+			Parents:         []string{parentID},
+			ShortcutDetails: &drive.FileShortcutDetails{TargetId: targetID},
+		}).SupportsAllDrives(true).Fields("id, name, shortcutDetails(targetId)").Context(ctx).Do()
+		out = f
+		return err
+	})
+	return out, err
+}
+
+// findChildrenNamed returns every non-trashed child of parentID named name.
+// mimeType, when non-empty, restricts the match to that type. fields is the
+// inner Drive fields selector, e.g. "id, name, owners(emailAddress)".
+//
+// Unlike findChildFolder it hands back every match so the caller can pick by a
+// property Drive's query grammar cannot express (reclaim-folders picks the
+// candidate owned by the running account, and the shortcut pointing at a target).
+// One page of up to 100: an exact-name match in one folder never needs more.
+func findChildrenNamed(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, parentID, name, mimeType, fields string) ([]*drive.File, error) {
+	q := fmt.Sprintf("'%s' in parents and name = '%s' and trashed = false", parentID, escapeDriveQuery(name))
+	if mimeType != "" {
+		q += fmt.Sprintf(" and mimeType = '%s'", mimeType)
+	}
+	if err := limiter.Wait(ctx); err != nil {
+		return nil, err
+	}
+	list, err := svc.Files.List().
+		Q(q).
+		Fields(googleapi.Field("files(" + fields + ")")).
+		SupportsAllDrives(true).IncludeItemsFromAllDrives(true).
+		PageSize(100).
+		Context(ctx).Do()
+	if err != nil {
+		return nil, err
+	}
+	return list.Files, nil
 }

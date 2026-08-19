@@ -1814,3 +1814,91 @@ func deleteNodeRow(db *sql.DB, driveID string) error {
 	}
 	return tx.Commit()
 }
+
+// --- reclaim-folders persistence ---
+
+// reclaimTarget is one folder the reclaim-folders command replaces: a folder owned by
+// the account being reclaimed, somewhere inside the scoped subtree.
+type reclaimTarget struct {
+	rowID   int64
+	driveID string
+	name    string
+	depth   int // hops below the scope folder; the scope folder itself is 0
+}
+
+// foldersOwnedBy returns every folder in the subtree rooted at scopeDriveID
+// (inclusive) owned by account — owner_email matched case-insensitively, or
+// owner_id matched exactly — shallowest first, so reclaim-folders replaces a folder
+// before the folders nested inside it.
+func foldersOwnedBy(db *sql.DB, scopeDriveID, account string) ([]reclaimTarget, error) {
+	rows, err := db.Query(`
+		WITH RECURSIVE subtree(id, depth) AS (
+			SELECT id, 0 FROM nodes WHERE drive_id = ?
+			UNION ALL
+			SELECT n.id, s.depth + 1 FROM nodes n JOIN subtree s ON n.parent_id = s.id
+		)
+		SELECT n.id, n.drive_id, n.name, s.depth
+		FROM nodes n JOIN subtree s ON s.id = n.id
+		WHERE n.type = ?
+		  AND (n.owner_email = ? COLLATE NOCASE OR n.owner_id = ?)
+		ORDER BY s.depth, n.id`, scopeDriveID, typeFolder, account, account)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []reclaimTarget
+	for rows.Next() {
+		var t reclaimTarget
+		if err := rows.Scan(&t.rowID, &t.driveID, &t.name, &t.depth); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// parentRowOf returns the row id of a node's recorded parent. ok is false when
+// the node has no parent (a crawl root).
+func parentRowOf(db *sql.DB, driveID string) (rowID int64, ok bool, err error) {
+	var parent sql.NullInt64
+	if err := db.QueryRow(`SELECT parent_id FROM nodes WHERE drive_id = ?`, driveID).Scan(&parent); err != nil {
+		return 0, false, err
+	}
+	return parent.Int64, parent.Valid, nil
+}
+
+// reparentNode points an existing node's row at a new parent row, recording a
+// move reclaim-folders just made on Drive so the snapshot keeps describing where items
+// actually live. Reports whether a row was updated — a child created after the
+// last crawl has no row, and is left for the next crawl to pick up.
+func reparentNode(tx *sql.Tx, driveID string, parentRowID int64) (bool, error) {
+	res, err := tx.Exec(`UPDATE nodes SET parent_id = ? WHERE drive_id = ?`, parentRowID, driveID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// queryRower is the QueryRow half of *sql.DB and *sql.Tx, so a helper can be
+// called either standalone or inside a caller's transaction.
+type queryRower interface {
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+// subtreeHasKeep reports whether any node strictly below rowID is marked keep.
+// It decides what reclaim-folders leaves on a folder it emptied: keep when something
+// kept is still stuck inside, delete otherwise.
+func subtreeHasKeep(q queryRower, rowID int64) (bool, error) {
+	var n int
+	err := q.QueryRow(`
+		WITH RECURSIVE subtree(id) AS (
+			SELECT id FROM nodes WHERE id = ?
+			UNION ALL
+			SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
+		)
+		SELECT COUNT(*) FROM nodes
+		WHERE id IN (SELECT id FROM subtree) AND id <> ? AND decision = ?`,
+		rowID, rowID, decisionKeep).Scan(&n)
+	return n > 0, err
+}

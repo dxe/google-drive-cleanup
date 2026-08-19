@@ -192,10 +192,15 @@ drive-cleanup delete --remove-unowned          # also handle externally-owned it
 
 # Bring one archived item back to its original folder and mark it keep
 drive-cleanup restore 1AbCdEfGh...
+
+# Replace every folder owned by someone else with an identically-named folder
+# owned by you, moving the contents and the sharing across
+drive-cleanup reclaim-folders alice@example.com
+drive-cleanup reclaim-folders alice@example.com --folder 1AbCdEfGh...  # only that subtree
 ```
 
-The commands that change Drive — `pack`, `unpack`, `archive`, `delete`, and
-`restore` — accept `--dry-run`, which reports every `WOULD
+The commands that change Drive — `pack`, `unpack`, `archive`, `delete`,
+`restore`, and `reclaim-folders` — accept `--dry-run`, which reports every `WOULD
 move/create/delete` action without changing anything. A dry run authenticates
 with the read-only scope (so it never triggers a write-scope consent) and skips
 the confirmation prompt. Run one first to preview a step. They also accept
@@ -221,6 +226,59 @@ folders, per-folder counts of owned descendants, Drive links, and keyboard
 navigation — handy to attach when reaching out to an owner. Run it without an
 account argument to generate one such file per owner in the database (owners
 with neither an email nor an owner id are skipped).
+
+### Taking over someone's folders (`reclaim-folders`)
+
+Drive lets you move a file into a folder you own, but it never lets you take a
+*folder's* ownership away from its owner — only they can hand it over.
+`reclaim-folders` works around that: it supersedes each of their folders with an
+identically-named folder that you own, and moves the contents across.
+
+```bash
+drive-cleanup reclaim-folders alice@example.com --dry-run
+drive-cleanup reclaim-folders alice@example.com
+drive-cleanup reclaim-folders alice@example.com --folder 1AbCdEfGh...
+```
+
+The email is matched against `owner_email` (case-insensitively) or `owner_id`.
+Without `--folder` every folder they own under the crawl root is replaced (the
+crawl root itself never is, even if they own it); with it, the run is scoped to
+that crawled folder's subtree and the folder itself is included when they own
+it. For each of their folders, shallowest first:
+
+1. it is renamed `(old) <name>` — skipped if it already carries the prefix, so
+   a re-run is a no-op rather than `(old) (old) <name>`;
+2. a folder `<name>` owned by you is created under the same parent, or an
+   existing one you own there is adopted;
+3. their folder's sharing is copied onto yours, **without sending anybody a
+   notification email**, so nobody loses access when the contents move;
+4. everything directly inside their folder moves into yours;
+5. a `(new) <name>` shortcut to your folder is left inside theirs, so anyone
+   who lands on the old folder finds the new one;
+6. if anything could not be moved, an `(old) <name>` shortcut back to their
+   folder is created inside yours;
+7. their emptied folder is marked `delete`, or `keep` if a descendant that
+   stayed behind is marked keep — the same propagation the review UI applies,
+   so ancestors are re-decided and no kept item is left inside a delete subtree.
+
+The sharing copy runs before anything moves, so nobody is locked out even
+briefly. The owner grant, grants naming you, and grants whose user or group
+Drive reports as deleted are all skipped. Drive reports a My-Drive folder's
+inherited grants alongside its own, and your replacement sits under the same
+parent, so it starts with the same inherited access — only what their folder
+has *beyond* that gets created on yours. Roles are compared, not just
+grantees, so a folder of theirs that widens an inherited grant (shared with
+`anyone` as writer inside a parent shared as reader, say) is matched by an
+explicit grant on yours; anything your folder already provides at an equal or
+stronger role is left alone, which keeps a re-run a no-op.
+
+Because a folder of theirs nested inside another is carried into the new parent
+in step 4 before its own turn comes, its replacement is created in the *new*
+tree, not the old one. The snapshot is updated as the run goes — the new
+folders and shortcuts become `nodes` rows, the moved items are reparented, and
+the replacement's sharing is written to `folder_permissions` — so decisions and
+later `archive`/`delete` runs see where things really are. Re-crawl afterwards
+to pick up anything created since the last crawl.
 
 ### Reviewing what to keep vs delete (`review` / `export-review`)
 

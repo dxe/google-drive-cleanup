@@ -100,9 +100,34 @@ func (l *opLog) grantPermission(ctx context.Context, svc *drive.Service, limiter
 	return err
 }
 
+func (l *opLog) copyPermission(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, fileID string, p *drive.Permission) (*drive.Permission, error) {
+	started := now()
+	created, err := copyPermission(ctx, svc, limiter, fileID, p)
+	l.record("copy_permission", fileID, "", "", "", permissionKey(p)+" "+p.Role, started, err)
+	return created, err
+}
+
 func (l *opLog) revokePermission(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, fileID, permissionID string) error {
 	started := now()
 	err := revokePermission(ctx, svc, limiter, fileID, permissionID)
 	l.record("revoke_permission", fileID, "", "", "", "permission "+permissionID, started, err)
 	return err
+}
+
+func (l *opLog) renameFile(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, fileID, name string) error {
+	started := now()
+	err := renameFile(ctx, svc, limiter, fileID, name)
+	l.record("rename", fileID, name, "", "", "", started, err)
+	return err
+}
+
+func (l *opLog) createShortcut(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, parentID, name, targetID string) (*drive.File, error) {
+	started := now()
+	f, err := createShortcut(ctx, svc, limiter, parentID, name, targetID)
+	id := ""
+	if f != nil {
+		id = f.Id
+	}
+	l.record("create_shortcut", id, name, "", parentID, "target "+targetID, started, err)
+	return f, err
 }
