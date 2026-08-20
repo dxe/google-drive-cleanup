@@ -26,6 +26,11 @@ recent file keep clears any delete decision on its ancestor folders (a kept file
 may not live inside a deleted subtree) and rolls fully-decided folders back up,
 so the web UI's keep/delete invariants stay intact.
 
+config.json's "keep-recent-after" (YYYY-MM-DD, optional) floors the window: a
+file last modified on or before that date is never marked, however many --months
+are asked for. Set it when a bulk edit, move, or re-share has bumped old files'
+last_modified and you do not want them kept because of it.
+
 Files with no recorded last_modified (never seen a crawl that recorded it, or an
 unparseable value) are left untouched. This reads and writes only the database;
 re-run crawl first if it is stale.`,
@@ -69,7 +74,14 @@ func runKeepRecent(dbPath, cfgPath string, months int, dryRun bool) error {
 		}
 	}
 
-	cutoff := time.Now().AddDate(0, -months, 0)
+	// config.json's keep-recent-after floors the window: a file last modified on
+	// or before that date is never recent, so an old file whose last_modified was
+	// bumped by mistake stays unmarked however many --months are asked for.
+	keepAfter, hasKeepAfter, err := optionalKeepRecentAfter(cfgPath)
+	if err != nil {
+		return err
+	}
+	cutoff, window := recentWindow(time.Now(), months, keepAfter, hasKeepAfter)
 
 	// Collect the recent files. Filter by parsed time in Go (rather than a SQL
 	// string comparison) to match review_export's modTime handling exactly.
@@ -102,7 +114,7 @@ func runKeepRecent(dbPath, cfgPath string, months int, dryRun bool) error {
 	}
 
 	if len(recent) == 0 {
-		fmt.Fprintf(os.Stderr, "No files modified in the last %s.\n", monthsPhrase(months))
+		fmt.Fprintf(os.Stderr, "No files modified %s.\n", window)
 		return nil
 	}
 
@@ -120,9 +132,9 @@ func runKeepRecent(dbPath, cfgPath string, months int, dryRun bool) error {
 
 	if dryRun {
 		fmt.Fprintf(os.Stderr,
-			"[dry run] %d file(s) modified in the last %s; would change %d node(s), "+
+			"[dry run] %d file(s) modified %s; would change %d node(s), "+
 				"clearing %d delete ancestor(s). No changes written.\n",
-			matched, monthsPhrase(months), len(rec), res.ClearedAncestors)
+			matched, window, len(rec), res.ClearedAncestors)
 		return nil // deferred Rollback discards the transaction
 	}
 
@@ -130,8 +142,8 @@ func runKeepRecent(dbPath, cfgPath string, months int, dryRun bool) error {
 		return err
 	}
 	fmt.Fprintf(os.Stderr,
-		"Marked keep: %d file(s) modified in the last %s; %d node(s) changed, "+
+		"Marked keep: %d file(s) modified %s; %d node(s) changed, "+
 			"%d delete ancestor(s) cleared.\n",
-		matched, monthsPhrase(months), len(rec), res.ClearedAncestors)
+		matched, window, len(rec), res.ClearedAncestors)
 	return nil
 }

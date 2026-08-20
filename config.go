@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"strings"
+	"time"
 )
 
 // placeholderPrefix marks the example values written by `drive-cleanup init`.
@@ -21,8 +22,15 @@ type config struct {
 	// InternalDomains lists the org's own email domains (no leading "@"), e.g.
 	// "example.com". Commands can use these to distinguish internal from
 	// external owners.
-	InternalDomains []string        `json:"internal-domains" doc:"your org's email domains"`
-	Owners          ownersConfig    `json:"owners"`
+	InternalDomains []string     `json:"internal-domains" doc:"your org's email domains"`
+	Owners          ownersConfig `json:"owners"`
+	// KeepRecentAfter is a floor on what counts as "recently modified": a file
+	// modified on or before this date is never treated as recent, however wide
+	// the --months / --recent-months window is. Set it to suppress keeping old
+	// files whose last_modified was bumped recently by mistake (a stray edit, a
+	// bulk move, a re-share). Written as YYYY-MM-DD (RFC3339 also accepted);
+	// empty means no floor, so only the time window applies.
+	KeepRecentAfter string          `json:"keep-recent-after" doc:"YYYY-MM-DD; files modified on or before this date never count as recent (blank for no floor)"`
 	Migration       migrationConfig `json:"migration"`
 	Archive         archiveConfig   `json:"archive"`
 	Externals       externalsConfig `json:"externals"`
@@ -167,6 +175,36 @@ func optionalArchiveRootID(path string) (string, error) {
 	return cfg.Archive.Root.ID, nil
 }
 
+// optionalKeepRecentAfter returns the configured keep-recent-after date, with
+// ok false when the config file is absent or the setting is blank. Like
+// optionalArchiveRootID it lets the database-only commands (export-review,
+// keep-recent) read the setting without making config.json mandatory.
+func optionalKeepRecentAfter(path string) (time.Time, bool, error) {
+	cfg, err := loadConfig(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	return cfg.keepRecentAfter()
+}
+
+// keepRecentAfter parses config.KeepRecentAfter. A bare date is read as local
+// midnight, so "modified after 2026-08-17" means from the start of the 18th.
+func (c config) keepRecentAfter() (time.Time, bool, error) {
+	s := strings.TrimSpace(c.KeepRecentAfter)
+	if s == "" {
+		return time.Time{}, false, nil
+	}
+	for _, layout := range []string{"2006-01-02", time.RFC3339} {
+		if t, err := time.ParseInLocation(layout, s, time.Local); err == nil {
+			return t, true, nil
+		}
+	}
+	return time.Time{}, false, fmt.Errorf("keep-recent-after: %q is not a date; use YYYY-MM-DD (or a full RFC3339 timestamp)", s)
+}
+
 // configTemplate is the scaffold written by `drive-cleanup init`. It is built by
 // marshaling a config value so the JSON keys come straight from the struct's
 // json tags and never drift from what the subcommands read. Folder specs carry
@@ -184,6 +222,7 @@ func configTemplate() (string, error) {
 		Crawl:           crawlConfig{Root: folder("ROOT")},
 		InternalDomains: []string{"example.com"},
 		Owners:          ownersConfig{IgnoreInternalDomains: false},
+		KeepRecentAfter: "",
 		Migration: migrationConfig{
 			PackingFolder:                   folder("PACKING"),
 			DropoffFolder:                   folder("DROPOFF"),

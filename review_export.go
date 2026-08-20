@@ -31,8 +31,10 @@ sent to teammates as-is. The files written are:
   review-undecided-old.html   undecided files not modified recently
 
 The "recent" window and "old" threshold are configurable (see --recent-months
-and --old-years). The focused reports only include files whose last_modified is
-known (recorded by 'crawl').`,
+and --old-years). config.json's "keep-recent-after" additionally floors what the
+delete-recents report calls recent — matching what 'keep-recent' would mark — so
+files last modified on or before that date are left out of it. The focused
+reports only include files whose last_modified is known (recorded by 'crawl').`,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dbPath, _ := cmd.Flags().GetString("db")
@@ -71,9 +73,18 @@ func runExportReview(dbPath, cfgPath, outDir string, recentMonths, oldYears int)
 		return fmt.Errorf("database has no crawled nodes; run crawl first")
 	}
 
+	keepAfter, hasKeepAfter, err := optionalKeepRecentAfter(cfgPath)
+	if err != nil {
+		return err
+	}
+
 	now := time.Now()
 	recentCutoff := now.AddDate(0, -recentMonths, 0)
 	oldCutoff := now.AddDate(-oldYears, 0, 0)
+	// The delete-recents report exists to catch files keep-recent would have
+	// rescued, so it uses keep-recent's window — floored by keep-recent-after —
+	// rather than the plain months window the undecided-old report uses.
+	deleteRecentCutoff, deleteRecentPhrase := recentWindow(now, recentMonths, keepAfter, hasKeepAfter)
 
 	// modifiedAfter/modifiedBefore only match files whose last_modified is known
 	// and valid; a file with no recorded time never lands in a focused report.
@@ -109,8 +120,8 @@ func runExportReview(dbPath, cfgPath, outDir string, recentMonths, oldYears int)
 		{
 			file:        "review-delete-recents.html",
 			title:       "delete, but recently modified",
-			description: fmt.Sprintf("Files marked delete despite being modified within the last %s.", monthsPhrase(recentMonths)),
-			roots:       filterReviewForest(roots, decided(decisionDelete, modifiedAfter(recentCutoff))),
+			description: fmt.Sprintf("Files marked delete despite being modified %s.", deleteRecentPhrase),
+			roots:       filterReviewForest(roots, decided(decisionDelete, modifiedAfter(deleteRecentCutoff))),
 			expanded:    true,
 		},
 		{
@@ -230,6 +241,19 @@ func (n *reviewNode) modTime() (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return t, true
+}
+
+// recentWindow resolves what "recently modified" means: the later of the
+// months-back window and the config's keep-recent-after floor, plus a phrase
+// naming it ("in the last 6 months" / "since 2026-08-17"). The floor lets an
+// old file whose last_modified was bumped by mistake stay out of the recent
+// set no matter how wide the window is.
+func recentWindow(now time.Time, months int, after time.Time, hasAfter bool) (time.Time, string) {
+	cutoff := now.AddDate(0, -months, 0)
+	if hasAfter && after.After(cutoff) {
+		return after, "since " + after.Format("2006-01-02")
+	}
+	return cutoff, "in the last " + monthsPhrase(months)
 }
 
 func monthsPhrase(m int) string {
