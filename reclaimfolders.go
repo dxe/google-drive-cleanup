@@ -105,7 +105,10 @@ shared as reader, say) is matched by an explicit grant on yours, and a grant
 your folder already provides at an equal or stronger role is left alone.
 
 Folders are handled shallowest first, so a folder of theirs nested inside
-another is replaced inside the new parent. The database is updated as the run
+another is replaced inside the new parent. A --subtree run also follows the
+folder it is scoped to into the replacement an earlier run made for it: that
+folder is left empty, so what is still to be reclaimed lives in the replacement
+beside it. The database is updated as the run
 goes — the new folders and shortcuts are recorded, the moved items reparented,
 and the replacement's sharing written to folder_permissions — so the snapshot
 keeps describing where things actually live and who can reach them; a
@@ -221,25 +224,47 @@ func runReclaimFolders(dbPath, cfgPath, email, subtree, folder string, dryRun bo
 
 	var targets []reclaimTarget
 	if scope.recursive {
-		if pending, err := countPendingFolders(db, scope.driveID); err != nil {
-			return err
-		} else if pending > 0 {
-			log.Printf("WARN the crawl is incomplete (%d folder(s) not fully listed); folders it never reached will not be reclaimed. Re-run crawl for a complete pass", pending)
-		}
-
-		targets, err = foldersOwnedBy(db, scope.driveID, email)
+		// A folder an earlier run already replaced is an emptied husk: what used to
+		// be inside it, nested folders of theirs included, now sits in the
+		// replacement beside it. Walking only the husk's own subtree would find
+		// none of it, so the run covers the replacement too.
+		roots, err := reclaimScopeRoots(db, scope.driveID)
 		if err != nil {
 			return err
 		}
+		if len(roots) > 1 {
+			log.Printf("NOTE %s was already replaced by %s in an earlier run; its contents live there now, so the run covers that folder's subtree as well",
+				scope.driveID, strings.Join(roots[1:], ", "))
+		}
+
+		pending := 0
+		for _, root := range roots {
+			n, err := countPendingFolders(db, root)
+			if err != nil {
+				return err
+			}
+			pending += n
+		}
+		if pending > 0 {
+			log.Printf("WARN the crawl is incomplete (%d folder(s) not fully listed); folders it never reached will not be reclaimed. Re-run crawl for a complete pass", pending)
+		}
+
 		// The crawl root is the boundary of the snapshot and is never renamed or
 		// replaced, even when the account being reclaimed owns it.
-		kept := targets[:0]
-		for _, t := range targets {
-			if t.driveID != crawlRoot {
-				kept = append(kept, t)
+		seen := make(map[string]bool)
+		for _, root := range roots {
+			found, err := foldersOwnedBy(db, root, email)
+			if err != nil {
+				return err
+			}
+			for _, t := range found {
+				if t.driveID == crawlRoot || seen[t.driveID] {
+					continue
+				}
+				seen[t.driveID] = true
+				targets = append(targets, t)
 			}
 		}
-		targets = kept
 	} else {
 		// --folder names the one folder to replace, so anything that would make it
 		// no target at all is an error rather than a quiet empty run.
@@ -365,6 +390,31 @@ func (s reclaimScope) note() string {
 		return fmt.Sprintf(" under %q", s.path)
 	default:
 		return fmt.Sprintf(" at %q", s.path)
+	}
+}
+
+// reclaimScopeRoots returns the folders a --subtree run walks: the folder named,
+// then the replacement an earlier run left for it, and so on down the chain.
+// Reclaiming empties a folder into a replacement created beside it, so its
+// former contents end up outside its own subtree; a re-run scoped to their
+// folder would otherwise see nothing but the husk and the "(new) <name>"
+// shortcut in it. Only the scope folder needs this: a replacement made deeper
+// in the tree is a sibling of the folder it replaced, and so already inside the
+// subtree being walked.
+func reclaimScopeRoots(db *sql.DB, driveID string) ([]string, error) {
+	roots := []string{driveID}
+	seen := map[string]bool{driveID: true}
+	for cur := driveID; ; {
+		next, ok, err := reclaimReplacementOf(db, cur)
+		if err != nil {
+			return nil, err
+		}
+		if !ok || seen[next] {
+			return roots, nil
+		}
+		seen[next] = true
+		roots = append(roots, next)
+		cur = next
 	}
 }
 

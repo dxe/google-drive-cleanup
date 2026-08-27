@@ -121,6 +121,58 @@ func TestFolderOwnedByAccount(t *testing.T) {
 	}
 }
 
+func TestReclaimScopeRootsFollowsReplacements(t *testing.T) {
+	db := testDB(t)
+	rootID, aID := buildReclaimTree(t, db)
+
+	// An unscoped root, and a folder nobody has replaced, walk themselves only.
+	for _, id := range []string{"root", "A"} {
+		got, err := reclaimScopeRoots(db, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 || got[0] != id {
+			t.Errorf("reclaimScopeRoots(%s) = %v, want just %s", id, got, id)
+		}
+	}
+
+	// Reclaim A the way a run does: A keeps a "(new) A" shortcut to the
+	// replacement A', which is where A's nested folder B now lives.
+	newA, _, _, _ := mustUpsert(t, db, node{driveID: "A2", name: "A", typ: typeFolder, mimeType: folderMimeType,
+		ownerEmail: nullString("me@example.com"), parentID: sql.NullInt64{Int64: rootID, Valid: true}})
+	mustUpsert(t, db, node{driveID: "A2link", name: newFolderPrefix + "A", typ: typeShortcut,
+		mimeType: shortcutMimeType, shortcutTarget: nullString("A2"),
+		ownerEmail: nullString("me@example.com"), parentID: sql.NullInt64{Int64: aID, Valid: true}})
+	mustUpsert(t, db, node{driveID: "B", name: "B", typ: typeFolder, mimeType: folderMimeType,
+		ownerEmail: nullString("alice@example.com"), parentID: sql.NullInt64{Int64: newA, Valid: true}}, true)
+
+	got, err := reclaimScopeRoots(db, "A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != "A" || got[1] != "A2" {
+		t.Fatalf("reclaimScopeRoots(A) = %v, want [A A2]", got)
+	}
+	// Which is what makes a re-run scoped to their emptied folder still see the
+	// nested folder that moved into the replacement.
+	if found, err := foldersOwnedBy(db, "A2", "alice@example.com"); err != nil {
+		t.Fatal(err)
+	} else if len(found) != 1 || found[0].driveID != "B" {
+		t.Errorf("folders owned by alice under the replacement = %+v, want B", found)
+	}
+
+	// The "(old) A" shortcut pointing back the other way is not followed, so the
+	// walk cannot loop between the pair.
+	mustUpsert(t, db, node{driveID: "Alink", name: oldFolderPrefix + "A", typ: typeShortcut,
+		mimeType: shortcutMimeType, shortcutTarget: nullString("A"),
+		ownerEmail: nullString("me@example.com"), parentID: sql.NullInt64{Int64: newA, Valid: true}})
+	if got, err := reclaimScopeRoots(db, "A"); err != nil {
+		t.Fatal(err)
+	} else if len(got) != 2 {
+		t.Errorf("reclaimScopeRoots(A) with a back-shortcut = %v, want [A A2]", got)
+	}
+}
+
 func TestReclaimScopeNote(t *testing.T) {
 	for _, tc := range []struct {
 		scope reclaimScope

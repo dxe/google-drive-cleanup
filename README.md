@@ -264,7 +264,10 @@ drive-cleanup reclaim-folders alice@example.com --folder 1AbCdEfGh...
 The email is matched against `owner_email` (case-insensitively) or `owner_id`.
 Unscoped, every folder they own under the crawl root is replaced (the crawl root
 itself never is, even if they own it). `--subtree` narrows that to one crawled
-folder's subtree, the folder itself included when they own it. `--folder`
+folder's subtree, the folder itself included when they own it; if an earlier run
+already replaced that folder, the run follows the `(new) <name>` shortcut into
+the replacement too, since the emptied folder no longer holds what is left to
+reclaim. `--folder`
 narrows it further, to that one crawled folder and nothing below it; the folder
 must be one the snapshot says they own, and unlike the other two forms an id
 that names no target of theirs is an error rather than an empty run. The two

@@ -1874,6 +1874,30 @@ func foldersOwnedBy(db *sql.DB, scopeDriveID, account string) ([]reclaimTarget, 
 	return out, rows.Err()
 }
 
+// reclaimReplacementOf returns the folder an earlier reclaim-folders run left in
+// place of driveID, found through the "(new) <name>" shortcut that run created
+// inside it. ok is false when the folder holds no such shortcut — it was never
+// reclaimed, or the run that reclaimed it never got as far as recording the
+// shortcut.
+func reclaimReplacementOf(db *sql.DB, driveID string) (string, bool, error) {
+	var target string
+	err := db.QueryRow(`
+		SELECT s.shortcut_target_id
+		FROM nodes s
+		JOIN nodes p ON s.parent_id = p.id
+		JOIN nodes t ON t.drive_id = s.shortcut_target_id
+		WHERE p.drive_id = ? AND s.type = ? AND s.name LIKE ? AND t.type = ?
+		ORDER BY s.id
+		LIMIT 1`, driveID, typeShortcut, newFolderPrefix+"%", typeFolder).Scan(&target)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return target, true, nil
+}
+
 // folderOwnedByAccount returns the single folder driveID as a reclaim target —
 // what --folder scopes a run to, with no descendants. owned reports whether the
 // snapshot says account owns it, matched the same way foldersOwnedBy matches:
