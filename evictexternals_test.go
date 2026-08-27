@@ -184,7 +184,7 @@ func TestPlanEviction(t *testing.T) {
 	db := testDB(t)
 	nodes := buildEvictTree(t, db)
 
-	plan, err := planEviction(nodes, evictMe, evictDomains, "Team")
+	plan, err := planEviction(nodes, evictMe, evictDomains, "Team", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +214,7 @@ func TestPlanEvictionNothingToDo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan, err := planEviction(nodes, evictMe, evictDomains, "Owned")
+	plan, err := planEviction(nodes, evictMe, evictDomains, "Owned", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +233,7 @@ func TestPlanEvictionRefusesDeleteMarked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = planEviction(nodes, evictMe, evictDomains, "Team")
+	_, err = planEviction(nodes, evictMe, evictDomains, "Team", false)
 	if err == nil {
 		t.Fatal("a delete-marked item did not stop the run")
 	}
@@ -255,12 +255,69 @@ func TestPlanEvictionRefusesFolderWithContent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = planEviction(nodes, evictMe, evictDomains, "Team")
+	plan, err := planEviction(nodes, evictMe, evictDomains, "Team", false)
 	if err == nil {
 		t.Fatal("an externally-owned folder still holding content did not stop the run")
 	}
-	// The message has to name both the fix and whom to run it for.
-	assertContainsAll(t, err.Error(), "reclaim-folders", "ext@other.com", "(old) Plans")
+	// The message has to name both ways out and whom to run reclaim-folders for.
+	assertContainsAll(t, err.Error(), "reclaim-folders", "ext@other.com", "--allow-unowned-folders")
+	// The half-built plan behind the refusal is not used, but the offending
+	// folders are still reported, with where they are and how much they hold.
+	if len(plan.stuffed) != 1 || plan.stuffed[0].node.driveID != "Plans-old" {
+		t.Fatalf("folders still holding content = %+v, want just (old) Plans", plan.stuffed)
+	}
+	// "(new) Plans" and the file somebody put back: both of them count.
+	if got := plan.stuffed[0]; got.path != "(old) Plans" || got.items != 2 {
+		t.Errorf("reported folder = %+v, want path %q holding 2 items", got, "(old) Plans")
+	}
+}
+
+// TestPlanEvictionAllowUnownedFolders covers --allow-unowned-folders: the folder
+// that still holds content is evicted like any other leaf, and everything below
+// it travels with it instead of being evicted in its own right.
+func TestPlanEvictionAllowUnownedFolders(t *testing.T) {
+	db := testDB(t)
+	buildEvictTree(t, db)
+	var plansRow int64
+	if err := db.QueryRow(`SELECT id FROM nodes WHERE drive_id = 'Plans-old'`).Scan(&plansRow); err != nil {
+		t.Fatal(err)
+	}
+	// A file of ours, an unowned file, and a whole unowned subfolder with an
+	// unowned file of its own — none of which may be evicted separately.
+	mustUpsert(t, db, node{driveID: "stuck", name: "stuck.pdf", typ: typeBinary, mimeType: "application/pdf",
+		ownerEmail: nullString("me@example.com"), parentID: sql.NullInt64{Int64: plansRow, Valid: true}}, true)
+	mustUpsert(t, db, node{driveID: "theirs", name: "theirs.pdf", typ: typeBinary, mimeType: "application/pdf",
+		ownerEmail: nullString("ext@other.com"), parentID: sql.NullInt64{Int64: plansRow, Valid: true}}, true)
+	subRow, _, _, _ := mustUpsert(t, db, node{driveID: "Deep", name: "Deep", typ: typeFolder,
+		mimeType: folderMimeType, ownerEmail: nullString("ext@other.com"),
+		parentID: sql.NullInt64{Int64: plansRow, Valid: true}}, true)
+	mustUpsert(t, db, node{driveID: "deepfile", name: "deep.pdf", typ: typeBinary, mimeType: "application/pdf",
+		ownerEmail: nullString("ext@other.com"), parentID: sql.NullInt64{Int64: subRow, Valid: true}}, true)
+
+	nodes, err := subtreeNodes(db, "Team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := planEviction(nodes, evictMe, evictDomains, "Team", true)
+	if err != nil {
+		t.Fatalf("--allow-unowned-folders did not clear the refusal: %v", err)
+	}
+	// (old) Plans leaves whole; "Deep" is inside it, so it is not evicted on its
+	// own, and neither is anything below either of them.
+	if !sameIDs(plan.folders, "Plans-old", "Empty") {
+		t.Errorf("folders to evict = %v, want (old) Plans and Empty", driveIDsOf(plan.folders))
+	}
+	if !sameIDs(plan.files, "notes", "snap") {
+		t.Errorf("files to evict = %v, want notes and snap only", driveIDsOf(plan.files))
+	}
+	if len(plan.stuffed) != 1 || !plan.carriedDriveIDs()["Plans-old"] {
+		t.Errorf("folders leaving with their contents = %+v, want (old) Plans", plan.stuffed)
+	}
+	// The wording of what is about to happen has to stop claiming these folders
+	// are empty.
+	if plan.folderNoun() == "emptied folder(s)" {
+		t.Error("folders leaving with their contents are still described as emptied")
+	}
 }
 
 func TestPlanEvictionRefusesUnownedSubtreeRoot(t *testing.T) {
@@ -272,7 +329,7 @@ func TestPlanEvictionRefusesUnownedSubtreeRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = planEviction(nodes, evictMe, evictDomains, "Theirs")
+	_, err = planEviction(nodes, evictMe, evictDomains, "Theirs", false)
 	if err == nil {
 		t.Fatal("preparing a folder somebody else owns did not fail")
 	}

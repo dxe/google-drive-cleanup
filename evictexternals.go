@@ -37,7 +37,9 @@ package main
 //     first. Moving such a folder out would drag its contents — quite possibly
 //     owned ones — along with it. After reclaim-folders each of their folders is
 //     empty except for the "(new) <name>" shortcut pointing at the replacement,
-//     and a folder like that carries nothing but itself.
+//     and a folder like that carries nothing but itself. Every such folder is
+//     listed, and --allow-unowned-folders overrides the refusal: the folders
+//     then move out exactly like empty ones, contents and all.
 //
 // The externals tree mirrors the crawl root's folder structure, so an evicted
 // file keeps its original location and name, and each replica folder gets the
@@ -92,10 +94,17 @@ The run refuses to start, changing nothing, if either of these is outstanding:
     those unwanted (and possibly unowned) items are out of the way instead of
     being evicted as if they were worth keeping;
   * an externally-owned folder in the subtree still holds content — run
-    reclaim-folders <owner> first. Moving such a folder out would take its
-    contents with it. A folder that is empty, or that holds nothing but a
-    single shortcut (the "(new) <name>" link reclaim-folders leaves pointing at
-    the replacement), carries nothing but itself and is fine.
+    reclaim-folders <owner> first, or pass --allow-unowned-folders. Moving such
+    a folder out would take its contents with it. A folder that is empty, or
+    that holds nothing but a single shortcut (the "(new) <name>" link
+    reclaim-folders leaves pointing at the replacement), carries nothing but
+    itself and is fine.
+
+Every externally-owned folder still holding content is listed before either of
+those happens, so it is clear what is at stake. With --allow-unowned-folders
+those folders are treated as leaf folders like any other: each moves into the
+externals tree as it stands, and everything inside it — owned material included
+— travels along and is not evicted in its own right.
 
 What then happens, for each item:
 
@@ -104,9 +113,10 @@ What then happens, for each item:
      it came from, so the file is still reachable from where it used to be.
   2. Externally-owned leaf folders move into their parent's replica, once a
      live check confirms they are still empty (or still hold just the one
-     shortcut). No shortcut is created for them: reclaim-folders already left
-     a "(new) <name>" link inside them pointing at the folder that took over,
-     and that link travels with the folder.
+     shortcut) — a folder cleared by --allow-unowned-folders skips that check,
+     since holding content is the point. No shortcut is created for them:
+     reclaim-folders already left a "(new) <name>" link inside them pointing at
+     the folder that took over, and that link travels with the folder.
 
 The externals tree replicates the crawl root's folder structure, under the
 originals' own names, so an evicted file keeps its original location and name.
@@ -138,12 +148,14 @@ read-only access, the tool re-runs consent automatically to obtain it.`,
 		dryRun, _ := cmd.Flags().GetBool("dry-run")
 		maxErrors, _ := cmd.Flags().GetInt("max-errors")
 		concurrency, _ := cmd.Flags().GetInt("concurrency")
-		return runEvictExternals(dbPath, cfgPath, args[0], dryRun, maxErrors, concurrency)
+		allowUnowned, _ := cmd.Flags().GetBool("allow-unowned-folders")
+		return runEvictExternals(dbPath, cfgPath, args[0], dryRun, allowUnowned, maxErrors, concurrency)
 	},
 }
 
 func init() {
 	evictExternalsCmd.Flags().Bool("dry-run", false, "report what would be evicted without changing anything (read-only scope)")
+	evictExternalsCmd.Flags().Bool("allow-unowned-folders", false, "evict externally-owned folders that still hold content, taking their contents with them, instead of refusing and pointing at reclaim-folders")
 	evictExternalsCmd.Flags().Int("max-errors", 5, "abort once more than this many items fail")
 	evictExternalsCmd.Flags().Int("concurrency", defaultMoveConcurrency, "how many item moves to run in parallel (all still share the global rate limiter)")
 }
@@ -225,18 +237,49 @@ func isLeafFolder(children []evictNode) bool {
 type evictPlan struct {
 	files   []evictNode // externally-owned files to move, each leaving a shortcut behind
 	folders []evictNode // externally-owned leaf folders to move as they stand
+	// stuffed is every externally-owned folder in the subtree that still holds
+	// content. Without --allow-unowned-folders these are the refusal; with it
+	// they are in folders too, and this is what gets reported before they go.
+	stuffed []stuffedFolder
+}
+
+// stuffedFolder is an externally-owned folder that the snapshot says still holds
+// content, so moving it out cannot help taking that content along.
+type stuffedFolder struct {
+	node  evictNode
+	path  string // path below the subtree root, so it can be found by eye
+	items int    // how much the snapshot says it holds
+}
+
+// carriedDriveIDs is the set of folders that are leaving with their contents, so
+// the live leaf check can be waived for exactly those.
+func (p evictPlan) carriedDriveIDs() map[string]bool {
+	out := make(map[string]bool, len(p.stuffed))
+	for _, s := range p.stuffed {
+		out[s.node.driveID] = true
+	}
+	return out
 }
 
 // planEviction works out what to evict from the subtree, or returns the refusal
 // that has to be dealt with first. nodes is the whole subtree, shallowest
-// first, with its root at index 0.
-func planEviction(nodes []evictNode, me *drive.User, internalDomains []string, subtreePath string) (evictPlan, error) {
+// first, with its root at index 0. allowUnownedFolders waives the refusal over
+// externally-owned folders that still hold content: they are then evicted like
+// empty ones, taking what is inside them along.
+//
+// The folders that still hold content are recorded in the plan either way, so
+// the caller can list them whether it is about to refuse or about to move them.
+func planEviction(nodes []evictNode, me *drive.User, internalDomains []string, subtreePath string, allowUnownedFolders bool) (evictPlan, error) {
 	var plan evictPlan
 	if len(nodes) == 0 {
 		return plan, fmt.Errorf("the subtree is empty in the database; re-run crawl")
 	}
 	root := nodes[0]
 	children := make(map[int64][]evictNode, len(nodes))
+	byRow := make(map[int64]evictNode, len(nodes))
+	for _, n := range nodes {
+		byRow[n.rowID] = n
+	}
 	for _, n := range nodes[1:] {
 		if n.parentRowID.Valid {
 			children[n.parentRowID.Int64] = append(children[n.parentRowID.Int64], n)
@@ -270,30 +313,47 @@ func planEviction(nodes []evictNode, me *drive.User, internalDomains []string, s
 	}
 
 	// Refusal 2: externally-owned folders that still hold content. Moving one out
-	// would take everything inside it — owned material included — along with it.
-	var stuffed []evictNode
+	// would take everything inside it — owned material included — along with it,
+	// unless the caller has said that is what it wants.
+	//
+	// A folder that leaves does so as it stands, so everything below it travels
+	// along rather than being evicted in its own right: leaving therefore covers
+	// the descendants of a departing folder too, not just its children. Walking
+	// shallowest-first is what makes that a single pass.
+	leaving := make(map[int64]bool)
 	for _, n := range nodes {
-		if n.typ != typeFolder || n.rowID == root.rowID || !externallyOwned(n, me, internalDomains) {
+		if n.rowID == root.rowID {
+			continue
+		}
+		if n.parentRowID.Valid && leaving[n.parentRowID.Int64] {
+			if n.typ == typeFolder {
+				leaving[n.rowID] = true
+			}
+			continue
+		}
+		if n.typ != typeFolder || !externallyOwned(n, me, internalDomains) {
 			continue
 		}
 		if isLeafFolder(children[n.rowID]) {
 			plan.folders = append(plan.folders, n)
-		} else {
-			stuffed = append(stuffed, n)
+			leaving[n.rowID] = true
+			continue
+		}
+		plan.stuffed = append(plan.stuffed, stuffedFolder{
+			node:  n,
+			path:  pathBelowRoot(n, byRow, root.rowID),
+			items: len(children[n.rowID]),
+		})
+		if allowUnownedFolders {
+			plan.folders = append(plan.folders, n)
+			leaving[n.rowID] = true
 		}
 	}
-	if len(stuffed) > 0 {
-		return plan, fmt.Errorf("%d externally-owned folder(s) in %s still hold content, so evicting them would take their contents along; run `drive-cleanup reclaim-folders` for %s first (see --folder %s to scope it), then re-run:\n%s",
-			len(stuffed), subtreeLabel(subtreePath, root), ownerList(stuffed), root.driveID, itemExamples(stuffed))
+	if len(plan.stuffed) > 0 && !allowUnownedFolders {
+		return plan, fmt.Errorf("%d externally-owned folder(s) in %s still hold content (each one listed above), so evicting them would take their contents along; either run `drive-cleanup reclaim-folders` for %s first (see --folder %s to scope it) so that nothing but the folders themselves is left to move, or re-run with --allow-unowned-folders to evict them as they stand, contents and all",
+			len(plan.stuffed), subtreeLabel(subtreePath, root), ownerList(plan.stuffed), root.driveID)
 	}
 
-	// The leaf folders leave as they stand, so anything inside one of them (at
-	// most that single shortcut) travels with it rather than being evicted in its
-	// own right.
-	leaving := make(map[int64]bool, len(plan.folders))
-	for _, f := range plan.folders {
-		leaving[f.rowID] = true
-	}
 	for _, n := range nodes {
 		if n.typ == typeFolder || n.rowID == root.rowID || !externallyOwned(n, me, internalDomains) {
 			continue
@@ -304,6 +364,44 @@ func planEviction(nodes []evictNode, me *drive.User, internalDomains []string, s
 		plan.files = append(plan.files, n)
 	}
 	return plan, nil
+}
+
+// pathBelowRoot names a node by its path below the subtree root, root name
+// excluded, so a folder buried a few levels down can be recognised without
+// looking its Drive ID up.
+func pathBelowRoot(n evictNode, byRow map[int64]evictNode, rootRow int64) string {
+	parts := []string{n.name}
+	for cur := n; cur.rowID != rootRow && cur.parentRowID.Valid; {
+		parent, ok := byRow[cur.parentRowID.Int64]
+		if !ok || parent.rowID == rootRow {
+			break
+		}
+		parts = append(parts, parent.name)
+		cur = parent
+	}
+	for i, j := 0, len(parts)-1; i < j; i, j = i+1, j-1 {
+		parts[i], parts[j] = parts[j], parts[i]
+	}
+	return strings.Join(parts, "/")
+}
+
+// reportStuffedFolders lists every externally-owned folder that still holds
+// content — the whole list, not a sample — so what is at stake is visible
+// before the run either refuses or takes the folders wholesale. allowed says
+// which of the two is about to happen.
+func reportStuffedFolders(stuffed []stuffedFolder, allowed bool) {
+	if len(stuffed) == 0 {
+		return
+	}
+	if allowed {
+		fmt.Fprintf(os.Stderr, "%d externally-owned folder(s) still hold content; --allow-unowned-folders was passed, so each moves into the externals tree as it stands and everything inside it travels along:\n", len(stuffed))
+	} else {
+		fmt.Fprintf(os.Stderr, "%d externally-owned folder(s) still hold content:\n", len(stuffed))
+	}
+	for _, s := range stuffed {
+		fmt.Fprintf(os.Stderr, "  %s (%s)  [owner: %s, holds %d item(s)]\n",
+			s.path, s.node.driveID, ownerLabelOf(s.node), s.items)
+	}
 }
 
 // subtreeLabel names the subtree in a message: its path under the crawl root
@@ -329,13 +427,13 @@ func itemExamples(nodes []evictNode) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// ownerList renders the distinct owners of the given nodes, in first-seen
+// ownerList renders the distinct owners of the given folders, in first-seen
 // order, for a message telling the user whom to run reclaim-folders for.
-func ownerList(nodes []evictNode) string {
-	seen := make(map[string]bool, len(nodes))
+func ownerList(folders []stuffedFolder) string {
+	seen := make(map[string]bool, len(folders))
 	var owners []string
-	for _, n := range nodes {
-		label := ownerLabelOf(n)
+	for _, f := range folders {
+		label := ownerLabelOf(f.node)
 		if !seen[label] {
 			seen[label] = true
 			owners = append(owners, label)
@@ -344,7 +442,7 @@ func ownerList(nodes []evictNode) string {
 	return strings.Join(owners, ", ")
 }
 
-func runEvictExternals(dbPath, cfgPath, folderID string, dryRun bool, maxErrors, concurrency int) error {
+func runEvictExternals(dbPath, cfgPath, folderID string, dryRun, allowUnownedFolders bool, maxErrors, concurrency int) error {
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
 		return err
@@ -443,7 +541,10 @@ func runEvictExternals(dbPath, cfgPath, folderID string, dryRun bool, maxErrors,
 	}
 	me := about.User
 
-	plan, err := planEviction(nodes, me, cfg.InternalDomains, subtreePath)
+	plan, err := planEviction(nodes, me, cfg.InternalDomains, subtreePath, allowUnownedFolders)
+	// The folders that still hold content are worth seeing in full whether the
+	// run is about to refuse over them or about to take them wholesale.
+	reportStuffedFolders(plan.stuffed, allowUnownedFolders)
 	if err != nil {
 		return err
 	}
@@ -479,11 +580,11 @@ func runEvictExternals(dbPath, cfgPath, folderID string, dryRun bool, maxErrors,
 	}
 
 	if dryRun {
-		fmt.Fprintf(os.Stderr, "DRY RUN: no changes will be made. Would evict %d file(s) and %d emptied folder(s) owned outside the org out of %s into %q, leaving %d shortcut(s) behind.\n",
-			len(plan.files), len(plan.folders), subtreeLabel(subtreePath, nodes[0]), externalsFolder.Name, plan.shortcutCount())
+		fmt.Fprintf(os.Stderr, "DRY RUN: no changes will be made. Would evict %d file(s) and %d %s owned outside the org out of %s into %q, leaving %d shortcut(s) behind.\n",
+			len(plan.files), len(plan.folders), plan.folderNoun(), subtreeLabel(subtreePath, nodes[0]), externalsFolder.Name, plan.shortcutCount())
 	} else {
-		fmt.Fprintf(os.Stderr, "About to evict %d file(s) and %d emptied folder(s) owned outside the org out of %s into %q (%s), replicating their folders (with their sharing) and leaving %d shortcut(s) behind.\n",
-			len(plan.files), len(plan.folders), subtreeLabel(subtreePath, nodes[0]), externalsFolder.Name, externalsFolder.Id, plan.shortcutCount())
+		fmt.Fprintf(os.Stderr, "About to evict %d file(s) and %d %s owned outside the org out of %s into %q (%s), replicating their folders (with their sharing) and leaving %d shortcut(s) behind.\n",
+			len(plan.files), len(plan.folders), plan.folderNoun(), subtreeLabel(subtreePath, nodes[0]), externalsFolder.Name, externalsFolder.Id, plan.shortcutCount())
 		if !promptYesNo("Continue? [y/N] ") {
 			fmt.Fprintln(os.Stderr, "Aborted.")
 			return nil
@@ -505,6 +606,7 @@ func runEvictExternals(dbPath, cfgPath, folderID string, dryRun bool, maxErrors,
 		externalsRootName: externalsFolder.Name,
 		root:              replicaRef{driveID: externalsFolder.Id},
 		verified:          make(map[string]replicaRef),
+		carried:           plan.carriedDriveIDs(),
 	}
 
 	// Resolve every replica folder up front, sequentially: the concurrent move
@@ -548,9 +650,10 @@ func runEvictExternals(dbPath, cfgPath, folderID string, dryRun bool, maxErrors,
 		return stats.err
 	}
 
-	// Phase B: the emptied folders, sequentially — each one is checked live
-	// first, and a folder that has gained content since the crawl is left alone
-	// rather than dragging it out of the subtree.
+	// Phase B: the folders, sequentially — each one is checked live first, and a
+	// folder that has gained content since the crawl is left alone rather than
+	// dragging it out of the subtree. The folders --allow-unowned-folders cleared
+	// are exempt from that check: content is expected there.
 	for _, n := range plan.folders {
 		if moveCtx.Err() != nil {
 			break
@@ -574,6 +677,16 @@ func runEvictExternals(dbPath, cfgPath, folderID string, dryRun bool, maxErrors,
 	fmt.Fprintf(os.Stderr, "%s now holds only items the org owns, as far as the snapshot knows. Re-crawl and re-run to confirm before moving it into a shared drive.\n",
 		subtreeLabel(subtreePath, nodes[0]))
 	return nil
+}
+
+// folderNoun describes the folders the plan moves. They are normally emptied
+// leaf folders, but --allow-unowned-folders lets folders leave with their
+// contents, and a message that called those "emptied" would be a lie.
+func (p evictPlan) folderNoun() string {
+	if len(p.stuffed) > 0 {
+		return "folder(s) (contents included)"
+	}
+	return "emptied folder(s)"
 }
 
 // shortcutCount is how many shortcuts the plan would leave behind: one per
@@ -630,6 +743,11 @@ type evictor struct {
 	// for this run. Written only by resolve, which runs sequentially before the
 	// concurrent phase, and read-only thereafter.
 	verified map[string]replicaRef
+
+	// carried holds the Drive IDs of the folders --allow-unowned-folders cleared
+	// to leave with their contents, which is what waives the live leaf check for
+	// them — and only for them.
+	carried map[string]bool
 }
 
 // resolve returns the replica folder that the contents of the original folder
@@ -824,7 +942,9 @@ func (e *evictor) evictFile(ctx context.Context, n evictNode) {
 // evictFolder moves one externally-owned leaf folder into its parent's replica,
 // as it stands. A live check comes first: the snapshot said the folder was empty
 // (or held nothing but a shortcut), and if that has changed since the crawl the
-// folder is left alone rather than carrying content out of the subtree.
+// folder is left alone rather than carrying content out of the subtree. A folder
+// --allow-unowned-folders cleared skips the check — it was known to hold content
+// and was accepted on those terms.
 func (e *evictor) evictFolder(ctx context.Context, n evictNode) {
 	replica, ok := e.verified[n.parentDriveID.String]
 	if !ok {
@@ -843,10 +963,14 @@ func (e *evictor) evictFolder(ctx context.Context, n evictNode) {
 		return
 	}
 	if !liveLeaf(children) {
-		log.Printf("SKIP folder %q (%s): it holds %d item(s) on Drive, so evicting it would take them out of the subtree; re-crawl and run reclaim-folders for %s, then re-run",
-			n.name, n.driveID, len(children), ownerLabelOf(n))
-		e.stats.skip()
-		return
+		if !e.carried[n.driveID] {
+			log.Printf("SKIP folder %q (%s): it holds %d item(s) on Drive, so evicting it would take them out of the subtree; re-crawl and run reclaim-folders for %s, or re-run with --allow-unowned-folders",
+				n.name, n.driveID, len(children), ownerLabelOf(n))
+			e.stats.skip()
+			return
+		}
+		log.Printf("NOTE folder %q (%s) holds %d item(s) on Drive; --allow-unowned-folders was passed, so they leave the subtree with it",
+			n.name, n.driveID, len(children))
 	}
 
 	if err := e.rec.moveFile(ctx, e.svc, e.limiter, n.driveID, replica.driveID, n.parentDriveID.String); err != nil {
@@ -972,7 +1096,13 @@ func (e *evictor) preview(ctx context.Context, plan evictPlan) {
 		log.Printf("WOULD move %s %q (%s), owned by %s, into %q and leave a shortcut to it behind",
 			n.typ, n.name, n.driveID, ownerLabelOf(n), destination(n))
 	}
+	carried := plan.carriedDriveIDs()
 	for _, n := range plan.folders {
+		if carried[n.driveID] {
+			log.Printf("WOULD move folder %q (%s), owned by %s, into %q with everything inside it (no shortcut left behind)",
+				n.name, n.driveID, ownerLabelOf(n), destination(n))
+			continue
+		}
 		log.Printf("WOULD move emptied folder %q (%s), owned by %s, into %q (no shortcut: reclaim-folders' own link travels with it)",
 			n.name, n.driveID, ownerLabelOf(n), destination(n))
 	}
