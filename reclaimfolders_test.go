@@ -88,6 +88,54 @@ func TestFoldersOwnedByScoped(t *testing.T) {
 	}
 }
 
+func TestFolderOwnedByAccount(t *testing.T) {
+	db := testDB(t)
+	buildReclaimTree(t, db)
+
+	// What --folder resolves to: the one folder, nothing below it.
+	got, owned, err := folderOwnedByAccount(db, "A", "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !owned || got.driveID != "A" || got.name != "A" || got.rowID == 0 {
+		t.Fatalf("folderOwnedByAccount(A, alice) = %+v, owned %v; want A owned with a row id", got, owned)
+	}
+	// owner_email is matched case-insensitively, as in foldersOwnedBy.
+	if _, owned, err := folderOwnedByAccount(db, "E", "alice@example.com"); err != nil {
+		t.Fatal(err)
+	} else if !owned {
+		t.Error("E (ALICE@EXAMPLE.COM) reported as not owned by alice@example.com")
+	}
+	// Somebody else's folder resolves but is not theirs to reclaim.
+	if got, owned, err := folderOwnedByAccount(db, "C", "alice@example.com"); err != nil {
+		t.Fatal(err)
+	} else if owned || got.name != "C" {
+		t.Errorf("folderOwnedByAccount(C, alice) = %+v, owned %v; want C not owned", got, owned)
+	}
+	// A file, or an id nobody crawled, is no folder at all.
+	if _, _, err := folderOwnedByAccount(db, "a1", "alice@example.com"); err != sql.ErrNoRows {
+		t.Errorf("folderOwnedByAccount on a file = %v, want sql.ErrNoRows", err)
+	}
+	if _, _, err := folderOwnedByAccount(db, "nope", "alice@example.com"); err != sql.ErrNoRows {
+		t.Errorf("folderOwnedByAccount on an unknown id = %v, want sql.ErrNoRows", err)
+	}
+}
+
+func TestReclaimScopeNote(t *testing.T) {
+	for _, tc := range []struct {
+		scope reclaimScope
+		want  string
+	}{
+		{reclaimScope{driveID: "root", recursive: true}, ""},
+		{reclaimScope{driveID: "A", path: "A", recursive: true}, ` under "A"`},
+		{reclaimScope{driveID: "A", path: "A"}, ` at "A"`},
+	} {
+		if got := tc.scope.note(); got != tc.want {
+			t.Errorf("scope %+v note = %q, want %q", tc.scope, got, tc.want)
+		}
+	}
+}
+
 func TestReparentNode(t *testing.T) {
 	db := testDB(t)
 	rootID, aID := buildReclaimTree(t, db)

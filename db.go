@@ -1874,6 +1874,24 @@ func foldersOwnedBy(db *sql.DB, scopeDriveID, account string) ([]reclaimTarget, 
 	return out, rows.Err()
 }
 
+// folderOwnedByAccount returns the single folder driveID as a reclaim target —
+// what --folder scopes a run to, with no descendants. owned reports whether the
+// snapshot says account owns it, matched the same way foldersOwnedBy matches:
+// owner_email case-insensitively, or owner_id exactly. sql.ErrNoRows means
+// there is no crawled folder with that id.
+func folderOwnedByAccount(db *sql.DB, driveID, account string) (t reclaimTarget, owned bool, err error) {
+	t.driveID = driveID
+	var ownerEmail, ownerID sql.NullString
+	err = db.QueryRow(`SELECT id, name, owner_email, owner_id FROM nodes WHERE drive_id = ? AND type = ?`,
+		driveID, typeFolder).Scan(&t.rowID, &t.name, &ownerEmail, &ownerID)
+	if err != nil {
+		return t, false, err
+	}
+	owned = (ownerEmail.Valid && strings.EqualFold(ownerEmail.String, account)) ||
+		(ownerID.Valid && ownerID.String == account)
+	return t, owned, nil
+}
+
 // parentRowOf returns the row id of a node's recorded parent. ok is false when
 // the node has no parent (a crawl root).
 func parentRowOf(db *sql.DB, driveID string) (rowID int64, ok bool, err error) {

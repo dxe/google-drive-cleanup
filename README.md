@@ -210,7 +210,8 @@ drive-cleanup restore 1AbCdEfGh...
 # Replace every folder owned by someone else with an identically-named folder
 # owned by you, moving the contents and the sharing across
 drive-cleanup reclaim-folders alice@example.com
-drive-cleanup reclaim-folders alice@example.com --folder 1AbCdEfGh...  # only that subtree
+drive-cleanup reclaim-folders alice@example.com --subtree 1AbCdEfGh... # only that subtree
+drive-cleanup reclaim-folders alice@example.com --folder 1AbCdEfGh...  # only that one folder
 
 # Clear a folder of externally-owned items so it can be moved to a shared
 # drive: they go to the externals folder, each leaving a shortcut behind
@@ -256,14 +257,18 @@ identically-named folder that you own, and moves the contents across.
 ```bash
 drive-cleanup reclaim-folders alice@example.com --dry-run
 drive-cleanup reclaim-folders alice@example.com
+drive-cleanup reclaim-folders alice@example.com --subtree 1AbCdEfGh...
 drive-cleanup reclaim-folders alice@example.com --folder 1AbCdEfGh...
 ```
 
 The email is matched against `owner_email` (case-insensitively) or `owner_id`.
-Without `--folder` every folder they own under the crawl root is replaced (the
-crawl root itself never is, even if they own it); with it, the run is scoped to
-that crawled folder's subtree and the folder itself is included when they own
-it. For each of their folders, shallowest first:
+Unscoped, every folder they own under the crawl root is replaced (the crawl root
+itself never is, even if they own it). `--subtree` narrows that to one crawled
+folder's subtree, the folder itself included when they own it. `--folder`
+narrows it further, to that one crawled folder and nothing below it; the folder
+must be one the snapshot says they own, and unlike the other two forms an id
+that names no target of theirs is an error rather than an empty run. The two
+flags cannot be combined. For each of their folders, shallowest first:
 
 1. it is renamed `(old) <name>` — skipped if it already carries the prefix, so
    a re-run is a no-op rather than `(old) (old) <name>`;

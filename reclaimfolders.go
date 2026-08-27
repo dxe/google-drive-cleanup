@@ -73,7 +73,8 @@ owned by the account running the tool, moving the contents across.
 
 Drive has no way to take a folder's ownership away from its owner, so each of
 their folders is superseded rather than transferred. For every folder they own,
-in the crawled tree (or under --folder, which is itself included):
+in the crawled tree (or, with --subtree, in that subtree, which includes the
+subtree folder itself; or, with --folder, that one folder alone):
 
   1. Their folder is renamed "(old) <name>" (skipped if it already is).
   2. A new folder "<name>", owned by you, is created under the same parent —
@@ -120,16 +121,19 @@ read-only access, the tool re-runs consent automatically to obtain it.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dbPath, _ := cmd.Flags().GetString("db")
 		cfgPath, _ := cmd.Flags().GetString("config")
-		subfolder, _ := cmd.Flags().GetString("folder")
+		subtree, _ := cmd.Flags().GetString("subtree")
+		folder, _ := cmd.Flags().GetString("folder")
 		dryRun, _ := cmd.Flags().GetBool("dry-run")
 		maxErrors, _ := cmd.Flags().GetInt("max-errors")
 		concurrency, _ := cmd.Flags().GetInt("concurrency")
-		return runReclaimFolders(dbPath, cfgPath, args[0], subfolder, dryRun, maxErrors, concurrency)
+		return runReclaimFolders(dbPath, cfgPath, args[0], subtree, folder, dryRun, maxErrors, concurrency)
 	},
 }
 
 func init() {
-	reclaimFoldersCmd.Flags().String("folder", "", "Google Drive folder ID (crawled, under the crawl root) to scope the run to; the folder itself is included. Defaults to the whole crawl root")
+	reclaimFoldersCmd.Flags().String("subtree", "", "Google Drive folder ID (crawled, under the crawl root) to scope the run to; the folder itself and everything below it is included. Defaults to the whole crawl root")
+	reclaimFoldersCmd.Flags().String("folder", "", "Google Drive folder ID (crawled, under the crawl root) to replace on its own; nothing below it is touched")
+	reclaimFoldersCmd.MarkFlagsMutuallyExclusive("subtree", "folder")
 	reclaimFoldersCmd.Flags().Bool("dry-run", false, "report what would be replaced without changing anything (read-only scope)")
 	reclaimFoldersCmd.Flags().Int("max-errors", 5, "abort once more than this many items fail")
 	reclaimFoldersCmd.Flags().Int("concurrency", defaultMoveConcurrency, "how many item moves to run in parallel (all still share the global rate limiter)")
@@ -171,7 +175,11 @@ type reclaimResult struct {
 	grants   int // grants copied from their folder onto ours
 }
 
-func runReclaimFolders(dbPath, cfgPath, email, subfolder string, dryRun bool, maxErrors, concurrency int) error {
+func runReclaimFolders(dbPath, cfgPath, email, subtree, folder string, dryRun bool, maxErrors, concurrency int) error {
+	if subtree != "" && folder != "" {
+		return fmt.Errorf("--subtree and --folder cannot be combined: --subtree scopes the run to a whole subtree, --folder replaces that one folder only")
+	}
+
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
 		return err
@@ -198,53 +206,57 @@ func runReclaimFolders(dbPath, cfgPath, email, subfolder string, dryRun bool, ma
 			cfg.Crawl.Root.ID, cfg.Crawl.Root.Name, crawlRoot)
 	}
 
-	// An optional subfolder scopes the run to one crawled folder of the tree.
-	// Requiring it to be under the crawl root also keeps the archive tree (which
-	// must live outside) out of reach.
-	scope, scopePath := crawlRoot, ""
-	if subfolder != "" {
-		typ, err := nodeTypeByDriveID(db, subfolder)
-		if err == sql.ErrNoRows {
-			return fmt.Errorf("folder %s not found in the database; it must be a folder crawled under the crawl root", subfolder)
-		}
+	// Both --subtree and --folder name one crawled folder: --subtree opens the
+	// run onto everything below it, --folder narrows it to that folder alone.
+	// Requiring either to be under the crawl root also keeps the archive tree
+	// (which must live outside) out of reach.
+	scope := reclaimScope{driveID: crawlRoot, recursive: true}
+	if named := subtree + folder; named != "" {
+		path, err := scopeFolderPath(db, crawlRoot, named)
 		if err != nil {
 			return err
 		}
-		if typ != typeFolder {
-			return fmt.Errorf("%s is a %s, not a folder", subfolder, typ)
-		}
-		if inside, err := nodeInSubtree(db, crawlRoot, subfolder); err != nil {
-			return err
-		} else if !inside {
-			return fmt.Errorf("folder %s is not under the crawl root; reclaim-folders only acts on the crawled tree", subfolder)
-		}
-		scope = subfolder
-		if scopePath, err = subtreeRelativePath(db, subfolder); err != nil {
-			return err
-		}
+		scope = reclaimScope{driveID: named, path: path, recursive: subtree != ""}
 	}
 
-	if pending, err := countPendingFolders(db, scope); err != nil {
-		return err
-	} else if pending > 0 {
-		log.Printf("WARN the crawl is incomplete (%d folder(s) not fully listed); folders it never reached will not be reclaimed. Re-run crawl for a complete pass", pending)
-	}
-
-	targets, err := foldersOwnedBy(db, scope, email)
-	if err != nil {
-		return err
-	}
-	// The crawl root is the boundary of the snapshot and is never renamed or
-	// replaced, even when the account being reclaimed owns it.
-	kept := targets[:0]
-	for _, t := range targets {
-		if t.driveID != crawlRoot {
-			kept = append(kept, t)
+	var targets []reclaimTarget
+	if scope.recursive {
+		if pending, err := countPendingFolders(db, scope.driveID); err != nil {
+			return err
+		} else if pending > 0 {
+			log.Printf("WARN the crawl is incomplete (%d folder(s) not fully listed); folders it never reached will not be reclaimed. Re-run crawl for a complete pass", pending)
 		}
+
+		targets, err = foldersOwnedBy(db, scope.driveID, email)
+		if err != nil {
+			return err
+		}
+		// The crawl root is the boundary of the snapshot and is never renamed or
+		// replaced, even when the account being reclaimed owns it.
+		kept := targets[:0]
+		for _, t := range targets {
+			if t.driveID != crawlRoot {
+				kept = append(kept, t)
+			}
+		}
+		targets = kept
+	} else {
+		// --folder names the one folder to replace, so anything that would make it
+		// no target at all is an error rather than a quiet empty run.
+		if scope.driveID == crawlRoot {
+			return fmt.Errorf("folder %s is the crawl root; reclaim-folders never replaces the root of the crawled tree", scope.driveID)
+		}
+		t, owned, err := folderOwnedByAccount(db, scope.driveID, email)
+		if err != nil {
+			return err
+		}
+		if !owned {
+			return fmt.Errorf("folder %s (%q) is not owned by %s according to the snapshot; re-run `drive-cleanup crawl` if its ownership changed since the last crawl", scope.driveID, t.name, email)
+		}
+		targets = []reclaimTarget{t}
 	}
-	targets = kept
 	if len(targets) == 0 {
-		fmt.Fprintf(os.Stderr, "No folders owned by %s%s; nothing to do.\n", email, scopeNoteFor(scopePath))
+		fmt.Fprintf(os.Stderr, "No folders owned by %s%s; nothing to do.\n", email, scope.note())
 		return nil
 	}
 
@@ -272,10 +284,10 @@ func runReclaimFolders(dbPath, cfgPath, email, subfolder string, dryRun bool, ma
 
 	if dryRun {
 		fmt.Fprintf(os.Stderr, "DRY RUN: no changes will be made. Would replace %d folder(s) owned by %s%s with folders owned by %s.\n",
-			len(targets), email, scopeNoteFor(scopePath), me.EmailAddress)
+			len(targets), email, scope.note(), me.EmailAddress)
 	} else {
 		fmt.Fprintf(os.Stderr, "About to replace %d folder(s) owned by %s%s with folders owned by %s: each is renamed %q, a folder of the same name is created beside it, and its contents are moved across.\n",
-			len(targets), email, scopeNoteFor(scopePath), me.EmailAddress, oldFolderPrefix+"<name>")
+			len(targets), email, scope.note(), me.EmailAddress, oldFolderPrefix+"<name>")
 		if !promptYesNo("Continue? [y/N] ") {
 			fmt.Fprintln(os.Stderr, "Aborted.")
 			return nil
@@ -334,13 +346,48 @@ func runReclaimFolders(dbPath, cfgPath, email, subfolder string, dryRun bool, ma
 	return r.stats.err
 }
 
-// scopeNoteFor renders the " under <path>" clause for messages, empty when the
-// run covers the whole crawl root.
-func scopeNoteFor(scopePath string) string {
-	if scopePath == "" {
+// reclaimScope is the part of the tree a run covers: the whole crawl root by
+// default, the subtree named by --subtree, or the single folder named by
+// --folder.
+type reclaimScope struct {
+	driveID   string // the folder the run is scoped to; the crawl root when unscoped
+	path      string // its path relative to the crawl root, empty when unscoped
+	recursive bool   // everything below driveID (--subtree), or driveID alone (--folder)
+}
+
+// note renders the " under <path>" / " at <path>" clause for messages, empty
+// when the run covers the whole crawl root.
+func (s reclaimScope) note() string {
+	switch {
+	case s.path == "":
 		return ""
+	case s.recursive:
+		return fmt.Sprintf(" under %q", s.path)
+	default:
+		return fmt.Sprintf(" at %q", s.path)
 	}
-	return fmt.Sprintf(" under %q", scopePath)
+}
+
+// scopeFolderPath checks that driveID is a folder crawled under crawlRoot — as
+// both --subtree and --folder must be — and returns its path relative to the
+// root, for the scope clause in messages.
+func scopeFolderPath(db *sql.DB, crawlRoot, driveID string) (string, error) {
+	typ, err := nodeTypeByDriveID(db, driveID)
+	if err == sql.ErrNoRows {
+		return "", fmt.Errorf("folder %s not found in the database; it must be a folder crawled under the crawl root", driveID)
+	}
+	if err != nil {
+		return "", err
+	}
+	if typ != typeFolder {
+		return "", fmt.Errorf("%s is a %s, not a folder", driveID, typ)
+	}
+	if inside, err := nodeInSubtree(db, crawlRoot, driveID); err != nil {
+		return "", err
+	} else if !inside {
+		return "", fmt.Errorf("folder %s is not under the crawl root; reclaim-folders only acts on the crawled tree", driveID)
+	}
+	return subtreeRelativePath(db, driveID)
 }
 
 // reclaimer carries everything one run needs: the Drive client and its shared
