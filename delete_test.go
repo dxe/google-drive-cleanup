@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"strings"
 	"testing"
+
+	"google.golang.org/api/drive/v3"
 )
 
 // replicaTree builds the archive side of buildArchiveTree: replicas of A and B
@@ -98,4 +100,40 @@ func mustRowID(t *testing.T, db *sql.DB, driveID string) int64 {
 		t.Fatal(err)
 	}
 	return id
+}
+
+// The owner Drive reports now, not the one the snapshot recorded, decides what
+// happens to an item delete picked up as externally owned — a shortcut
+// reclaim-folders created inside somebody else's folder is ours, and Drive
+// refuses to strip the only parent off an item we own (400 badRequest), so it
+// has to be deleted rather than removed.
+func TestLiveOwnerClassOverridesTheSnapshot(t *testing.T) {
+	me := &drive.User{EmailAddress: "me@example.com", PermissionId: "perm-me"}
+	domains := []string{"example.com"}
+	cases := []struct {
+		name string
+		f    *drive.File
+		want ownerClass
+	}{
+		{"our email", &drive.File{Owners: []*drive.User{{EmailAddress: "ME@example.com"}}}, ownerMine},
+		{"our permission id", &drive.File{Owners: []*drive.User{{PermissionId: "perm-me"}}}, ownerMine},
+		{"colleague in the org", &drive.File{Owners: []*drive.User{{EmailAddress: "colleague@example.com"}}}, ownerInternal},
+		{"genuinely external", &drive.File{Owners: []*drive.User{{EmailAddress: "stranger@other.com"}}}, ownerExternal},
+		{"shared-drive item, no owner", &drive.File{}, ownerExternal},
+	}
+	for _, c := range cases {
+		if got := liveOwnerClass(c.f, me, domains); got != c.want {
+			t.Errorf("liveOwnerClass(%s) = %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
+// An account with no permission id must not match an owner that has none
+// either — every item Drive reports without one would otherwise read as ours.
+func TestLiveOwnerClassIgnoresEmptyPermissionIDs(t *testing.T) {
+	me := &drive.User{EmailAddress: "me@example.com"}
+	f := &drive.File{Owners: []*drive.User{{EmailAddress: "stranger@other.com"}}}
+	if got := liveOwnerClass(f, me, []string{"example.com"}); got != ownerExternal {
+		t.Errorf("liveOwnerClass with empty permission ids = %d, want %d", got, ownerExternal)
+	}
 }

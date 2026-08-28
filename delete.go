@@ -14,6 +14,13 @@ package main
 //     relocates them to their owner's My Drive — and then drops every direct
 //     permission, the running account's own last.
 //
+// The snapshot's owner only decides which bucket an item starts in; before
+// anything irreversible the live owner decides what actually happens to it, in
+// both directions (a "mine" item Drive says is somebody else's, and an
+// "external" one Drive says is ours). Drive will not strip the only parent off
+// an item we own — it answers 400 badRequest — so an item misfiled as external
+// would otherwise fail every run.
+//
 // A folder — an archived one, or one of the "ARCH " replicas mirroring the
 // crawl root's structure, which are pruned afterwards including shells left
 // behind by earlier runs — goes once a live listing shows nothing inside it but
@@ -109,6 +116,25 @@ func classifyOwner(t archiveTarget, me *drive.User, internalDomains []string) ow
 		return ownerMine
 	}
 	if isInternalEmail(t.ownerEmail, internalDomains) {
+		return ownerInternal
+	}
+	return ownerExternal
+}
+
+// liveOwnerClass buckets an item the same way classifyOwner does, but from the
+// owner Drive reports right now rather than the one the snapshot recorded. An
+// item Drive gives no owner for — anything living in a shared drive — comes
+// back external, which is where its only caller already had it: none of the
+// ownership mechanics here apply to such an item, so it keeps the handling the
+// snapshot chose.
+func liveOwnerClass(f *drive.File, me *drive.User, internalDomains []string) ownerClass {
+	if len(f.Owners) == 0 {
+		return ownerExternal
+	}
+	if ownedByAccount(f, me.EmailAddress) || (me.PermissionId != "" && ownedByAccount(f, me.PermissionId)) {
+		return ownerMine
+	}
+	if isInternalEmail(nullString(f.Owners[0].EmailAddress), internalDomains) {
 		return ownerInternal
 	}
 	return ownerExternal
@@ -529,10 +555,39 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 		return outcomeGone
 	}
 
+	// queueInternal hands an item to phase 3's dropoff queue. Reached from the
+	// concurrent phases when Drive's live owner contradicts the snapshot's, so
+	// many workers may hit it at once — hence the mutex; phase 3 reads the
+	// queue only after those pools have drained.
+	var internalMu sync.Mutex
+	queueInternal := func(t archiveTarget) itemOutcome {
+		internalMu.Lock()
+		internalF = append(internalF, t)
+		internalMu.Unlock()
+		// Re-queued, not dealt with: phase 3 decides its row's fate.
+		return outcomeSkipped
+	}
+	// rerouteInternal is where an item the snapshot called externally owned
+	// goes once Drive says an internal account owns it. Phases 1-2 queue it for
+	// phase 3; phase 4 runs after that queue has drained and is sequential, so
+	// it is re-pointed at deleteViaDropoff before then.
+	rerouteInternal := queueInternal
+
 	// handleExternal skips (and flags) an externally-owned item, or with
 	// --remove-unowned removes it from its folder — Drive relocates it to its
 	// owner's My Drive, sharing intact — and then drops every direct
 	// permission it can, the running account's own last.
+	//
+	// The recorded owner only decides which items get here; what actually
+	// happens to one is decided by the owner Drive reports now. A snapshot can
+	// name an owner the item no longer has — or never had: the "(new) <name>"
+	// shortcuts reclaim-folders leaves inside a folder it replaced belong to
+	// the running account, yet have been crawled as owned by the account owning
+	// the folder around them. Removing the only parent of an item we own is not
+	// something Drive allows (it answers 400 badRequest, since that would
+	// orphan it), and it is not what we want either: an item of ours in the
+	// archive is there to be deleted. So a live re-read reroutes it, the mirror
+	// of what phase 1 does when the snapshot claims an item we do not own.
 	handleExternal := func(ctx context.Context, t archiveTarget) itemOutcome {
 		owner := "(unknown)"
 		if t.ownerEmail.Valid {
@@ -567,6 +622,17 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 				stats.fail("ERROR fetching external %q (%s): %v", t.name, t.driveID, err)
 			}
 			return outcomeFailed
+		}
+		switch liveOwnerClass(f, me, cfg.InternalDomains) {
+		case ownerMine:
+			log.Printf("NOTE %q (%s) is owned by this account, not %s (the snapshot was wrong); deleting it instead of removing it from its folder",
+				t.name, t.driveID, owner)
+			return deleteOwned(ctx, t)
+		case ownerInternal:
+			log.Printf("NOTE %q (%s) is owned by %s, not %s (the snapshot was wrong); routing it via %q instead of removing it from its folder",
+				t.name, t.driveID, f.Owners[0].EmailAddress, owner, deletionPendingFolderName)
+			t.ownerEmail = nullString(f.Owners[0].EmailAddress)
+			return rerouteInternal(t)
 		}
 		// Nothing to detach when Drive reports no parent we can see: the item is
 		// already out of our tree, which is the end state either way. Remember
@@ -654,10 +720,8 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 	}
 
 	// Phase 1: files owned by this account, concurrently. Items whose live
-	// owner turns out to have changed are re-routed to the internal queue,
-	// which many workers may hit at once — hence the mutex; phase 3 reads the
-	// queue only after this pool has drained.
-	var internalMu sync.Mutex
+	// owner turns out to have changed are re-routed to the internal queue (see
+	// queueInternal), which phase 3 reads once this pool has drained.
 	deleteMine := func(t archiveTarget) itemOutcome {
 		if dryRun {
 			return deleteOwned(deleteCtx, t)
@@ -684,11 +748,7 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 			isInternalEmail(nullString(f.Owners[0].EmailAddress), cfg.InternalDomains):
 			log.Printf("NOTE %q (%s) is now owned by %s (snapshot was stale); routing it via %q", t.name, t.driveID, f.Owners[0].EmailAddress, deletionPendingFolderName)
 			t.ownerEmail = nullString(f.Owners[0].EmailAddress)
-			internalMu.Lock()
-			internalF = append(internalF, t)
-			internalMu.Unlock()
-			// Re-queued, not dealt with: phase 3 decides its row's fate.
-			return outcomeSkipped
+			return queueInternal(t)
 		default:
 			stats.fail("ERROR deleting %q (%s): %v", t.name, t.driveID, err)
 			return outcomeFailed
@@ -726,7 +786,11 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 
 	// Phase 4: archived folders, sequentially and deepest-first, each gated on
 	// a live check that nothing this run did not already delete is left inside
-	// (its archived contents went in the phases above).
+	// (its archived contents went in the phases above). The dropoff queue has
+	// drained, so a folder that turns out to be internally owned goes through
+	// Deletion pending here and now rather than onto a queue nobody reads
+	// again.
+	rerouteInternal = func(t archiveTarget) itemOutcome { return deleteViaDropoff(deleteCtx, t) }
 	for _, t := range folders {
 		if deleteCtx.Err() != nil {
 			break
