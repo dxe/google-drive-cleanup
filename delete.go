@@ -533,7 +533,6 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 	if dryRun {
 		workers = 1
 	}
-	prog := newProgress()
 
 	// deletionPending lazily finds or creates the working folder in the dropoff
 	// shared drive; created only if an internally-owned file actually needs it.
@@ -1001,8 +1000,9 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 			return outcomeFailed
 		}
 	}
+	prog1 := newProgress()
 	forEachConcurrent(deleteCtx, workers, mineF, func(t archiveTarget) {
-		prog.tick("progress: %d/%d owned file(s) deleted", stats.delCount(), len(mineF))
+		prog1.step("progress: %d/%d owned file(s) deleted", stats.delCount(), len(mineF))
 		dropRowIfGone(t, deleteMine(t))
 	})
 	if err := checkpoint(); err != nil {
@@ -1010,9 +1010,10 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 	}
 
 	// Phase 2: externally-owned files, concurrently.
+	prog2 := newProgress()
 	forEachConcurrent(deleteCtx, workers, externalF, func(t archiveTarget) {
 		removed, skipped := stats.externalCounts()
-		prog.tick("progress: external file(s): %d removed, %d skipped", removed, skipped)
+		prog2.step("progress: external file(s): %d removed, %d skipped, of %d", removed, skipped, len(externalF))
 		dropRowIfGone(t, handleExternal(deleteCtx, t))
 	})
 	if err := checkpoint(); err != nil {
@@ -1020,12 +1021,13 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 	}
 
 	// Phase 3: internally-owned files, sequentially through Deletion pending.
-	for _, t := range internalF {
+	prog3 := newProgress()
+	for i, t := range internalF {
 		if deleteCtx.Err() != nil {
 			break
 		}
-		prog.tick("progress: %d internal file(s) via %q", stats.viaDropoff, deletionPendingFolderName)
 		dropRowIfGone(t, deleteViaDropoff(deleteCtx, t))
+		prog3.step("progress: %d/%d internal file(s) via %q", i+1, len(internalF), deletionPendingFolderName)
 	}
 	if err := checkpoint(); err != nil {
 		return err
@@ -1043,7 +1045,8 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 		}
 		return deleteViaDropoff(deleteCtx, t)
 	}
-	for _, t := range folders {
+	prog4 := newProgress()
+	for i, t := range folders {
 		if deleteCtx.Err() != nil {
 			break
 		}
@@ -1094,6 +1097,7 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 			outcome = handleExternal(deleteCtx, t)
 		}
 		dropRowIfGone(t, outcome)
+		prog4.step("progress: %d/%d archived folder(s) processed", i+1, len(folders))
 	}
 	if err := checkpoint(); err != nil {
 		return err
@@ -1121,7 +1125,8 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 			return err
 		}
 	}
-	for _, p := range prunes {
+	prog5 := newProgress()
+	for i, p := range prunes {
 		if deleteCtx.Err() != nil {
 			break
 		}
@@ -1156,6 +1161,7 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 				outcome = outcomeGone
 			}
 		}
+		prog5.step("progress: %d/%d replica folder(s) checked", i+1, len(prunes))
 		if outcome != outcomeGone {
 			continue
 		}
