@@ -179,13 +179,16 @@ func TestExternalsReplicaNames(t *testing.T) {
 	if got := externalsBackLinkName("Finance"); got != "((new)) Finance" {
 		t.Errorf("externalsBackLinkName = %q, want %q", got, "((new)) Finance")
 	}
+	if got := externalsForwardLinkName("Finance"); got != "(external files) Finance" {
+		t.Errorf("externalsForwardLinkName = %q, want %q", got, "(external files) Finance")
+	}
 	// A replica must never be named like the canonical folder it mirrors, nor
 	// like an archive replica.
 	if externalsReplicaName("Finance") == "Finance" || externalsReplicaName("Finance") == replicaName("Finance") {
 		t.Error("the externals replica name does not distinguish itself")
 	}
 	long := strings.Repeat("é", 300)
-	for _, got := range []string{externalsReplicaName(long), externalsBackLinkName(long)} {
+	for _, got := range []string{externalsReplicaName(long), externalsBackLinkName(long), externalsForwardLinkName(long)} {
 		if r := []rune(got); len(r) != maxReplicaNameRunes {
 			t.Errorf("truncated length = %d runes, want %d", len(r), maxReplicaNameRunes)
 		}
@@ -195,6 +198,60 @@ func TestExternalsReplicaNames(t *testing.T) {
 	}
 	if !strings.HasPrefix(externalsBackLinkName(long), extBackLinkPrefix) {
 		t.Error("a truncated back-link name lost its prefix")
+	}
+	if !strings.HasPrefix(externalsForwardLinkName(long), extForwardLinkPrefix) {
+		t.Error("a truncated forward-link name lost its prefix")
+	}
+}
+
+// TestRecordLink covers both signposts landing in the snapshot under the folder
+// that actually holds them: the replica's link back to the original, and the
+// original's link to its replica.
+func TestRecordLink(t *testing.T) {
+	db := testDB(t)
+	nodes := buildEvictTree(t, db)
+	var teamRow int64
+	for _, n := range nodes {
+		if n.driveID == "Team" {
+			teamRow = n.rowID
+		}
+	}
+	replicaRow, err := upsertReplicaRow(db, "Team-replica", "(ext) Team", sql.NullInt64{}, "me@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := &evictor{db: db, me: evictMe}
+
+	back := &drive.File{Id: "team-backlink", Name: externalsBackLinkName("Team")}
+	if err := e.recordLink(back, "Team", replicaRow); err != nil {
+		t.Fatal(err)
+	}
+	forward := &drive.File{Id: "team-forwardlink", Name: externalsForwardLinkName("Team")}
+	if err := e.recordLink(forward, "Team-replica", teamRow); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		driveID    string
+		wantParent int64
+		wantTarget string
+	}{
+		{"team-backlink", replicaRow, "Team"},
+		{"team-forwardlink", teamRow, "Team-replica"},
+	} {
+		var (
+			parent int64
+			target sql.NullString
+			typ    string
+		)
+		if err := db.QueryRow(`SELECT parent_id, shortcut_target_id, type FROM nodes WHERE drive_id = ?`, tc.driveID).
+			Scan(&parent, &target, &typ); err != nil {
+			t.Fatalf("%s: %v", tc.driveID, err)
+		}
+		if parent != tc.wantParent || target.String != tc.wantTarget || typ != typeShortcut {
+			t.Errorf("%s recorded under %d pointing at %q as %q; want %d -> %q as a shortcut",
+				tc.driveID, parent, target.String, typ, tc.wantParent, tc.wantTarget)
+		}
 	}
 }
 
