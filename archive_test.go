@@ -573,3 +573,97 @@ func TestConfigTemplateHasArchiveSection(t *testing.T) {
 		t.Error("real spec reported not configured")
 	}
 }
+
+// The whole point of explainNotEmpty is to distinguish a folder a re-run will
+// clear from one that is stuck forever, so the tests are about that verdict and
+// about naming the item responsible.
+func TestExplainNotEmpty(t *testing.T) {
+	known := func(id, name, decision string) folderBlocker {
+		return folderBlocker{name: name, driveID: id, known: true, decision: decision}
+	}
+
+	t.Run("only unarchived delete-marked children is transient", func(t *testing.T) {
+		msg, permanent := explainNotEmpty([]folderBlocker{known("d1", "doc", decisionDelete)}, nil)
+		if permanent {
+			t.Error("delete-marked children should not be reported as permanently blocked")
+		}
+		if !strings.Contains(msg, "re-run archive to pick them up") {
+			t.Errorf("missing the re-run advice: %q", msg)
+		}
+	})
+
+	t.Run("an undecided child is permanent and is named", func(t *testing.T) {
+		msg, permanent := explainNotEmpty([]folderBlocker{known("u1", "test file 1.3 owned", decisionNone)}, nil)
+		if !permanent {
+			t.Error("an undecided child can never be archived; want permanent")
+		}
+		if !strings.Contains(msg, `"test file 1.3 owned" (u1)`) {
+			t.Errorf("blocker not named: %q", msg)
+		}
+		if !strings.Contains(msg, "Re-running archive cannot empty this folder") {
+			t.Errorf("still advises a pointless re-run: %q", msg)
+		}
+	})
+
+	t.Run("a kept child is permanent", func(t *testing.T) {
+		if _, permanent := explainNotEmpty([]folderBlocker{known("k1", "keeper", decisionKeep)}, nil); !permanent {
+			t.Error("a kept child can never be archived; want permanent")
+		}
+	})
+
+	t.Run("an uncrawled child asks for a crawl", func(t *testing.T) {
+		msg, permanent := explainNotEmpty([]folderBlocker{{name: "new", driveID: "n1"}}, nil)
+		if !permanent {
+			t.Error("a child with no row has no decision; want permanent")
+		}
+		if !strings.Contains(msg, "drive-cleanup crawl") {
+			t.Errorf("missing the crawl advice: %q", msg)
+		}
+	})
+
+	t.Run("a delete-marked child that is itself stuck makes the parent stuck", func(t *testing.T) {
+		child := known("c1", "test folder 1 unowned", decisionDelete)
+		msg, permanent := explainNotEmpty([]folderBlocker{child}, map[string]bool{"c1": true})
+		if !permanent {
+			t.Error("parent of a permanently blocked folder is stuck too; want permanent")
+		}
+		if strings.Contains(msg, "re-run archive to pick them up") {
+			t.Errorf("advises a re-run that cannot help: %q", msg)
+		}
+		if !strings.Contains(msg, "could not empty either") {
+			t.Errorf("does not point at the blocked subfolder: %q", msg)
+		}
+	})
+
+	t.Run("no children at all is the listing lag", func(t *testing.T) {
+		msg, permanent := explainNotEmpty(nil, nil)
+		if permanent {
+			t.Error("an empty listing is eventual consistency, not a permanent block")
+		}
+		if !strings.Contains(msg, "lags recent moves") {
+			t.Errorf("missing the lag explanation: %q", msg)
+		}
+	})
+}
+
+func TestExplainNotEmptyForDelete(t *testing.T) {
+	archived := func(id, name string, skipped bool) folderBlocker {
+		return folderBlocker{name: name, driveID: id, known: true, decision: decisionDelete, archived: true, skipped: skipped}
+	}
+
+	// An externally-owned item delete already skipped will be skipped again on
+	// every plain re-run, so the message has to name the flag that clears it.
+	msg := explainNotEmptyForDelete([]folderBlocker{archived("e1", "someone else's doc", true)})
+	if !strings.Contains(msg, "--remove-unowned") {
+		t.Errorf("missing the --remove-unowned advice: %q", msg)
+	}
+	if strings.Contains(msg, "re-run delete to pick them up") {
+		t.Errorf("advises a plain re-run that cannot help: %q", msg)
+	}
+
+	// Whereas one that simply has not been deleted yet is a genuine re-run case.
+	msg = explainNotEmptyForDelete([]folderBlocker{archived("p1", "mine", false)})
+	if !strings.Contains(msg, "re-run delete to pick them up") {
+		t.Errorf("missing the re-run advice: %q", msg)
+	}
+}

@@ -59,6 +59,206 @@ func replicaName(original string) string {
 	return string(r)
 }
 
+// folderBlocker is one live child that keeps a delete-marked folder from
+// emptying, paired with what the database knows about it.
+type folderBlocker struct {
+	name     string
+	driveID  string
+	known    bool   // the database has a row for this child
+	decision string // that row's decision: delete, keep, or undecided
+	archived bool   // already moved into the archive tree
+	skipped  bool   // delete_skipped: a delete run left it alone (externally owned)
+}
+
+// folderBlockers lists what Drive still reports inside folderID and joins each
+// child to its database row, so a folder that will not empty can say which
+// items are holding it up. Shared by archive's and delete's emptiness gates.
+func folderBlockers(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, db *sql.DB, folderID string) ([]folderBlocker, error) {
+	children, err := listChildren(ctx, svc, limiter, folderID, "nextPageToken, files(id, name)")
+	if err != nil {
+		return nil, err
+	}
+	out := make([]folderBlocker, 0, len(children))
+	for _, c := range children {
+		b := folderBlocker{name: c.Name, driveID: c.Id}
+		var (
+			orig    sql.NullString
+			skipped int
+		)
+		err := db.QueryRow(`SELECT decision, original_parent_drive_id, delete_skipped FROM nodes WHERE drive_id = ?`, c.Id).
+			Scan(&b.decision, &orig, &skipped)
+		switch err {
+		case nil:
+			b.known, b.archived, b.skipped = true, orig.Valid, skipped != 0
+		case sql.ErrNoRows:
+			// Not crawled yet; b.known stays false.
+		default:
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, nil
+}
+
+// blockerNames renders up to maxNamed blockers as `"name" (id)`, with a count
+// of the rest, for a single log line.
+func blockerNames(blockers []folderBlocker) string {
+	const maxNamed = 3
+	named := blockers
+	if len(named) > maxNamed {
+		named = named[:maxNamed]
+	}
+	parts := make([]string, 0, len(named))
+	for _, b := range named {
+		parts = append(parts, fmt.Sprintf("%q (%s)", b.name, b.driveID))
+	}
+	s := strings.Join(parts, ", ")
+	if rest := len(blockers) - len(named); rest > 0 {
+		s += fmt.Sprintf(", and %d more", rest)
+	}
+	return s
+}
+
+// explainNotEmpty turns a non-empty folder's live contents into one actionable
+// sentence. The causes need different responses, and the generic advice to
+// re-run only clears the first:
+//
+//   - children marked delete that are not archived yet: transient. They failed
+//     earlier this run, or Drive's listing lags a move that already happened, so
+//     a re-run really does pick them up.
+//   - children marked keep, or still undecided: permanent. Archive only moves
+//     what is marked delete, so the folder can never empty on its own and no
+//     number of re-runs changes that — the items have to be re-decided in
+//     review, or the folder left as it is.
+//   - children the database has never seen: added since the last crawl, so they
+//     have no decision at all yet; crawl, then decide them.
+//
+// Telling someone to "re-run archive later" when every blocker is permanent
+// sends them round a loop that cannot finish, which is the case this exists to
+// call out.
+// stuck is the set of folder Drive IDs this run already reported as permanently
+// blocked. Phase C walks deepest-first, so a child folder's verdict is always
+// known before its parent's — and a parent whose only blocker is such a child
+// is just as stuck, however the child itself is marked. Without that chaining a
+// parent would be told to "re-run archive", which is exactly the dead end this
+// function exists to stop reporting.
+//
+// The second return value says whether the folder is permanently blocked, so
+// the caller can add it to stuck for the ancestors still to come.
+func explainNotEmpty(blockers []folderBlocker, stuck map[string]bool) (string, bool) {
+	if len(blockers) == 0 {
+		// The emptiness probe said "not empty" and this listing found nothing:
+		// Drive's listing is eventually consistent, so it is the lag case.
+		return "not empty on Drive, but a second listing found no children (Drive's listing lags recent moves) — re-run archive later", false
+	}
+	var pending, blocked, undecided, kept, unknown []folderBlocker
+	for _, b := range blockers {
+		switch {
+		case !b.known:
+			unknown = append(unknown, b)
+		case stuck[b.driveID]:
+			blocked = append(blocked, b)
+		case b.decision == decisionDelete:
+			pending = append(pending, b)
+		case b.decision == decisionKeep:
+			kept = append(kept, b)
+		default:
+			undecided = append(undecided, b)
+		}
+	}
+	var counts []string
+	if len(pending) > 0 {
+		counts = append(counts, fmt.Sprintf("%d marked delete but not archived yet", len(pending)))
+	}
+	if len(blocked) > 0 {
+		counts = append(counts, fmt.Sprintf("%d subfolder(s) this run could not empty either", len(blocked)))
+	}
+	if len(kept) > 0 {
+		counts = append(counts, fmt.Sprintf("%d marked keep", len(kept)))
+	}
+	if len(undecided) > 0 {
+		counts = append(counts, fmt.Sprintf("%d undecided", len(undecided)))
+	}
+	if len(unknown) > 0 {
+		counts = append(counts, fmt.Sprintf("%d not in the database", len(unknown)))
+	}
+
+	msg := fmt.Sprintf("not empty on Drive: %d item(s) inside (%s) — %s",
+		len(blockers), strings.Join(counts, ", "), blockerNames(blockers))
+	if len(blocked)+len(kept)+len(undecided)+len(unknown) == 0 {
+		return msg + "; re-run archive to pick them up (Drive listings can also lag a just-moved item)", false
+	}
+
+	var fix []string
+	if len(kept)+len(undecided) > 0 {
+		fix = append(fix, fmt.Sprintf("mark %s delete in `drive-cleanup review` (or leave this folder unarchived)",
+			blockerNames(append(append([]folderBlocker{}, kept...), undecided...))))
+	}
+	if len(unknown) > 0 {
+		fix = append(fix, fmt.Sprintf("run `drive-cleanup crawl` so %s get a decision", blockerNames(unknown)))
+	}
+	if len(blocked) > 0 {
+		fix = append(fix, fmt.Sprintf("clear what is blocking %s first (reported above)", blockerNames(blocked)))
+	}
+	return msg + ". Re-running archive cannot empty this folder — archive only moves items marked delete. To finish it: " +
+		strings.Join(fix, "; "), true
+}
+
+// explainNotEmptyForDelete is explainNotEmpty's counterpart for the delete
+// command, whose gate is the same live emptiness check but whose blockers mean
+// something different. Inside an archive folder the items that will not go are
+// the ones delete already declined: externally-owned items it skipped (which
+// only --remove-unowned clears), and anything that is not marked delete at all.
+func explainNotEmptyForDelete(blockers []folderBlocker) string {
+	if len(blockers) == 0 {
+		return "not empty on Drive, but a second listing found no children (Drive's listing lags recent deletions) — re-run delete later"
+	}
+	var pending, skipped, other, unknown []folderBlocker
+	for _, b := range blockers {
+		switch {
+		case !b.known:
+			unknown = append(unknown, b)
+		case b.decision != decisionDelete:
+			other = append(other, b)
+		case b.skipped:
+			skipped = append(skipped, b)
+		default:
+			pending = append(pending, b)
+		}
+	}
+	var counts []string
+	if len(pending) > 0 {
+		counts = append(counts, fmt.Sprintf("%d marked delete but not deleted yet", len(pending)))
+	}
+	if len(skipped) > 0 {
+		counts = append(counts, fmt.Sprintf("%d skipped as externally owned", len(skipped)))
+	}
+	if len(other) > 0 {
+		counts = append(counts, fmt.Sprintf("%d not marked delete", len(other)))
+	}
+	if len(unknown) > 0 {
+		counts = append(counts, fmt.Sprintf("%d not in the database", len(unknown)))
+	}
+
+	msg := fmt.Sprintf("not empty on Drive: %d item(s) inside (%s) — %s",
+		len(blockers), strings.Join(counts, ", "), blockerNames(blockers))
+	if len(skipped)+len(other)+len(unknown) == 0 {
+		return msg + "; re-run delete to pick them up (Drive listings can also lag a just-deleted item)"
+	}
+
+	var fix []string
+	if len(skipped) > 0 {
+		fix = append(fix, fmt.Sprintf("re-run with --remove-unowned to hand %s back to their owners", blockerNames(skipped)))
+	}
+	if len(other) > 0 {
+		fix = append(fix, fmt.Sprintf("mark %s delete in `drive-cleanup review` and re-run archive", blockerNames(other)))
+	}
+	if len(unknown) > 0 {
+		fix = append(fix, fmt.Sprintf("run `drive-cleanup crawl` so %s get a decision", blockerNames(unknown)))
+	}
+	return msg + ". Re-running delete on its own cannot empty this folder. To finish it: " + strings.Join(fix, "; ")
+}
+
 var archiveCmd = &cobra.Command{
 	Use:   "archive",
 	Short: "Move files marked delete into the archive folder, preserving folder structure",
@@ -816,6 +1016,9 @@ func runArchive(dbPath, cfgPath, subfolder string, dryRun bool, maxErrors, concu
 	// only once a live check shows it empty, which requires its own contents
 	// (deeper in the list) to have been archived first. Folders keep their
 	// permissions.
+	// Folders this run reported as permanently blocked, so an ancestor whose
+	// only blocker is one of them is told the same rather than to re-run.
+	stuckFolders := map[string]bool{}
 	for _, t := range folders {
 		if moveCtx.Err() != nil {
 			break
@@ -839,7 +1042,22 @@ func runArchive(dbPath, cfgPath, subfolder string, dryRun bool, maxErrors, concu
 			continue
 		}
 		if !empty {
-			log.Printf("SKIP folder %q (%s): not empty on Drive (unarchived or new items inside; note Drive listings can lag just-moved items) — re-run archive later", t.name, t.driveID)
+			// Say which children are holding it up and whether a re-run can
+			// actually clear them; "not empty, try again later" is a loop with
+			// no exit when the blockers are items nothing will ever move.
+			blockers, berr := folderBlockers(moveCtx, svc, limiter, db, t.driveID)
+			if berr != nil {
+				if moveCtx.Err() != nil {
+					break
+				}
+				log.Printf("SKIP folder %q (%s): not empty on Drive, and listing its contents to say why failed: %v", t.name, t.driveID, berr)
+			} else {
+				why, permanent := explainNotEmpty(blockers, stuckFolders)
+				log.Printf("SKIP folder %q (%s): %s", t.name, t.driveID, why)
+				if permanent {
+					stuckFolders[t.driveID] = true
+				}
+			}
 			stats.skip()
 			continue
 		}
