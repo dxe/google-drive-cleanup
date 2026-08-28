@@ -1675,6 +1675,40 @@ func foldersWithReplicas(db *sql.DB) ([]archiveTarget, error) {
 	return scanArchiveTargets(rows)
 }
 
+// orphanedReplicaFolders returns the replica folders inside the archive tree
+// that no original folder points at any more, deepest-first. A replica is
+// orphaned when its original folder's row goes away — the folder was archived
+// and then deleted, and its row (which held archive_folder_drive_id) went with
+// it — leaving the replica behind as an empty shell of the crawl root's
+// structure that foldersWithReplicas can no longer see, and so nothing would
+// ever prune.
+//
+// A row qualifies only if all of these hold, which together mean "a folder
+// archive created, that we still have no other use for":
+//
+//   - it sits inside the archive tree (the subtree scope) but is not its root;
+//   - it carries the "ARCH " prefix archive gives replicas;
+//   - it has no original parent — an archived folder that happens to be named
+//     "ARCH ..." records where it came from, and is a real item, not a shell;
+//   - nothing points at it as a replica any more;
+//   - it is still undecided, so a shell someone deliberately marked keep in the
+//     review UI is left alone.
+//
+// Emptiness is not part of the query: only a live Drive check may decide that.
+func orphanedReplicaFolders(db *sql.DB, archiveRootDriveID string) ([]archiveTarget, error) {
+	rows, err := db.Query(archiveTargetQuery+`
+		  AND n.type = ? AND n.name LIKE ? AND n.decision = ?
+		  AND n.original_parent_drive_id IS NULL
+		  AND p.drive_id IS NOT NULL
+		  AND n.drive_id NOT IN (
+			SELECT archive_folder_drive_id FROM nodes WHERE archive_folder_drive_id IS NOT NULL)
+		ORDER BY depth DESC, n.id`, archiveRootDriveID, typeFolder, archReplicaPrefix+"%", decisionNone)
+	if err != nil {
+		return nil, err
+	}
+	return scanArchiveTargets(rows)
+}
+
 // folderChainToRoot returns the folder rows from just below the root down to
 // folderDriveID (inclusive) — the ancestors whose replicas must exist before a
 // child of folderDriveID can be archived, or evicted into the externals tree.

@@ -14,8 +14,10 @@ package main
 //     relocates them to their owner's My Drive — and then drops every direct
 //     permission, the running account's own last.
 //
-// Empty replica folders are pruned afterwards. A database row is removed only
-// once Drive confirms the item is gone — deleted, removed from our tree, or
+// The "ARCH " replica folders mirroring the crawl root's structure are pruned
+// afterwards, including ones left behind by earlier runs, whenever a live
+// listing shows nothing but items this run already removed. A database row is
+// removed only once Drive confirms the item is gone — deleted, removed from our tree, or
 // reported absent by a live read; every other result (an API error, an
 // interrupted run, a skip) keeps the row so the next run retries the item. Each
 // handler says which happened by returning an itemOutcome, and dropRowIfGone is
@@ -28,6 +30,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 
@@ -57,10 +60,13 @@ skipped and counted unless --remove-unowned is given, which removes them from
 their archive folder (Drive relocates them to their owner's My Drive, sharing
 intact) and then drops every direct permission, the running account's own last.
 
-Empty "ARCH " replica folders are pruned afterwards. Drive listings are
-eventually consistent, so a folder that just emptied may be skipped once —
-re-run delete to pick it up. Pass --folder <id> (a folder inside the archive
-tree, or a crawled folder whose replica exists) to delete only that subtree.
+The "ARCH " replica folders that mirror the crawl root's structure are pruned
+afterwards — deepest-first, and including shells left behind by earlier runs —
+once a live listing shows nothing left inside but what this run removed. Drive
+listings are eventually consistent, so an archived folder that just emptied may
+still be skipped once; re-run delete to pick it up. Pass --folder <id> (a folder
+inside the archive tree, or a crawled folder whose replica exists) to delete
+only that subtree.
 
 This command requires the full Drive scope. If the cached token.json only has
 read-only access, the tool re-runs consent automatically to obtain it.`,
@@ -122,6 +128,97 @@ const (
 	outcomeGone                       // confirmed removed from Drive, or confirmed already absent
 	outcomeSkipped                    // deliberately left alone (dry run, externally owned, re-queued)
 )
+
+// goneSet collects the Drive IDs this run confirmed are out of the archive
+// tree — deleted, or handed back to their owner. It exists because files.list
+// is eventually consistent: a folder emptied seconds ago keeps listing what we
+// just removed from it. Discounting exactly the IDs a handler reported
+// outcomeGone lets the replica-pruning phase see such a folder as the empty
+// shell it really is. Written from the concurrent phases, read by phase 5 after
+// they have drained; the mutex guards that hand-off.
+type goneSet struct {
+	mu  sync.Mutex
+	ids map[string]bool
+}
+
+func (g *goneSet) add(id string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.ids[id] = true
+}
+
+func (g *goneSet) has(id string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.ids[id]
+}
+
+// replicaLeftovers returns the live children of a replica folder that this run
+// has not already removed — what is genuinely still inside it. Anything listed
+// here is real content (a file whose delete failed or was skipped, an
+// externally-owned item left in place, an archived folder still awaiting its
+// own delete) and keeps the replica alive.
+func replicaLeftovers(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, folderID string, gone *goneSet) ([]folderBlocker, error) {
+	children, err := listChildren(ctx, svc, limiter, folderID, "nextPageToken, files(id, name)")
+	if err != nil {
+		return nil, err
+	}
+	var left []folderBlocker
+	for _, c := range children {
+		if !gone.has(c.Id) {
+			left = append(left, folderBlocker{name: c.Name, driveID: c.Id})
+		}
+	}
+	return left, nil
+}
+
+// replicaPrune is one archive-tree folder mirroring the crawl root's structure
+// that phase 5 offers to remove once a live check shows nothing left inside it.
+type replicaPrune struct {
+	replicaID  string // the folder on Drive
+	originalID string // original folder whose cached pointer to clear; empty when orphaned
+	name       string // the original folder's name, or the shell's own
+	label      string // how log lines name it
+	depth      int    // distance from the tree's root; deepest are pruned first
+}
+
+// replicasToPrune lists every replica folder this run may remove, deepest-first
+// — a child folder's replica nests inside its parent's, so the stack has to
+// collapse from the bottom. Two kinds, pruned identically apart from the
+// bookkeeping: replicas an original folder still points at, and the shells left
+// behind when that original was itself archived and deleted (see
+// orphanedReplicaFolders). Both are measured from their tree's root, so their
+// depths sort against each other.
+func replicasToPrune(db *sql.DB, archiveRootDriveID string) ([]replicaPrune, error) {
+	cached, err := foldersWithReplicas(db)
+	if err != nil {
+		return nil, err
+	}
+	orphans, err := orphanedReplicaFolders(db, archiveRootDriveID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]replicaPrune, 0, len(cached)+len(orphans))
+	for _, t := range cached {
+		out = append(out, replicaPrune{
+			replicaID:  t.archiveFolder.String,
+			originalID: t.driveID,
+			name:       t.name,
+			label:      fmt.Sprintf("replica %q of %q", replicaName(t.name), t.name),
+			depth:      t.depth,
+		})
+	}
+	for _, t := range orphans {
+		out = append(out, replicaPrune{
+			replicaID: t.driveID,
+			name:      t.name,
+			label:     fmt.Sprintf("leftover replica folder %q", t.name),
+			depth:     t.depth,
+		})
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].depth > out[j].depth })
+	return out, nil
+}
 
 // deleteStats holds a delete run's tallies, updated from the worker pool.
 type deleteStats struct {
@@ -305,6 +402,7 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 	deleteCtx, deleteCancel := context.WithCancel(ctx)
 	defer deleteCancel()
 	stats := &deleteStats{errorBudget: &errorBudget{cmd: "delete", maxErrors: maxErrors, cancel: deleteCancel}}
+	gone := &goneSet{ids: make(map[string]bool)}
 	workers := concurrency
 	if dryRun {
 		workers = 1
@@ -341,6 +439,7 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 		if outcome != outcomeGone {
 			return
 		}
+		gone.add(t.driveID)
 		if err := deleteNodeRow(db, t.driveID); err != nil {
 			log.Printf("WARN removing database row of deleted %q (%s): %v", t.name, t.driveID, err)
 		}
@@ -668,10 +767,19 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 		return err
 	}
 
-	// Phase 5: prune replica folders that emptied out, deepest-first (a child
-	// folder's replica nests inside its parent's), clearing the originals'
-	// caches so a later archive re-creates replicas as needed.
-	replicas, err := foldersWithReplicas(db)
+	// Phase 5: prune the replica folders — the "ARCH " shells mirroring the
+	// crawl root's structure — that this run emptied out. Deepest-first (a
+	// child folder's replica nests inside its parent's) and discounting what we
+	// already removed, so a whole stack of nested shells collapses in one run:
+	// a pruned replica joins the gone set, which is what lets its parent read
+	// as empty on the next iteration even while Drive still lists it.
+	//
+	// Pruning is safe for archive: it caches these IDs on the original folder
+	// (archive_folder_drive_id) and reuses them, so every prune clears that
+	// cache and the replica's own row here. Archive re-creates a replica it
+	// needs — its resolver verifies a cached ID live and falls through to
+	// find-by-name, then create, when the ID is gone (see replicaResolver.ensure).
+	prunes, err := replicasToPrune(db, cfg.Archive.Root.ID)
 	if err != nil {
 		return err
 	}
@@ -681,37 +789,37 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 			return err
 		}
 	}
-	for _, t := range replicas {
+	for _, p := range prunes {
 		if deleteCtx.Err() != nil {
 			break
 		}
-		replicaID := t.archiveFolder.String
-		if inScope != nil && !inScope[replicaID] {
+		if inScope != nil && !inScope[p.replicaID] {
 			continue
 		}
 		if dryRun {
-			log.Printf("WOULD prune replica %q of %q (%s) once empty", replicaName(t.name), t.name, replicaID)
+			log.Printf("WOULD prune %s (%s) once empty", p.label, p.replicaID)
 			continue
 		}
 		// Same rule as the item phases: the replica's row and the original's
 		// cached pointer to it are only cleared once Drive confirms the replica
 		// folder is gone.
 		outcome := outcomeFailed
-		empty, err := folderIsEmpty(deleteCtx, svc, limiter, replicaID)
+		left, err := replicaLeftovers(deleteCtx, svc, limiter, p.replicaID, gone)
 		switch {
 		case isNotFound(err):
 			// Replica already gone; just clear the bookkeeping.
 			outcome = outcomeGone
 		case err != nil:
 			if deleteCtx.Err() == nil {
-				log.Printf("WARN checking replica %s of %q: %v", replicaID, t.name, err)
+				log.Printf("WARN checking %s (%s): %v", p.label, p.replicaID, err)
 			}
-		case !empty:
-			detailf("replica of %q (%s) not empty yet; leaving it", t.name, replicaID)
+		case len(left) > 0:
+			detailf("%s (%s) still holds %d item(s): %s; leaving it",
+				p.label, p.replicaID, len(left), blockerNames(left))
 		default:
-			if derr := rec.deleteFile(deleteCtx, svc, limiter, replicaID); derr != nil && !isNotFound(derr) {
+			if derr := rec.deleteFile(deleteCtx, svc, limiter, p.replicaID); derr != nil && !isNotFound(derr) {
 				if deleteCtx.Err() == nil {
-					log.Printf("WARN pruning empty replica %s of %q: %v", replicaID, t.name, derr)
+					log.Printf("WARN pruning empty %s (%s): %v", p.label, p.replicaID, derr)
 				}
 			} else {
 				outcome = outcomeGone
@@ -720,13 +828,18 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 		if outcome != outcomeGone {
 			continue
 		}
-		if err := clearArchiveFolder(db, t.driveID); err != nil {
-			log.Printf("WARN clearing replica cache of %q (%s): %v", t.name, t.driveID, err)
+		// Its parent's replica may now be an empty shell too, and Drive will
+		// keep listing this one inside it for a while yet.
+		gone.add(p.replicaID)
+		if p.originalID != "" {
+			if err := clearArchiveFolder(db, p.originalID); err != nil {
+				log.Printf("WARN clearing replica cache of %q (%s): %v", p.name, p.originalID, err)
+			}
 		}
-		if err := deleteNodeRow(db, replicaID); err != nil {
-			log.Printf("WARN removing database row of pruned replica %s: %v", replicaID, err)
+		if err := deleteNodeRow(db, p.replicaID); err != nil {
+			log.Printf("WARN removing database row of pruned replica %s: %v", p.replicaID, err)
 		}
-		detailf("OK pruned empty replica of %q (%s)", t.name, replicaID)
+		detailf("OK pruned empty %s (%s)", p.label, p.replicaID)
 		stats.prune()
 	}
 
