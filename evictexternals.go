@@ -698,22 +698,24 @@ func runEvictExternals(dbPath, cfgPath, folderID string, dryRun, allowUnownedFol
 		return fmt.Errorf("recording the externals root: %w", err)
 	}
 	e.root.rowID = rootRow
-	for _, parent := range plan.parentDriveIDs() {
+	parents := plan.parentDriveIDs()
+	prog := newProgress()
+	for i, parent := range parents {
 		if err := moveCtx.Err(); err != nil {
 			return err
 		}
 		if _, err := e.resolve(moveCtx, parent); err != nil {
 			return fmt.Errorf("preparing the externals replica of folder %s: %w", parent, err)
 		}
+		prog.step("evict-externals: %d/%d replica folder(s) prepared", i+1, len(parents))
 	}
-
-	prog := newProgress()
 
 	// Phase A: files, concurrently. Each one moves into its folder's replica and
 	// then gets a shortcut left behind where it used to be.
+	prog = newProgress()
 	forEachConcurrent(moveCtx, concurrency, plan.files, func(n evictNode) {
-		prog.tick("evict-externals: %d/%d file(s) evicted", stats.fileCount(), len(plan.files))
 		e.evictFile(moveCtx, n)
+		prog.step("evict-externals: %d/%d file(s) evicted", stats.fileCount(), len(plan.files))
 	})
 	if ctx.Err() != nil {
 		log.Printf("interrupted: %d file(s) and %d folder(s) evicted, %d skipped, %d failed",
@@ -728,11 +730,13 @@ func runEvictExternals(dbPath, cfgPath, folderID string, dryRun, allowUnownedFol
 	// folder that has gained content since the crawl is left alone rather than
 	// dragging it out of the subtree. The folders --allow-unowned-folders cleared
 	// are exempt from that check: content is expected there.
-	for _, n := range plan.folders {
+	prog = newProgress()
+	for i, n := range plan.folders {
 		if moveCtx.Err() != nil {
 			break
 		}
 		e.evictFolder(moveCtx, n)
+		prog.step("evict-externals: %d/%d folder(s) processed", i+1, len(plan.folders))
 	}
 	if ctx.Err() != nil {
 		log.Printf("interrupted: %d file(s) and %d folder(s) evicted, %d skipped, %d failed",
