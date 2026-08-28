@@ -14,9 +14,13 @@ package main
 //     relocates them to their owner's My Drive — and then drops every direct
 //     permission, the running account's own last.
 //
-// Empty replica folders are pruned afterwards, and a really-deleted item's
-// database row is removed. Run pack/unpack before delete to transfer internal
-// ownership to the org and shrink the dropoff bucket.
+// Empty replica folders are pruned afterwards. A database row is removed only
+// once Drive confirms the item is gone — deleted, removed from our tree, or
+// reported absent by a live read; every other result (an API error, an
+// interrupted run, a skip) keeps the row so the next run retries the item. Each
+// handler says which happened by returning an itemOutcome, and dropRowIfGone is
+// the one place that acts on it. Run pack/unpack before delete to transfer
+// internal ownership to the org and shrink the dropoff bucket.
 
 import (
 	"context"
@@ -102,6 +106,22 @@ func classifyOwner(t archiveTarget, me *drive.User, internalDomains []string) ow
 	}
 	return ownerExternal
 }
+
+// itemOutcome is what one item's handler managed to do with it on the Drive
+// side. It is the sole gate on removing the item's database row: only
+// outcomeGone — the Drive object was deleted, or removed from our tree, or a
+// live read proved it no longer exists — may drop a row. Anything else keeps
+// the row so a later run retries the item. Keeping the decision in one type,
+// returned by every handler and acted on in one place (see dropRowIfGone),
+// is what stops a future branch from quietly dropping a row for an item Drive
+// still holds.
+type itemOutcome int
+
+const (
+	outcomeFailed  itemOutcome = iota // Drive still holds it, or we could not tell
+	outcomeGone                       // confirmed removed from Drive, or confirmed already absent
+	outcomeSkipped                    // deliberately left alone (dry run, externally owned, re-queued)
+)
 
 // deleteStats holds a delete run's tallies, updated from the worker pool.
 type deleteStats struct {
@@ -311,51 +331,57 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 		return f, nil
 	}
 
-	// dropRow removes a really-deleted item's database row; a failure here is
-	// per-item, not fatal (the row lingers and the next run's 404 handling
-	// cleans it up).
-	dropRow := func(t archiveTarget) {
+	// dropRowIfGone removes an item's database row, and only when its handler
+	// confirmed Drive no longer holds it. Every node row this command removes
+	// for a deleted item goes through here, so a Drive failure can never leave
+	// the database claiming the item was dealt with: the row survives and the
+	// next run retries it. A failure of the delete itself is per-item, not fatal
+	// (the row lingers and the next run's 404 handling cleans it up).
+	dropRowIfGone := func(t archiveTarget, outcome itemOutcome) {
+		if outcome != outcomeGone {
+			return
+		}
 		if err := deleteNodeRow(db, t.driveID); err != nil {
 			log.Printf("WARN removing database row of deleted %q (%s): %v", t.name, t.driveID, err)
 		}
 	}
 
-	// deleteOwned deletes an item the running account owns. Reports whether the
-	// caller may treat the item as gone.
-	deleteOwned := func(ctx context.Context, t archiveTarget) bool {
+	// deleteOwned deletes an item the running account owns.
+	deleteOwned := func(ctx context.Context, t archiveTarget) itemOutcome {
 		if dryRun {
 			log.Printf("WOULD delete %s %q (%s), owned by this account", t.typ, t.name, t.driveID)
 			stats.del()
-			return false
+			return outcomeSkipped
 		}
 		err := rec.deleteFile(ctx, svc, limiter, t.driveID)
 		if err == nil || isNotFound(err) {
+			// A 404 from files.delete means the object is not there — the end
+			// state we wanted — so the row goes either way.
 			detailf("OK deleted %q (%s)", t.name, t.driveID)
-			dropRow(t)
 			stats.del()
-			return true
+			return outcomeGone
 		}
 		if ctx.Err() == nil {
 			stats.fail("ERROR deleting %q (%s): %v", t.name, t.driveID, err)
 		}
-		return false
+		return outcomeFailed
 	}
 
 	// deleteViaDropoff handles an internally-owned item: move it into the
 	// Deletion pending folder (the move into the shared drive flips ownership
 	// to the org; requires the Workspace "Move any file or folder into shared
 	// drives" privilege), then delete it there. Runs sequentially.
-	deleteViaDropoff := func(ctx context.Context, t archiveTarget) {
+	deleteViaDropoff := func(ctx context.Context, t archiveTarget) itemOutcome {
 		if dryRun {
 			log.Printf("WOULD move %s %q (%s), owned by %s, into %q in the dropoff shared drive and delete it there",
 				t.typ, t.name, t.driveID, t.ownerEmail.String, deletionPendingFolderName)
 			stats.dropoff()
-			return
+			return outcomeSkipped
 		}
 		dp, err := ensureDeletionPending(ctx)
 		if err != nil {
 			stats.fail("ERROR %q (%s): %v", t.name, t.driveID, err)
-			return
+			return outcomeFailed
 		}
 		// Optimistic move from the recorded parent (the archive replica);
 		// diagnose from live state on failure, pack-style.
@@ -365,12 +391,11 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 			switch {
 			case isNotFound(gerr):
 				detailf("OK %q (%s): no longer exists", t.name, t.driveID)
-				dropRow(t)
 				stats.del()
-				return
+				return outcomeGone
 			case gerr != nil:
 				stats.fail("ERROR %q (%s): move to %q failed (%v) and live lookup failed (%v)", t.name, t.driveID, deletionPendingFolderName, err, gerr)
-				return
+				return outcomeFailed
 			case hasParent(f, dp.Id):
 				// Already moved by an interrupted run; carry on to the delete.
 			default:
@@ -379,27 +404,27 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 						stats.fail("ERROR moving %q (%s) into %q: %v (this needs the Workspace privilege \"Move any file or folder into shared drives\")",
 							t.name, t.driveID, deletionPendingFolderName, err)
 					}
-					return
+					return outcomeFailed
 				}
 			}
 		}
 		if ctx.Err() != nil {
-			return
+			return outcomeFailed
 		}
 		if err := rec.deleteFile(ctx, svc, limiter, t.driveID); err != nil && !isNotFound(err) {
 			stats.fail("ERROR deleting %q (%s) from %q (it is stranded there): %v", t.name, t.driveID, deletionPendingFolderName, err)
-			return
+			return outcomeFailed
 		}
 		detailf("OK deleted %q (%s) via %q", t.name, t.driveID, deletionPendingFolderName)
-		dropRow(t)
 		stats.dropoff()
+		return outcomeGone
 	}
 
 	// handleExternal skips (and flags) an externally-owned item, or with
 	// --remove-unowned removes it from its folder — Drive relocates it to its
 	// owner's My Drive, sharing intact — and then drops every direct
 	// permission it can, the running account's own last.
-	handleExternal := func(ctx context.Context, t archiveTarget) {
+	handleExternal := func(ctx context.Context, t archiveTarget) itemOutcome {
 		owner := "(unknown)"
 		if t.ownerEmail.Valid {
 			owner = t.ownerEmail.String
@@ -414,33 +439,37 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 				}
 			}
 			stats.skip()
-			return
+			return outcomeSkipped
 		}
 		if dryRun {
 			log.Printf("WOULD remove %s %q (%s), externally owned by %s, from its folder (it lands in the owner's My Drive) and drop its direct permissions",
 				t.typ, t.name, t.driveID, owner)
 			stats.remove()
-			return
+			return outcomeSkipped
 		}
 		f, err := getFileState(ctx, svc, limiter, t.driveID)
 		if isNotFound(err) {
 			detailf("OK %q (%s): no longer exists", t.name, t.driveID)
-			dropRow(t)
 			stats.del()
-			return
+			return outcomeGone
 		}
 		if err != nil {
 			if ctx.Err() == nil {
 				stats.fail("ERROR fetching external %q (%s): %v", t.name, t.driveID, err)
 			}
-			return
+			return outcomeFailed
 		}
-		if len(f.Parents) > 0 {
+		// Nothing to detach when Drive reports no parent we can see: the item is
+		// already out of our tree, which is the end state either way. Remember
+		// which it was so the closing line does not claim a removal that never
+		// happened.
+		detached := len(f.Parents) > 0
+		if detached {
 			if err := rec.removeFromParent(ctx, svc, limiter, t.driveID, strings.Join(f.Parents, ",")); err != nil {
 				if ctx.Err() == nil {
 					stats.fail("ERROR removing external %q (%s) from its folder: %v", t.name, t.driveID, err)
 				}
-				return
+				return outcomeFailed
 			}
 		}
 		// Best-effort permission cleanup; the item is out of our tree either way.
@@ -468,9 +497,13 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 				log.Printf("WARN revoking own permission on removed %q (%s): %v", t.name, t.driveID, err)
 			}
 		}
-		detailf("OK removed external %q (%s) from its folder", t.name, t.driveID)
-		dropRow(t)
+		if detached {
+			detailf("OK removed external %q (%s) from its folder", t.name, t.driveID)
+		} else {
+			detailf("OK external %q (%s) was already outside every folder we can see", t.name, t.driveID)
+		}
 		stats.remove()
+		return outcomeGone
 	}
 
 	interrupted := func() bool {
@@ -496,30 +529,28 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 	// which many workers may hit at once — hence the mutex; phase 3 reads the
 	// queue only after this pool has drained.
 	var internalMu sync.Mutex
-	forEachConcurrent(deleteCtx, workers, mineF, func(t archiveTarget) {
-		prog.tick("progress: %d/%d owned file(s) deleted", stats.delCount(), len(mineF))
+	deleteMine := func(t archiveTarget) itemOutcome {
 		if dryRun {
-			deleteOwned(deleteCtx, t)
-			return
+			return deleteOwned(deleteCtx, t)
 		}
 		err := rec.deleteFile(deleteCtx, svc, limiter, t.driveID)
 		if err == nil || isNotFound(err) {
 			detailf("OK deleted %q (%s)", t.name, t.driveID)
-			dropRow(t)
 			stats.del()
-			return
+			return outcomeGone
 		}
 		if deleteCtx.Err() != nil {
-			return
+			return outcomeFailed
 		}
 		// The database says we own it, Drive disagrees (stale snapshot). If the
 		// live owner is internal the dropoff path still works; queue it there.
 		f, gerr := getFileState(deleteCtx, svc, limiter, t.driveID)
 		switch {
 		case deleteCtx.Err() != nil:
+			return outcomeFailed
 		case isNotFound(gerr):
-			dropRow(t)
 			stats.del()
+			return outcomeGone
 		case gerr == nil && len(f.Owners) > 0 && !ownedByAccount(f, me.EmailAddress) &&
 			isInternalEmail(nullString(f.Owners[0].EmailAddress), cfg.InternalDomains):
 			log.Printf("NOTE %q (%s) is now owned by %s (snapshot was stale); routing it via %q", t.name, t.driveID, f.Owners[0].EmailAddress, deletionPendingFolderName)
@@ -527,9 +558,16 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 			internalMu.Lock()
 			internalF = append(internalF, t)
 			internalMu.Unlock()
+			// Re-queued, not dealt with: phase 3 decides its row's fate.
+			return outcomeSkipped
 		default:
 			stats.fail("ERROR deleting %q (%s): %v", t.name, t.driveID, err)
+			return outcomeFailed
 		}
+	}
+	forEachConcurrent(deleteCtx, workers, mineF, func(t archiveTarget) {
+		prog.tick("progress: %d/%d owned file(s) deleted", stats.delCount(), len(mineF))
+		dropRowIfGone(t, deleteMine(t))
 	})
 	if err := checkpoint(); err != nil {
 		return err
@@ -539,7 +577,7 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 	forEachConcurrent(deleteCtx, workers, externalF, func(t archiveTarget) {
 		removed, skipped := stats.externalCounts()
 		prog.tick("progress: external file(s): %d removed, %d skipped", removed, skipped)
-		handleExternal(deleteCtx, t)
+		dropRowIfGone(t, handleExternal(deleteCtx, t))
 	})
 	if err := checkpoint(); err != nil {
 		return err
@@ -551,7 +589,7 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 			break
 		}
 		prog.tick("progress: %d internal file(s) via %q", stats.viaDropoff, deletionPendingFolderName)
-		deleteViaDropoff(deleteCtx, t)
+		dropRowIfGone(t, deleteViaDropoff(deleteCtx, t))
 	}
 	if err := checkpoint(); err != nil {
 		return err
@@ -570,7 +608,7 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 		}
 		empty, err := folderIsEmpty(deleteCtx, svc, limiter, t.driveID)
 		if isNotFound(err) {
-			dropRow(t)
+			dropRowIfGone(t, outcomeGone)
 			stats.del()
 			continue
 		}
@@ -585,14 +623,16 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 			stats.skipFull()
 			continue
 		}
+		var outcome itemOutcome
 		switch classifyOwner(t, me, cfg.InternalDomains) {
 		case ownerMine:
-			deleteOwned(deleteCtx, t)
+			outcome = deleteOwned(deleteCtx, t)
 		case ownerInternal:
-			deleteViaDropoff(deleteCtx, t)
+			outcome = deleteViaDropoff(deleteCtx, t)
 		default:
-			handleExternal(deleteCtx, t)
+			outcome = handleExternal(deleteCtx, t)
 		}
+		dropRowIfGone(t, outcome)
 	}
 	if err := checkpoint(); err != nil {
 		return err
@@ -623,25 +663,32 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 			log.Printf("WOULD prune replica %q of %q (%s) once empty", replicaName(t.name), t.name, replicaID)
 			continue
 		}
+		// Same rule as the item phases: the replica's row and the original's
+		// cached pointer to it are only cleared once Drive confirms the replica
+		// folder is gone.
+		outcome := outcomeFailed
 		empty, err := folderIsEmpty(deleteCtx, svc, limiter, replicaID)
 		switch {
 		case isNotFound(err):
 			// Replica already gone; just clear the bookkeeping.
+			outcome = outcomeGone
 		case err != nil:
 			if deleteCtx.Err() == nil {
 				log.Printf("WARN checking replica %s of %q: %v", replicaID, t.name, err)
 			}
-			continue
 		case !empty:
 			detailf("replica of %q (%s) not empty yet; leaving it", t.name, replicaID)
-			continue
 		default:
 			if derr := rec.deleteFile(deleteCtx, svc, limiter, replicaID); derr != nil && !isNotFound(derr) {
 				if deleteCtx.Err() == nil {
 					log.Printf("WARN pruning empty replica %s of %q: %v", replicaID, t.name, derr)
 				}
-				continue
+			} else {
+				outcome = outcomeGone
 			}
+		}
+		if outcome != outcomeGone {
+			continue
 		}
 		if err := clearArchiveFolder(db, t.driveID); err != nil {
 			log.Printf("WARN clearing replica cache of %q (%s): %v", t.name, t.driveID, err)
