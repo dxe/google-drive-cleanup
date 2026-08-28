@@ -205,14 +205,13 @@ func explainNotEmpty(blockers []folderBlocker, stuck map[string]bool) (string, b
 }
 
 // explainNotEmptyForDelete is explainNotEmpty's counterpart for the delete
-// command, whose gate is the same live emptiness check but whose blockers mean
-// something different. Inside an archive folder the items that will not go are
-// the ones delete already declined: externally-owned items it skipped (which
-// only --remove-unowned clears), and anything that is not marked delete at all.
+// command, whose blockers mean something different. Inside an archive folder
+// the items that will not go are the ones delete already declined:
+// externally-owned items it skipped (which only --remove-unowned clears), and
+// anything that is not marked delete at all. Callers pass what
+// remainingContents kept, so the list is never empty — items this run deleted
+// but Drive still lists are gone from it before it gets here.
 func explainNotEmptyForDelete(blockers []folderBlocker) string {
-	if len(blockers) == 0 {
-		return "not empty on Drive, but a second listing found no children (Drive's listing lags recent deletions) — re-run delete later"
-	}
 	var pending, skipped, other, unknown []folderBlocker
 	for _, b := range blockers {
 		switch {

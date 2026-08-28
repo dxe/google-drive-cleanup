@@ -14,11 +14,12 @@ package main
 //     relocates them to their owner's My Drive — and then drops every direct
 //     permission, the running account's own last.
 //
-// The "ARCH " replica folders mirroring the crawl root's structure are pruned
-// afterwards, including ones left behind by earlier runs, whenever a live
-// listing shows nothing but items this run already removed. A database row is
-// removed only once Drive confirms the item is gone — deleted, removed from our tree, or
-// reported absent by a live read; every other result (an API error, an
+// A folder — an archived one, or one of the "ARCH " replicas mirroring the
+// crawl root's structure, which are pruned afterwards including shells left
+// behind by earlier runs — goes once a live listing shows nothing inside it but
+// items this run already removed (see remainingContents). A database row is
+// removed only once Drive confirms the item is gone — deleted, removed from our
+// tree, or reported absent by a live read; every other result (an API error, an
 // interrupted run, a skip) keeps the row so the next run retries the item. Each
 // handler says which happened by returning an itemOutcome, and dropRowIfGone is
 // the one place that acts on it. Run pack/unpack before delete to transfer
@@ -60,13 +61,13 @@ skipped and counted unless --remove-unowned is given, which removes them from
 their archive folder (Drive relocates them to their owner's My Drive, sharing
 intact) and then drops every direct permission, the running account's own last.
 
-The "ARCH " replica folders that mirror the crawl root's structure are pruned
-afterwards — deepest-first, and including shells left behind by earlier runs —
-once a live listing shows nothing left inside but what this run removed. Drive
-listings are eventually consistent, so an archived folder that just emptied may
-still be skipped once; re-run delete to pick it up. Pass --folder <id> (a folder
-inside the archive tree, or a crawled folder whose replica exists) to delete
-only that subtree.
+An archived folder is deleted once a live listing shows nothing inside it but
+items this run already removed, and the "ARCH " replica folders that mirror the
+crawl root's structure are pruned the same way afterwards — deepest-first, and
+including shells left behind by earlier runs. Drive's listings lag deletions, so
+anything left behind by an EARLIER run may still be reported for a while; re-run
+delete to pick those up. Pass --folder <id> (a folder inside the archive tree,
+or a crawled folder whose replica exists) to delete only that subtree.
 
 This command requires the full Drive scope. If the cached token.json only has
 read-only access, the tool re-runs consent automatically to obtain it.`,
@@ -133,9 +134,11 @@ const (
 // tree — deleted, or handed back to their owner. It exists because files.list
 // is eventually consistent: a folder emptied seconds ago keeps listing what we
 // just removed from it. Discounting exactly the IDs a handler reported
-// outcomeGone lets the replica-pruning phase see such a folder as the empty
-// shell it really is. Written from the concurrent phases, read by phase 5 after
-// they have drained; the mutex guards that hand-off.
+// outcomeGone lets the later phases — the archived-folder gate and the replica
+// prune — see such a folder as the empty shell it really is, instead of waiting
+// for Drive to catch up over another run. Written from the concurrent phases
+// and read by the sequential ones after they have drained; the mutex guards
+// that hand-off.
 type goneSet struct {
 	mu  sync.Mutex
 	ids map[string]bool
@@ -153,20 +156,27 @@ func (g *goneSet) has(id string) bool {
 	return g.ids[id]
 }
 
-// replicaLeftovers returns the live children of a replica folder that this run
-// has not already removed — what is genuinely still inside it. Anything listed
-// here is real content (a file whose delete failed or was skipped, an
-// externally-owned item left in place, an archived folder still awaiting its
-// own delete) and keeps the replica alive.
-func replicaLeftovers(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, folderID string, gone *goneSet) ([]folderBlocker, error) {
-	children, err := listChildren(ctx, svc, limiter, folderID, "nextPageToken, files(id, name)")
+// remainingContents is delete's emptiness check: the live children of folderID
+// that this run has not already removed, joined to what the database knows
+// about them. An empty result means the folder can go; anything in it is real
+// content (a file whose delete failed or was skipped, an externally-owned item
+// left in place, an archived folder still awaiting its own delete) and, being
+// blockers, explains itself through explainNotEmptyForDelete.
+//
+// It replaces a plain "does this folder have any child at all" probe, which
+// could not tell content apart from Drive's lag: files.list keeps reporting
+// items for a while after they are deleted, so a folder this run just emptied
+// looked full, and its own deleted children — whose rows are gone by then —
+// were reported back as "not in the database, run crawl".
+func remainingContents(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, db *sql.DB, folderID string, gone *goneSet) ([]folderBlocker, error) {
+	blockers, err := folderBlockers(ctx, svc, limiter, db, folderID)
 	if err != nil {
 		return nil, err
 	}
-	var left []folderBlocker
-	for _, c := range children {
-		if !gone.has(c.Id) {
-			left = append(left, folderBlocker{name: c.Name, driveID: c.Id})
+	left := blockers[:0]
+	for _, b := range blockers {
+		if !gone.has(b.driveID) {
+			left = append(left, b)
 		}
 	}
 	return left, nil
@@ -715,7 +725,8 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 	}
 
 	// Phase 4: archived folders, sequentially and deepest-first, each gated on
-	// a live emptiness check (its archived contents were deleted above).
+	// a live check that nothing this run did not already delete is left inside
+	// (its archived contents went in the phases above).
 	for _, t := range folders {
 		if deleteCtx.Err() != nil {
 			break
@@ -725,7 +736,11 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 			stats.del()
 			continue
 		}
-		empty, err := folderIsEmpty(deleteCtx, svc, limiter, t.driveID)
+		// One listing decides both questions: whether anything this run did not
+		// already remove is still inside, and — when there is — which items are
+		// holding the folder up and whether a plain re-run can clear them (see
+		// explainNotEmptyForDelete).
+		left, err := remainingContents(deleteCtx, svc, limiter, db, t.driveID, gone)
 		if isNotFound(err) {
 			dropRowIfGone(t, outcomeGone)
 			stats.del()
@@ -737,18 +752,8 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 			}
 			continue
 		}
-		if !empty {
-			// Name the contents that are holding it up, and say whether a plain
-			// re-run can clear them — see explainNotEmptyForDelete.
-			blockers, berr := folderBlockers(deleteCtx, svc, limiter, db, t.driveID)
-			if berr != nil {
-				if deleteCtx.Err() != nil {
-					break
-				}
-				log.Printf("SKIP folder %q (%s): not empty yet, and listing its contents to say why failed: %v", t.name, t.driveID, berr)
-			} else {
-				log.Printf("SKIP folder %q (%s): %s", t.name, t.driveID, explainNotEmptyForDelete(blockers))
-			}
+		if len(left) > 0 {
+			log.Printf("SKIP folder %q (%s): %s", t.name, t.driveID, explainNotEmptyForDelete(left))
 			stats.skipFull()
 			continue
 		}
@@ -804,7 +809,7 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 		// cached pointer to it are only cleared once Drive confirms the replica
 		// folder is gone.
 		outcome := outcomeFailed
-		left, err := replicaLeftovers(deleteCtx, svc, limiter, p.replicaID, gone)
+		left, err := remainingContents(deleteCtx, svc, limiter, db, p.replicaID, gone)
 		switch {
 		case isNotFound(err):
 			// Replica already gone; just clear the bookkeeping.
@@ -814,8 +819,7 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 				log.Printf("WARN checking %s (%s): %v", p.label, p.replicaID, err)
 			}
 		case len(left) > 0:
-			detailf("%s (%s) still holds %d item(s): %s; leaving it",
-				p.label, p.replicaID, len(left), blockerNames(left))
+			detailf("leaving %s (%s): %s", p.label, p.replicaID, explainNotEmptyForDelete(left))
 		default:
 			if derr := rec.deleteFile(deleteCtx, svc, limiter, p.replicaID); derr != nil && !isNotFound(derr) {
 				if deleteCtx.Err() == nil {
