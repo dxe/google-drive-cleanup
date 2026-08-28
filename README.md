@@ -383,10 +383,19 @@ an empty leaf, and the run proceeds:
   over, and that link travels along. Links and bookmarks aimed at the folder
   keep working regardless, since its Drive ID does not change when it moves.
 
-The externals tree mirrors the crawl root's folder structure under the
-originals' own names, so an evicted file keeps its original location and name.
-Only ancestor folders that actually receive something are created — the tree
-never fills up with empty placeholders. Each replica folder gets the original
+The externals tree mirrors the crawl root's folder structure, so an evicted file
+keeps its original location and name. Each replica folder is named `(ext)
+<original>` — the counterpart of the archive tree's `ARCH ` prefix — so it is
+never mistaken for the canonical folder it mirrors, and it holds a `((new))
+<original>` shortcut pointing at that folder, so the way back is one click from
+wherever an evicted file landed. (`delete`'s replica prune discounts those
+shortcuts, so a replica holding nothing else still counts as empty and goes,
+taking its own signpost with it.) A replica is found again by the Drive ID
+recorded for it rather than by its name, so a replica renamed by hand — or left
+under its bare name by a run from before the `(ext) ` prefix — is found, renamed
+back to `(ext) <original>`, and reused rather than built a second time. Only
+ancestor folders that actually receive something are created — the tree never
+fills up with empty placeholders. Each replica folder gets the original
 folder's sharing copied onto it, **without sending anybody a notification
 email**, so everyone who could reach the file before still can. Because the
 replicas are built top-down, each one inherits what its parent replica provides

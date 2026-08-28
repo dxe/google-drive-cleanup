@@ -169,6 +169,55 @@ func TestIsLeafFolder(t *testing.T) {
 	}
 }
 
+// TestExternalsReplicaNames covers the naming of the externals tree: the replica
+// prefix, the back-link prefix, and the rune-safe truncation both share with the
+// archive tree's "ARCH " replicas.
+func TestExternalsReplicaNames(t *testing.T) {
+	if got := externalsReplicaName("Finance"); got != "(ext) Finance" {
+		t.Errorf("externalsReplicaName = %q, want %q", got, "(ext) Finance")
+	}
+	if got := externalsBackLinkName("Finance"); got != "((new)) Finance" {
+		t.Errorf("externalsBackLinkName = %q, want %q", got, "((new)) Finance")
+	}
+	// A replica must never be named like the canonical folder it mirrors, nor
+	// like an archive replica.
+	if externalsReplicaName("Finance") == "Finance" || externalsReplicaName("Finance") == replicaName("Finance") {
+		t.Error("the externals replica name does not distinguish itself")
+	}
+	long := strings.Repeat("é", 300)
+	for _, got := range []string{externalsReplicaName(long), externalsBackLinkName(long)} {
+		if r := []rune(got); len(r) != maxReplicaNameRunes {
+			t.Errorf("truncated length = %d runes, want %d", len(r), maxReplicaNameRunes)
+		}
+	}
+	if !strings.HasPrefix(externalsReplicaName(long), extReplicaPrefix) {
+		t.Error("a truncated replica name lost its prefix")
+	}
+	if !strings.HasPrefix(externalsBackLinkName(long), extBackLinkPrefix) {
+		t.Error("a truncated back-link name lost its prefix")
+	}
+}
+
+// TestIsExternalsBackLink covers what delete's replica prune is allowed to
+// discount: our own signpost shortcuts, and nothing else.
+func TestIsExternalsBackLink(t *testing.T) {
+	if !isExternalsBackLink("((new)) Finance", shortcutMimeType) {
+		t.Error("a replica's back-link was not recognised")
+	}
+	// A folder of that name is not a shortcut, reclaim-folders' single-paren
+	// links point the other way, and a real shortcut somebody put in a replica
+	// still keeps it alive.
+	if isExternalsBackLink("((new)) Finance", folderMimeType) {
+		t.Error("a folder named like a back-link was taken for one")
+	}
+	if isExternalsBackLink("(new) Finance", shortcutMimeType) {
+		t.Error("reclaim-folders' own link was taken for a back-link")
+	}
+	if isExternalsBackLink("Budget", shortcutMimeType) {
+		t.Error("an ordinary shortcut was taken for a back-link")
+	}
+}
+
 func TestLiveLeaf(t *testing.T) {
 	sc := &drive.File{MimeType: shortcutMimeType}
 	doc := &drive.File{MimeType: "application/pdf"}

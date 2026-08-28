@@ -52,7 +52,15 @@ const archivalPendingFolderName = "Archival pending"
 // replicaName returns the archive replica folder name for an original folder
 // name: prefixed and rune-safely truncated.
 func replicaName(original string) string {
-	r := []rune(archReplicaPrefix + original)
+	return prefixedReplicaName(archReplicaPrefix, original)
+}
+
+// prefixedReplicaName prefixes an original folder's name and truncates the
+// result to maxReplicaNameRunes without splitting a rune. Shared by the archive
+// tree's "ARCH " replicas and the externals tree's "(ext) " ones, so a long name
+// is cut the same way in both.
+func prefixedReplicaName(prefix, original string) string {
+	r := []rune(prefix + original)
 	if len(r) > maxReplicaNameRunes {
 		r = r[:maxReplicaNameRunes]
 	}
@@ -64,6 +72,7 @@ func replicaName(original string) string {
 type folderBlocker struct {
 	name     string
 	driveID  string
+	mimeType string
 	known    bool   // the database has a row for this child
 	decision string // that row's decision: delete, keep, or undecided
 	archived bool   // already moved into the archive tree
@@ -74,13 +83,13 @@ type folderBlocker struct {
 // child to its database row, so a folder that will not empty can say which
 // items are holding it up. Shared by archive's and delete's emptiness gates.
 func folderBlockers(ctx context.Context, svc *drive.Service, limiter *rate.Limiter, db *sql.DB, folderID string) ([]folderBlocker, error) {
-	children, err := listChildren(ctx, svc, limiter, folderID, "nextPageToken, files(id, name)")
+	children, err := listChildren(ctx, svc, limiter, folderID, "nextPageToken, files(id, name, mimeType)")
 	if err != nil {
 		return nil, err
 	}
 	out := make([]folderBlocker, 0, len(children))
 	for _, c := range children {
-		b := folderBlocker{name: c.Name, driveID: c.Id}
+		b := folderBlocker{name: c.Name, driveID: c.Id, mimeType: c.MimeType}
 		var (
 			orig    sql.NullString
 			skipped int

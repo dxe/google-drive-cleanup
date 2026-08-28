@@ -48,7 +48,11 @@ package main
 // file keeps its original location and name, and each replica folder gets the
 // original's sharing copied onto it, so everybody who could reach the file
 // before still can. Only the ancestor folders that actually receive something
-// are created; the tree never fills up with empty placeholders.
+// are created; the tree never fills up with empty placeholders. Each replica is
+// named "(ext) <original>", so it is never taken for the canonical folder it
+// mirrors, and holds a "((new)) <original>" shortcut pointing at that folder, so
+// the way back is one click from wherever an evicted file landed. Neither name
+// is what a replica is found by on a later run: the cached Drive ID is.
 //
 // The snapshot is updated as the moves happen — replica folders and the
 // shortcuts left behind become nodes rows, moved items are reparented under
@@ -125,8 +129,14 @@ What then happens, for each item:
      folder leaving with its contents has no such link, so it does get a
      shortcut in its old place.
 
-The externals tree replicates the crawl root's folder structure, under the
-originals' own names, so an evicted file keeps its original location and name.
+The externals tree replicates the crawl root's folder structure, so an evicted
+file keeps its original location and name. Each replica folder is named
+"(ext) <original>" to keep it apart from the canonical folder it mirrors, and
+holds a "((new)) <original>" shortcut pointing at that folder so the way back is
+one click. A replica is found again by the Drive ID recorded
+for it, not by its name, and one left under its bare name by a run from before
+the "(ext) " prefix is adopted and renamed rather than duplicated.
+
 Each replica folder gets the original folder's sharing copied onto it, WITHOUT
 sending anybody a notification email, so everyone who could reach the file
 before still can; only the grants the replica does not already inherit are
@@ -167,6 +177,38 @@ func init() {
 	evictExternalsCmd.Flags().Int("concurrency", defaultMoveConcurrency, "how many item moves to run in parallel (all still share the global rate limiter)")
 }
 
+const (
+	// extReplicaPrefix marks a folder in the externals tree as a replica: it
+	// mirrors a folder of the crawl root but holds only evicted items, and must
+	// not be mistaken for the canonical folder of that name.
+	extReplicaPrefix = "(ext) "
+	// extBackLinkPrefix names the shortcut each replica holds pointing at the
+	// folder it mirrors, so somebody who lands among the evicted files can get to
+	// where they came from. The doubled parens keep it apart from
+	// reclaim-folders' "(new) <name>" links, which point the other way.
+	extBackLinkPrefix = "((new)) "
+)
+
+// externalsReplicaName returns the externals-tree replica folder name for an
+// original folder name, prefixed and rune-safely truncated like the archive
+// tree's replicas.
+func externalsReplicaName(original string) string {
+	return prefixedReplicaName(extReplicaPrefix, original)
+}
+
+// externalsBackLinkName returns the name of the shortcut inside a replica that
+// points at the original folder the replica mirrors.
+func externalsBackLinkName(original string) string {
+	return prefixedReplicaName(extBackLinkPrefix, original)
+}
+
+// isExternalsBackLink reports whether a folder's live child is one of those
+// shortcuts: the delete command's replica prune discounts them, since a pointer
+// we put there ourselves is not content keeping a folder alive.
+func isExternalsBackLink(name, mimeType string) bool {
+	return mimeType == shortcutMimeType && strings.HasPrefix(name, extBackLinkPrefix)
+}
+
 // maxBlockerExamples bounds how many offending items a refusal lists by name.
 // The counts in the message are complete; the examples are there to point at
 // where to look.
@@ -181,6 +223,7 @@ type evictStats struct {
 	files     int
 	folders   int
 	shortcuts int
+	backLinks int
 	grants    int
 	skipped   int
 }
@@ -188,6 +231,7 @@ type evictStats struct {
 func (s *evictStats) file()       { s.mu.Lock(); s.files++; s.mu.Unlock() }
 func (s *evictStats) folder()     { s.mu.Lock(); s.folders++; s.mu.Unlock() }
 func (s *evictStats) shortcut()   { s.mu.Lock(); s.shortcuts++; s.mu.Unlock() }
+func (s *evictStats) backLink()   { s.mu.Lock(); s.backLinks++; s.mu.Unlock() }
 func (s *evictStats) grant(n int) { s.mu.Lock(); s.grants += n; s.mu.Unlock() }
 func (s *evictStats) skip()       { s.mu.Lock(); s.skipped++; s.mu.Unlock() }
 
@@ -621,8 +665,8 @@ func runEvictExternals(dbPath, cfgPath, folderID string, dryRun, allowUnownedFol
 	// dry run skips this entirely (it would create folders) and previews instead.
 	if dryRun {
 		e.preview(moveCtx, plan)
-		fmt.Fprintf(os.Stderr, "\nWould evict %d file(s) and %d folder(s) into %q, creating %d shortcut(s) and copying %d grant(s) onto replica folders.\n",
-			len(plan.files), len(plan.folders), externalsFolder.Name, plan.shortcutCount(), stats.grants)
+		fmt.Fprintf(os.Stderr, "\nWould evict %d file(s) and %d folder(s) into %q, creating %d shortcut(s) where they came from, and prepare %d replica folder(s) — each pointed back at the folder it mirrors — with %d grant(s) copied onto them.\n",
+			len(plan.files), len(plan.folders), externalsFolder.Name, plan.shortcutCount(), stats.backLinks, stats.grants)
 		return nil
 	}
 
@@ -676,8 +720,8 @@ func runEvictExternals(dbPath, cfgPath, folderID string, dryRun, allowUnownedFol
 		return stats.err
 	}
 
-	log.Printf("done: %d file(s) and %d folder(s) evicted into %q, %d shortcut(s) created, %d grant(s) copied onto replica folders, %d skipped, %d failed",
-		stats.files, stats.folders, externalsFolder.Name, stats.shortcuts, stats.grants, stats.skipped, stats.failed)
+	log.Printf("done: %d file(s) and %d folder(s) evicted into %q, %d shortcut(s) created, %d replica folder(s) pointed back at their original, %d grant(s) copied onto replica folders, %d skipped, %d failed",
+		stats.files, stats.folders, externalsFolder.Name, stats.shortcuts, stats.backLinks, stats.grants, stats.skipped, stats.failed)
 	if stats.failed > 0 {
 		return fmt.Errorf("%d item(s) failed; re-run evict-externals to retry", stats.failed)
 	}
@@ -787,13 +831,20 @@ func (e *evictor) resolve(ctx context.Context, parentDriveID string) (replicaRef
 
 // ensure returns the live replica of one original folder under parentReplica,
 // resolving in order: the cached id (verified live; a trashed or deleted replica
-// is re-created), an existing same-named folder we own (adopted, so re-runs and
-// crashes never duplicate), or a newly created one. Either way the original's
-// sharing is copied onto it, which is a no-op once it is already there.
+// is re-created), an existing folder we own carrying the replica's name
+// (adopted, so re-runs and crashes never duplicate), or a newly created one.
+// Either way the original's sharing is copied onto it, which is a no-op once it
+// is already there, and it ends up holding a shortcut back to the original.
+//
+// The replica is named "(ext) <original>". Reuse does not depend on that name:
+// the cached externals_folder_drive_id is looked up first, and the by-name
+// search accepts a replica left by a run from before the prefix existed and
+// renames it, rather than building a second tree beside it.
 func (e *evictor) ensure(ctx context.Context, folder archiveTarget, parentReplica replicaRef) (replicaRef, error) {
 	if ref, ok := e.verified[folder.driveID]; ok {
 		return ref, nil
 	}
+	name := externalsReplicaName(folder.name)
 	var replica *drive.File
 	if folder.externalsFolder.Valid {
 		f, err := getFileState(ctx, e.svc, e.limiter, folder.externalsFolder.String)
@@ -807,27 +858,29 @@ func (e *evictor) ensure(ctx context.Context, folder archiveTarget, parentReplic
 		}
 	}
 	if replica == nil {
-		// Only a candidate we own counts: a same-named folder owned by somebody
-		// else is a folder that happens to share the name, not our replica.
-		matches, err := findChildrenNamed(ctx, e.svc, e.limiter, parentReplica.driveID, folder.name, folderMimeType,
-			"id, name, owners(emailAddress, permissionId)")
+		f, err := e.adoptReplica(ctx, parentReplica.driveID, name, folder.name)
 		if err != nil {
-			return replicaRef{}, fmt.Errorf("looking up replica %q: %w", folder.name, err)
+			return replicaRef{}, err
 		}
-		for _, m := range matches {
-			if ownedByAccount(m, e.me.EmailAddress) {
-				replica = m
-				break
-			}
-		}
+		replica = f
 	}
 	if replica == nil {
-		f, err := e.rec.createFolder(ctx, e.svc, e.limiter, parentReplica.driveID, folder.name)
+		f, err := e.rec.createFolder(ctx, e.svc, e.limiter, parentReplica.driveID, name)
 		if err != nil {
-			return replicaRef{}, fmt.Errorf("creating replica %q under %s: %w", folder.name, parentReplica.driveID, err)
+			return replicaRef{}, fmt.Errorf("creating replica %q under %s: %w", name, parentReplica.driveID, err)
 		}
-		detailf("OK created replica %q (%s) under %s", folder.name, f.Id, parentReplica.driveID)
+		detailf("OK created replica %q (%s) under %s", name, f.Id, parentReplica.driveID)
 		replica = f
+	}
+	// A replica from before the "(ext) " prefix — found by its cached id or by
+	// its bare name — is renamed now, so the tree converges on one naming and the
+	// next run recognises it either way.
+	if replica.Name != "" && replica.Name != name {
+		if err := e.rec.renameFile(ctx, e.svc, e.limiter, replica.Id, name); err != nil {
+			return replicaRef{}, fmt.Errorf("renaming replica %q (%s) to %q: %w", replica.Name, replica.Id, name, err)
+		}
+		detailf("OK renamed replica %q (%s) -> %q", replica.Name, replica.Id, name)
+		replica.Name = name
 	}
 
 	// The originals' sharing is what keeps an evicted file reachable by everyone
@@ -837,13 +890,13 @@ func (e *evictor) ensure(ctx context.Context, folder archiveTarget, parentReplic
 	// does not stop the eviction: a file nobody but us can see beats a file
 	// stranded in a subtree that cannot move.
 	perms, copied, err := copyMissingPermissions(ctx, e.svc, e.limiter, e.rec,
-		folder.driveID, folder.name, replica.Id, folder.name, e.me, e.stats.fail)
+		folder.driveID, folder.name, replica.Id, name, e.me, e.stats.fail)
 	if err != nil {
 		e.stats.fail("ERROR copying the sharing of %q (%s) onto its replica %s: %v", folder.name, folder.driveID, replica.Id, err)
 	}
 	e.stats.grant(copied)
 
-	rowID, err := upsertReplicaRow(e.db, replica.Id, folder.name, sql.NullInt64{Int64: parentReplica.rowID, Valid: true}, e.me.EmailAddress)
+	rowID, err := upsertReplicaRow(e.db, replica.Id, name, sql.NullInt64{Int64: parentReplica.rowID, Valid: true}, e.me.EmailAddress)
 	if err != nil {
 		return replicaRef{}, err
 	}
@@ -856,8 +909,70 @@ func (e *evictor) ensure(ctx context.Context, folder archiveTarget, parentReplic
 		return replicaRef{}, err
 	}
 	ref := replicaRef{driveID: replica.Id, rowID: rowID}
+	e.ensureBackLink(ctx, folder, ref)
 	e.verified[folder.driveID] = ref
 	return ref, nil
+}
+
+// adoptReplica looks for a replica of an original folder already sitting under
+// parentReplicaID: one named name, or — for a tree built before the "(ext) "
+// prefix — one named exactly like the original. Only a candidate we own counts;
+// a folder that happens to share the name and belongs to somebody else is not
+// our replica. Returns nil when there is nothing to adopt.
+func (e *evictor) adoptReplica(ctx context.Context, parentReplicaID, name, originalName string) (*drive.File, error) {
+	for _, candidate := range []string{name, originalName} {
+		matches, err := findChildrenNamed(ctx, e.svc, e.limiter, parentReplicaID, candidate, folderMimeType,
+			"id, name, owners(emailAddress, permissionId)")
+		if err != nil {
+			return nil, fmt.Errorf("looking up replica %q: %w", candidate, err)
+		}
+		for _, m := range matches {
+			if ownedByAccount(m, e.me.EmailAddress) {
+				return m, nil
+			}
+		}
+	}
+	return nil, nil
+}
+
+// ensureBackLink puts a shortcut to the original folder inside its replica, so
+// anyone who lands among the evicted files can reach the canonical folder they
+// came out of. Idempotent: a re-run adopts the shortcut an earlier run left.
+//
+// A failure is charged to the error budget but does not stop the run — the
+// evictions are the point, a signpost is not.
+func (e *evictor) ensureBackLink(ctx context.Context, folder archiveTarget, replica replicaRef) {
+	name := externalsBackLinkName(folder.name)
+	sc, err := e.ensureShortcut(ctx, replica.driveID, name, folder.driveID)
+	if err != nil {
+		e.stats.fail("ERROR creating the %q shortcut to %q (%s) inside its replica %s: %v",
+			name, folder.name, folder.driveID, replica.driveID, err)
+		return
+	}
+	e.stats.backLink()
+	detailf("OK replica %s holds %q (%s) -> %q (%s)", replica.driveID, sc.Name, sc.Id, folder.name, folder.driveID)
+	if err := e.recordBackLink(sc, folder.driveID, replica.rowID); err != nil {
+		e.stats.fail("ERROR recording the %q shortcut (%s): %v", name, sc.Id, err)
+	}
+}
+
+// recordBackLink makes a replica's shortcut to its original a nodes row, so the
+// snapshot describes the externals tree as it really is.
+func (e *evictor) recordBackLink(sc *drive.File, targetDriveID string, replicaRow int64) error {
+	tx, err := e.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, _, _, _, err := upsertNode(tx, node{
+		driveID: sc.Id, name: sc.Name, typ: typeShortcut, mimeType: shortcutMimeType,
+		ownerEmail: nullString(e.me.EmailAddress), ownerID: nullString(e.me.PermissionId),
+		ownerDisplay: nullString(e.me.DisplayName), shortcutTarget: nullString(targetDriveID),
+		parentID: sql.NullInt64{Int64: replicaRow, Valid: true}, canEdit: true,
+	}, true); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // recordReplicaPermissions writes a replica folder's sharing, as it stands after
@@ -1193,6 +1308,9 @@ func (e *evictor) preview(ctx context.Context, plan evictPlan) {
 					copied, folder.name, folder.driveID, e.externalsRootName)
 				e.stats.grant(copied)
 			}
+			log.Printf("WOULD make sure the replica %q holds a %q shortcut to %q (%s)",
+				externalsReplicaName(folder.name), externalsBackLinkName(folder.name), folder.name, folder.driveID)
+			e.stats.backLink()
 			provides[folder.driveID] = next
 			have = next
 		}
