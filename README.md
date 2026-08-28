@@ -359,8 +359,10 @@ nothing) until they are:
    it holds, so you can see what is at stake before choosing. If taking those
    folders wholesale is what you want, pass `--allow-unowned-folders`: the
    refusal becomes a warning, each such folder is evicted like an empty one, and
-   everything inside it travels along rather than being evicted separately (no
-   shortcut is left behind, so the folder disappears from where it used to be).
+   everything inside it travels along rather than being evicted separately. Such
+   a folder has no `(new) <name>` link of its own to travel with it, so a
+   shortcut to it is left behind where it used to be, exactly as for an evicted
+   file.
 
    The folder you pass must itself be owned by the org, too — nothing inside it
    can fix a folder that cannot go to a shared drive at all.

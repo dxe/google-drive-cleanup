@@ -21,7 +21,9 @@ package main
 //	                   leaving a shortcut to it behind in its original folder
 //	unowned folder  -> moved into the externals tree as it stands, once it is
 //	                   an empty "leaf" (see below); no shortcut is created,
-//	                   because reclaim-folders already left one behind
+//	                   because reclaim-folders already left one behind — unless
+//	                   it is leaving with its contents (see
+//	                   --allow-unowned-folders), when it gets one like a file
 //
 // "Unowned" means what it means everywhere else in this tool: an owner that is
 // neither the running account nor on one of the configured internal-domains.
@@ -39,7 +41,8 @@ package main
 //     empty except for the "(new) <name>" shortcut pointing at the replacement,
 //     and a folder like that carries nothing but itself. Every such folder is
 //     listed, and --allow-unowned-folders overrides the refusal: the folders
-//     then move out exactly like empty ones, contents and all.
+//     then move out much like empty ones, contents and all, each leaving a
+//     shortcut behind in its old place.
 //
 // The externals tree mirrors the crawl root's folder structure, so an evicted
 // file keeps its original location and name, and each replica folder gets the
@@ -104,7 +107,9 @@ Every externally-owned folder still holding content is listed before either of
 those happens, so it is clear what is at stake. With --allow-unowned-folders
 those folders are treated as leaf folders like any other: each moves into the
 externals tree as it stands, and everything inside it — owned material included
-— travels along and is not evicted in its own right.
+— travels along and is not evicted in its own right. Because such a folder holds
+no "(new) <name>" link to travel with it, a shortcut to it is left behind in the
+folder it came from, exactly as for an evicted file.
 
 What then happens, for each item:
 
@@ -114,9 +119,11 @@ What then happens, for each item:
   2. Externally-owned leaf folders move into their parent's replica, once a
      live check confirms they are still empty (or still hold just the one
      shortcut) — a folder cleared by --allow-unowned-folders skips that check,
-     since holding content is the point. No shortcut is created for them:
-     reclaim-folders already left a "(new) <name>" link inside them pointing at
-     the folder that took over, and that link travels with the folder.
+     since holding content is the point. No shortcut is created for an emptied
+     one: reclaim-folders already left a "(new) <name>" link inside it pointing
+     at the folder that took over, and that link travels with the folder. A
+     folder leaving with its contents has no such link, so it does get a
+     shortcut in its old place.
 
 The externals tree replicates the crawl root's folder structure, under the
 originals' own names, so an evicted file keeps its original location and name.
@@ -691,11 +698,18 @@ func (p evictPlan) folderNoun() string {
 
 // shortcutCount is how many shortcuts the plan would leave behind: one per
 // evicted file, except for files that are themselves shortcuts (Drive shortcuts
-// cannot point at other shortcuts) and any whose original folder is unrecorded.
+// cannot point at other shortcuts) and any whose original folder is unrecorded,
+// plus one per folder leaving with its contents. An emptied folder gets none —
+// reclaim-folders' own link travels inside it.
 func (p evictPlan) shortcutCount() int {
 	n := 0
 	for _, f := range p.files {
 		if f.typ != typeShortcut && f.parentDriveID.Valid {
+			n++
+		}
+	}
+	for _, s := range p.stuffed {
+		if s.node.parentDriveID.Valid {
 			n++
 		}
 	}
@@ -1008,11 +1022,32 @@ func (e *evictor) evictFolder(ctx context.Context, n evictNode) {
 	}
 	e.stats.folder()
 
-	// No shortcut: reclaim-folders already left a "(new) <name>" link inside this
-	// folder pointing at the folder that took its contents over, and that link
-	// travels with it. Links and bookmarks aimed at the folder keep working too —
-	// its Drive ID does not change when it moves.
-	if err := e.record(n, replica, nil); err != nil {
+	// An emptied folder needs no shortcut: reclaim-folders already left a
+	// "(new) <name>" link inside it pointing at the folder that took its contents
+	// over, and that link travels with it. A folder leaving with its contents has
+	// no such link, and what left is real material, so it gets a shortcut in its
+	// old place like an evicted file does. Either way links and bookmarks aimed
+	// at the folder keep working — its Drive ID does not change when it moves.
+	var shortcut *drive.File
+	if e.carried[n.driveID] {
+		switch {
+		case !n.parentDriveID.Valid:
+			log.Printf("WARN no shortcut left behind for folder %q (%s): its original folder is not recorded", n.name, n.driveID)
+		default:
+			sc, err := e.ensureShortcut(ctx, n.parentDriveID.String, n.name, n.driveID)
+			if err != nil {
+				// Cosmetic next to the move: charge the budget for it but carry on to
+				// the bookkeeping, so the snapshot still matches what really happened.
+				e.stats.fail("ERROR creating a shortcut to folder %q (%s) in the folder it came from (%s): %v", n.name, n.driveID, n.parentDriveID.String, err)
+			} else {
+				shortcut = sc
+				e.stats.shortcut()
+				detailf("OK created shortcut %q (%s) in %s", sc.Name, sc.Id, n.parentDriveID.String)
+			}
+		}
+	}
+
+	if err := e.record(n, replica, shortcut); err != nil {
 		e.stats.fail("ERROR recording the eviction of folder %q (%s): %v", n.name, n.driveID, err)
 	}
 }
@@ -1099,7 +1134,7 @@ func (e *evictor) preview(ctx context.Context, plan evictPlan) {
 	carried := plan.carriedDriveIDs()
 	for _, n := range plan.folders {
 		if carried[n.driveID] {
-			log.Printf("WOULD move folder %q (%s), owned by %s, into %q with everything inside it (no shortcut left behind)",
+			log.Printf("WOULD move folder %q (%s), owned by %s, into %q with everything inside it and leave a shortcut to it behind",
 				n.name, n.driveID, ownerLabelOf(n), destination(n))
 			continue
 		}

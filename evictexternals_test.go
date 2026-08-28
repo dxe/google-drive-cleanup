@@ -318,6 +318,12 @@ func TestPlanEvictionAllowUnownedFolders(t *testing.T) {
 	if plan.folderNoun() == "emptied folder(s)" {
 		t.Error("folders leaving with their contents are still described as emptied")
 	}
+	// notes.doc and snap.jpg, plus one for (old) Plans — which, unlike an emptied
+	// folder, has no "(new) <name>" link of its own to travel with it. "Empty"
+	// still gets none.
+	if got := plan.shortcutCount(); got != 3 {
+		t.Errorf("shortcuts to be left behind = %d, want 3", got)
+	}
 }
 
 func TestPlanEvictionRefusesUnownedSubtreeRoot(t *testing.T) {
