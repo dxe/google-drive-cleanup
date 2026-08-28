@@ -128,10 +128,8 @@ are preparing, though — moving that subtree into a shared drive would take the
 externals tree along with it, and `evict-externals` refuses to run in that case.
 
 `migration.dropoff-folder` is required by `archive` and `delete` as well as by
-`pack`/`unpack`: both route internally-owned **files** through the shared drive
-it lives in to move their ownership to the org. Folders cannot take that route
-(Drive moves no folder into a shared drive) and are handled another way — see
-`delete` below.
+`pack`/`unpack`: both route internally-owned files through the shared drive
+it lives in to move their ownership to the org.
 
 `crawl.root.id` and `crawl.root.name` are both required. Before crawling, the
 tool fetches the folder from Drive and verifies it really is a folder **and**
@@ -616,19 +614,22 @@ confirmation prompt with counts. Ownership decides the mechanics:
 - **Folders** owned by other internal accounts keep their owner, and have no
   equivalent route: the Drive API moves *files* into shared drives and folders
   never (the move above answers 403 for a folder), and only a folder's owner may
-  delete it. Such a folder is **handed back** to its owner instead: once empty
-  it is renamed `(deleteme) <name>` and removed from the archive tree, which
-  leaves it in its owner's My Drive. Its owner can then search their Drive for
-  `(deleteme)` and delete the whole pile in one go. The rename comes first and a
-  failed rename fails the item — the folder stays in the archive tree for the
-  next run — because a folder handed back unmarked is one nobody will find
-  again; the prefix is not applied twice if a later run retries.
+  delete it. Such a folder is **collected** instead: once empty it is renamed
+  `(deleteme) <name>` and moved into an `(emptied internal folders)` folder
+  directly under the archive root — found by name, created on first use — where
+  an IT admin can select the lot in the Drive web interface, transfer ownership
+  to themselves via shared drive and delete them.
+  Unlike `Deletion pending`, that folder is not removed when it empties: it is
+  the agreed place to look.
+  The folder's row is dropped once it has moved — what happens to it next
+  happens outside this tool.
 - **Externally-owned** items are skipped and counted (flagged `delete_skipped`)
   unless `--remove-unowned` is passed, which removes the item from its archive
   folder — Drive relocates it to its owner's My Drive with sharing intact —
   and then drops every direct permission the account can revoke, its own last.
-  An externally-owned **folder** is renamed `(deleteme) <name>` first, for the
-  same reason as above.
+  An externally-owned **folder** is renamed `(deleteme) <name>` first, so its
+  owner can pick it out of their My Drive. Externally-owned items never go to
+  the collection folder — an admin cannot take over an outsider's item either.
 
 A really-deleted item's database row is removed. Empty `ARCH ` replica folders
 are pruned afterwards (deepest first) and their originals' caches cleared;

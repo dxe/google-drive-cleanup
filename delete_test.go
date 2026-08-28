@@ -141,8 +141,8 @@ func TestLiveOwnerClassIgnoresEmptyPermissionIDs(t *testing.T) {
 // A folder owned by another internal account cannot take the dropoff route its
 // files take: Drive moves files into a shared drive and folders never, so the
 // move that flips a file's ownership to the org answers 403 for a folder. It is
-// handed back to its owner instead.
-func TestRouteForInternalFoldersAreHandedBack(t *testing.T) {
+// gathered under the archive root for an admin to take over instead.
+func TestRouteForInternalFoldersAreCollected(t *testing.T) {
 	cases := []struct {
 		class ownerClass
 		typ   string
@@ -152,7 +152,7 @@ func TestRouteForInternalFoldersAreHandedBack(t *testing.T) {
 		{ownerMine, "file", routeDelete},
 		{ownerInternal, "file", routeDropoff},
 		{ownerInternal, typeShortcut, routeDropoff},
-		{ownerInternal, typeFolder, routeHandBack},
+		{ownerInternal, typeFolder, routeCollect},
 		{ownerExternal, typeFolder, routeExternal},
 		{ownerExternal, "file", routeExternal},
 	}
@@ -163,7 +163,7 @@ func TestRouteForInternalFoldersAreHandedBack(t *testing.T) {
 	}
 }
 
-// The prefix has to survive a rename that landed in a run whose hand-back then
+// The prefix has to survive a rename that landed in a run whose move then
 // failed: the next run renames from the folder's live name, so prefixing twice
 // would leave "(deleteme) (deleteme) Plans" behind.
 func TestDeleteMeNameIsIdempotent(t *testing.T) {
