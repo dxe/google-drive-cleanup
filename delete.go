@@ -465,7 +465,10 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 		// happened.
 		detached := len(f.Parents) > 0
 		if detached {
-			if err := rec.removeFromParent(ctx, svc, limiter, t.driveID, strings.Join(f.Parents, ",")); err != nil {
+			// A 404 means the item (or the parent we were detaching it from) is
+			// already gone between the read above and now — the end state we
+			// wanted, so take it as done.
+			if err := rec.removeFromParent(ctx, svc, limiter, t.driveID, strings.Join(f.Parents, ",")); err != nil && !isNotFound(err) {
 				if ctx.Err() == nil {
 					stats.fail("ERROR removing external %q (%s) from its folder: %v", t.name, t.driveID, err)
 				}
@@ -474,8 +477,18 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 		}
 		// Best-effort permission cleanup; the item is out of our tree either way.
 		// Our own permission goes last — it is what lets us revoke the others.
+		//
+		// A 404 here is the success case, not a failure: detaching the item
+		// commonly takes our own access with it (our only grant was inherited
+		// from the folder it sat in), and the owner may also have deleted it
+		// meanwhile. Either way it is out of our reach with nothing left to
+		// revoke, so say so plainly instead of warning.
+		unreachable := false
 		perms, err := listPermissions(ctx, svc, limiter, t.driveID)
-		if err != nil {
+		switch {
+		case isNotFound(err):
+			unreachable, perms = true, nil
+		case err != nil:
 			log.Printf("WARN listing permissions on removed %q (%s): %v", t.name, t.driveID, err)
 			perms = nil
 		}
@@ -488,18 +501,25 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 				selfID = p.Id
 				continue
 			}
-			if err := rec.revokePermission(ctx, svc, limiter, t.driveID, p.Id); err != nil {
+			// A 404 means that grant (or the item) is already gone — the end
+			// state we were after.
+			if err := rec.revokePermission(ctx, svc, limiter, t.driveID, p.Id); err != nil && !isNotFound(err) {
 				log.Printf("WARN revoking permission of %s on removed %q (%s): %v", p.EmailAddress, t.name, t.driveID, err)
 			}
 		}
 		if selfID != "" {
-			if err := rec.revokePermission(ctx, svc, limiter, t.driveID, selfID); err != nil {
+			if err := rec.revokePermission(ctx, svc, limiter, t.driveID, selfID); err != nil && !isNotFound(err) {
 				log.Printf("WARN revoking own permission on removed %q (%s): %v", t.name, t.driveID, err)
 			}
 		}
-		if detached {
+		switch {
+		case unreachable && detached:
+			detailf("OK removed external %q (%s) from its folder; this account can no longer see it", t.name, t.driveID)
+		case unreachable:
+			detailf("OK external %q (%s) is no longer visible to this account", t.name, t.driveID)
+		case detached:
 			detailf("OK removed external %q (%s) from its folder", t.name, t.driveID)
-		} else {
+		default:
 			detailf("OK external %q (%s) was already outside every folder we can see", t.name, t.driveID)
 		}
 		stats.remove()
@@ -619,7 +639,17 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 			continue
 		}
 		if !empty {
-			log.Printf("SKIP folder %q (%s): not empty yet (skipped contents, or Drive's listing lags recent deletions) — re-run delete later", t.name, t.driveID)
+			// Name the contents that are holding it up, and say whether a plain
+			// re-run can clear them — see explainNotEmptyForDelete.
+			blockers, berr := folderBlockers(deleteCtx, svc, limiter, db, t.driveID)
+			if berr != nil {
+				if deleteCtx.Err() != nil {
+					break
+				}
+				log.Printf("SKIP folder %q (%s): not empty yet, and listing its contents to say why failed: %v", t.name, t.driveID, berr)
+			} else {
+				log.Printf("SKIP folder %q (%s): %s", t.name, t.driveID, explainNotEmptyForDelete(blockers))
+			}
 			stats.skipFull()
 			continue
 		}
@@ -702,15 +732,20 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 
 	// Phase 6: remove Deletion pending itself when it was used and emptied out.
 	if deletionPending != nil && deleteCtx.Err() == nil {
-		if empty, err := folderIsEmpty(deleteCtx, svc, limiter, deletionPending.Id); err != nil {
+		empty, err := folderIsEmpty(deleteCtx, svc, limiter, deletionPending.Id)
+		switch {
+		case isNotFound(err):
+			// Already gone (a concurrent run, or someone tidying up): nothing to do.
+			detailf("OK %q folder no longer exists", deletionPendingFolderName)
+		case err != nil:
 			log.Printf("WARN checking %q: %v", deletionPendingFolderName, err)
-		} else if empty {
-			if err := rec.deleteFile(deleteCtx, svc, limiter, deletionPending.Id); err != nil {
+		case empty:
+			if err := rec.deleteFile(deleteCtx, svc, limiter, deletionPending.Id); err != nil && !isNotFound(err) {
 				log.Printf("WARN removing empty %q folder: %v", deletionPendingFolderName, err)
 			} else {
 				detailf("OK removed empty %q folder", deletionPendingFolderName)
 			}
-		} else {
+		default:
 			log.Printf("%q is not empty (stranded items, or Drive's listing lags recent deletions); leaving it", deletionPendingFolderName)
 		}
 	}
