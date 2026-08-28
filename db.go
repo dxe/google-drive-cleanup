@@ -2038,6 +2038,15 @@ func subtreeNodes(db *sql.DB, rootDriveID string) ([]evictNode, error) {
 // tree: the folder it came out of is stamped (first value wins, so a re-run
 // cannot overwrite the true origin) and the row is reparented under the replica
 // folder's row, so the snapshot keeps describing where the item actually lives.
+// anyEvictedFrom reports whether anything has ever been evicted directly out of
+// the folder folderDriveID — which is to say whether its externals replica holds
+// evicted items of its own, rather than only other replicas.
+func anyEvictedFrom(db *sql.DB, folderDriveID string) (bool, error) {
+	var exists int
+	err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM nodes WHERE evicted_from_drive_id = ?)`, folderDriveID).Scan(&exists)
+	return exists != 0, err
+}
+
 func markEvicted(tx *sql.Tx, driveID, fromParentDriveID string, replicaRowID int64) error {
 	_, err := tx.Exec(`
 		UPDATE nodes SET

@@ -51,11 +51,13 @@ package main
 // are created; the tree never fills up with empty placeholders. Each replica is
 // named "(ext) <original>", so it is never taken for the canonical folder it
 // mirrors, and holds a "((new)) <original>" shortcut pointing at that folder, so
-// the way back is one click from wherever an evicted file landed. The original
-// folder gets the matching link the other way — an "(external files) <original>"
-// shortcut pointing at its replica — so the evicted files are visible from where
-// they used to be. Neither replica name is what a replica is found by on a later
-// run: the cached Drive ID is.
+// the way back is one click from wherever an evicted file landed. An original
+// folder that actually gives something up gets the matching link the other way —
+// an "(external files) <original>" shortcut pointing at its replica — so the
+// evicted files are visible from where they used to be; a folder that is only an
+// ancestor on the way to one gets none, its replica holding nothing but other
+// replicas. Neither replica name is what a replica is found by on a later run:
+// the cached Drive ID is.
 //
 // The snapshot is updated as the moves happen — replica folders and the
 // shortcuts left behind become nodes rows, moved items are reparented under
@@ -136,10 +138,12 @@ The externals tree replicates the crawl root's folder structure, so an evicted
 file keeps its original location and name. Each replica folder is named
 "(ext) <original>" to keep it apart from the canonical folder it mirrors, and
 holds a "((new)) <original>" shortcut pointing at that folder so the way back is
-one click. The original folder gets the link the other way at the same time: an
-"(external files) <original>" shortcut pointing at its replica, created once and
-never duplicated — if a shortcut of that name is already there it is left as it
-stands. A replica is found again by the Drive ID recorded
+one click. A folder that actually parts with items of its own gets the link the
+other way at the same time: an "(external files) <original>" shortcut pointing
+at its replica, created once and never duplicated — if a shortcut of that name
+is already there it is left as it stands. A folder that merely sits on the way
+to one gets no such shortcut, since its replica holds nothing but other
+replicas. A replica is found again by the Drive ID recorded
 for it, not by its name, and one left under its bare name by a run from before
 the "(ext) " prefix is adopted and renamed rather than duplicated.
 
@@ -676,6 +680,7 @@ func runEvictExternals(dbPath, cfgPath, folderID string, dryRun, allowUnownedFol
 		root:              replicaRef{driveID: externalsFolder.Id},
 		verified:          make(map[string]replicaRef),
 		carried:           plan.carriedDriveIDs(),
+		receiving:         plan.receivingDriveIDs(),
 	}
 
 	// Resolve every replica folder up front, sequentially: the concurrent move
@@ -683,8 +688,8 @@ func runEvictExternals(dbPath, cfgPath, folderID string, dryRun, allowUnownedFol
 	// dry run skips this entirely (it would create folders) and previews instead.
 	if dryRun {
 		e.preview(moveCtx, plan)
-		fmt.Fprintf(os.Stderr, "\nWould evict %d file(s) and %d folder(s) into %q, creating %d shortcut(s) where they came from, and prepare %d replica folder(s) — each pointed back at the folder it mirrors, and pointed at from it — with %d grant(s) copied onto them.\n",
-			len(plan.files), len(plan.folders), externalsFolder.Name, plan.shortcutCount(), stats.backLinks, stats.grants)
+		fmt.Fprintf(os.Stderr, "\nWould evict %d file(s) and %d folder(s) into %q, creating %d shortcut(s) where they came from, and prepare %d replica folder(s) — each pointed back at the folder it mirrors, %d of them pointed at from it in turn — with %d grant(s) copied onto them.\n",
+			len(plan.files), len(plan.folders), externalsFolder.Name, plan.shortcutCount(), stats.backLinks, stats.forwardLinks, stats.grants)
 		return nil
 	}
 
@@ -798,6 +803,19 @@ func (p evictPlan) parentDriveIDs() []string {
 	return out
 }
 
+// receivingDriveIDs is the set of original folders that part with items of
+// their own in this run — the parents in the plan. Their replicas are the ones
+// that end up holding evicted items directly, as opposed to the ancestor
+// replicas created merely to get to them.
+func (p evictPlan) receivingDriveIDs() map[string]bool {
+	parents := p.parentDriveIDs()
+	out := make(map[string]bool, len(parents))
+	for _, id := range parents {
+		out[id] = true
+	}
+	return out
+}
+
 // evictor carries everything one run needs: the Drive client and its shared rate
 // limiter, the audit-log recorder, who we are, and the replica folders resolved
 // so far.
@@ -824,6 +842,12 @@ type evictor struct {
 	// to leave with their contents, which is what waives the live leaf check for
 	// them — and only for them.
 	carried map[string]bool
+
+	// receiving holds the Drive IDs of the folders that part with items of their
+	// own in this run, so a replica that only exists to hold other replicas can
+	// be told apart from one that actually receives something. See
+	// ensureForwardLink.
+	receiving map[string]bool
 }
 
 // resolve returns the replica folder that the contents of the original folder
@@ -929,7 +953,9 @@ func (e *evictor) ensure(ctx context.Context, folder archiveTarget, parentReplic
 	}
 	ref := replicaRef{driveID: replica.Id, rowID: rowID}
 	e.ensureBackLink(ctx, folder, ref)
-	e.ensureForwardLink(ctx, folder, ref)
+	if e.givesUpItems(folder) {
+		e.ensureForwardLink(ctx, folder, ref)
+	}
 	e.verified[folder.driveID] = ref
 	return ref, nil
 }
@@ -976,11 +1002,30 @@ func (e *evictor) ensureBackLink(ctx context.Context, folder archiveTarget, repl
 	}
 }
 
+// givesUpItems reports whether an original folder parts with items of its own —
+// in this run, or in an earlier one — rather than merely being an ancestor on
+// the way to a folder that does. Only such a folder is worth a forward link: a
+// replica holding nothing but other replicas has nothing to show somebody who
+// followed a signpost to it.
+func (e *evictor) givesUpItems(folder archiveTarget) bool {
+	if e.receiving[folder.driveID] {
+		return true
+	}
+	evicted, err := anyEvictedFrom(e.db, folder.driveID)
+	if err != nil {
+		log.Printf("WARN checking whether anything was evicted out of %q (%s) before: %v; leaving it unlinked to its replica",
+			folder.name, folder.driveID, err)
+		return false
+	}
+	return evicted
+}
+
 // ensureForwardLink puts a shortcut to the replica inside the original folder,
 // so somebody standing where the files used to be can see where they went —
-// the counterpart of ensureBackLink, pointing the other way. It is created
-// once: any shortcut already carrying the name is left as it is, whatever it
-// points at, rather than a second one being piled on beside it.
+// the counterpart of ensureBackLink, pointing the other way. Only folders that
+// give something up get one (see givesUpItems). It is created once: any
+// shortcut already carrying the name is left as it is, whatever it points at,
+// rather than a second one being piled on beside it.
 //
 // A failure is charged to the error budget but does not stop the run, for the
 // same reason as the back-link: the evictions are the point, a signpost is not.
@@ -1383,9 +1428,11 @@ func (e *evictor) preview(ctx context.Context, plan evictPlan) {
 			log.Printf("WOULD make sure the replica %q holds a %q shortcut to %q (%s)",
 				externalsReplicaName(folder.name), externalsBackLinkName(folder.name), folder.name, folder.driveID)
 			e.stats.backLink()
-			log.Printf("WOULD make sure %q (%s) holds a %q shortcut to its replica %q",
-				folder.name, folder.driveID, externalsForwardLinkName(folder.name), externalsReplicaName(folder.name))
-			e.stats.forwardLink()
+			if e.givesUpItems(folder) {
+				log.Printf("WOULD make sure %q (%s) holds a %q shortcut to its replica %q",
+					folder.name, folder.driveID, externalsForwardLinkName(folder.name), externalsReplicaName(folder.name))
+				e.stats.forwardLink()
+			}
 			provides[folder.driveID] = next
 			have = next
 		}

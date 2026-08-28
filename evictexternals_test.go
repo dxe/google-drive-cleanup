@@ -255,6 +255,51 @@ func TestRecordLink(t *testing.T) {
 	}
 }
 
+// TestForwardLinkOnlyWhereItemsLeave checks the rule that decides which original
+// folders get an "(external files)" shortcut: the ones whose replica actually
+// receives items, not the ancestors created on the way to them.
+func TestForwardLinkOnlyWhereItemsLeave(t *testing.T) {
+	db := testDB(t)
+	nodes := buildEvictTree(t, db)
+	byID := map[string]evictNode{}
+	for _, n := range nodes {
+		byID[n.driveID] = n
+	}
+	plan, err := planEviction(nodes, evictMe, evictDomains, "Team", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Team parts with notes.doc and the two emptied folders, Photos with
+	// snap.jpg; Root only holds Team, so its replica would hold only replicas.
+	receiving := plan.receivingDriveIDs()
+	if !receiving["Team"] || !receiving["Photos"] {
+		t.Errorf("receivingDriveIDs = %v, want Team and Photos", receiving)
+	}
+	if receiving["root"] {
+		t.Error("the crawl root parts with nothing of its own, so it must not be linked to a replica")
+	}
+
+	// A folder left out of this run's plan is still linked when an earlier run
+	// evicted something out of it, which is what the snapshot records.
+	e := &evictor{db: db, me: evictMe, receiving: receiving}
+	photos := archiveTarget{rowID: byID["Photos"].rowID, driveID: "Photos", name: "Photos"}
+	empty := archiveTarget{rowID: byID["Team"].rowID, driveID: "Nothing-left-here", name: "Elsewhere"}
+	if e.givesUpItems(empty) {
+		t.Error("a folder nothing has ever been evicted out of must not be linked to a replica")
+	}
+	replicaRow, err := upsertReplicaRow(db, "Photos-replica", "(ext) Photos", sql.NullInt64{}, "me@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.record(byID["snap"], replicaRef{driveID: "Photos-replica", rowID: replicaRow}, nil); err != nil {
+		t.Fatal(err)
+	}
+	e.receiving = map[string]bool{}
+	if !e.givesUpItems(photos) {
+		t.Error("a folder an earlier run evicted snap.jpg out of must still be linked to its replica")
+	}
+}
+
 // TestIsExternalsBackLink covers what delete's replica prune is allowed to
 // discount: our own signpost shortcuts, and nothing else.
 func TestIsExternalsBackLink(t *testing.T) {
