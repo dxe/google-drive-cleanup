@@ -137,3 +137,53 @@ func TestLiveOwnerClassIgnoresEmptyPermissionIDs(t *testing.T) {
 		t.Errorf("liveOwnerClass with empty permission ids = %d, want %d", got, ownerExternal)
 	}
 }
+
+// A folder owned by another internal account cannot take the dropoff route its
+// files take: Drive moves files into a shared drive and folders never, so the
+// move that flips a file's ownership to the org answers 403 for a folder. It is
+// handed back to its owner instead.
+func TestRouteForInternalFoldersAreHandedBack(t *testing.T) {
+	cases := []struct {
+		class ownerClass
+		typ   string
+		want  deleteRoute
+	}{
+		{ownerMine, typeFolder, routeDelete},
+		{ownerMine, "file", routeDelete},
+		{ownerInternal, "file", routeDropoff},
+		{ownerInternal, typeShortcut, routeDropoff},
+		{ownerInternal, typeFolder, routeHandBack},
+		{ownerExternal, typeFolder, routeExternal},
+		{ownerExternal, "file", routeExternal},
+	}
+	for _, c := range cases {
+		if got := routeFor(c.class, c.typ); got != c.want {
+			t.Errorf("routeFor(class %d, %q) = %d, want %d", c.class, c.typ, got, c.want)
+		}
+	}
+}
+
+// The prefix has to survive a rename that landed in a run whose hand-back then
+// failed: the next run renames from the folder's live name, so prefixing twice
+// would leave "(deleteme) (deleteme) Plans" behind.
+func TestDeleteMeNameIsIdempotent(t *testing.T) {
+	if got := deleteMeName("Plans"); got != "(deleteme) Plans" {
+		t.Errorf("deleteMeName(%q) = %q", "Plans", got)
+	}
+	if got := deleteMeName("(deleteme) Plans"); got != "(deleteme) Plans" {
+		t.Errorf("deleteMeName on an already-prefixed name = %q, want it unchanged", got)
+	}
+}
+
+// An item in a shared drive has no owner at all, and the log lines naming one
+// must not index into an empty list.
+func TestLiveOwnerNameWithoutAnOwner(t *testing.T) {
+	if got := liveOwnerName(&drive.File{Owners: []*drive.User{{EmailAddress: "them@example.com"}}}); got != "them@example.com" {
+		t.Errorf("liveOwnerName = %q, want them@example.com", got)
+	}
+	for _, f := range []*drive.File{{}, {Owners: []*drive.User{{}}}} {
+		if got := liveOwnerName(f); got == "" || strings.Contains(got, "@") {
+			t.Errorf("liveOwnerName(%+v) = %q, want a placeholder", f, got)
+		}
+	}
+}

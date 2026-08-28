@@ -5,14 +5,20 @@ package main
 // Ownership decides the mechanics:
 //
 //   - items the running account owns are deleted directly;
-//   - items owned by other INTERNAL accounts (config internal-domains) cannot
+//   - FILES owned by other INTERNAL accounts (config internal-domains) cannot
 //     be deleted directly, but moving them into a shared drive flips ownership
 //     to the org — they go through a "Deletion pending" folder inside the
 //     dropoff shared drive and are deleted there;
+//   - FOLDERS owned by other internal accounts have no such route: Drive moves
+//     a file into a shared drive but never a folder. They are handed back to
+//     their owner instead — renamed "(deleteme) <name>" and removed from the
+//     archive tree, which leaves them in their owner's My Drive, empty (a
+//     folder is only ever touched once nothing is left inside it) and carrying
+//     a prefix that lists the whole set in one search for bulk deletion;
 //   - EXTERNALLY-owned items are skipped (and flagged delete_skipped) unless
-//     --remove-unowned is given, which removes them from their folder — Drive
-//     relocates them to their owner's My Drive — and then drops every direct
-//     permission, the running account's own last.
+//     --remove-unowned is given, which hands them back the same way — a folder
+//     renamed first — and then drops every direct permission, the running
+//     account's own last.
 //
 // The snapshot's owner only decides which bucket an item starts in; before
 // anything irreversible the live owner decides what actually happens to it, in
@@ -48,9 +54,27 @@ import (
 )
 
 // deletionPendingFolderName is the working folder created inside the dropoff
-// shared drive for internally-owned items: moving them there flips their
-// ownership to the org so they become deletable. Removed again when empty.
+// shared drive for internally-owned files: moving a file there flips its
+// ownership to the org so it becomes deletable. Removed again when empty.
 const deletionPendingFolderName = "Deletion pending"
+
+// deleteMePrefix is put in front of a folder's name just before delete hands it
+// back to its owner, because that is all this account can do with a folder it
+// does not own: only an owner may delete a folder, and the shared-drive route
+// that flips a FILE's ownership to the org does not exist for folders (Drive
+// refuses to move one into a shared drive at all). The folder lands in its
+// owner's My Drive emptied, and the prefix is what makes the pile of them
+// findable in one search so its owner can delete the lot.
+const deleteMePrefix = "(deleteme) "
+
+// deleteMeName returns name carrying deleteMePrefix. Idempotent, so a folder an
+// earlier run renamed but did not manage to hand back is not prefixed twice.
+func deleteMeName(name string) string {
+	if strings.HasPrefix(name, deleteMePrefix) {
+		return name
+	}
+	return deleteMePrefix + name
+}
 
 var deleteCmd = &cobra.Command{
 	Use:   "delete",
@@ -59,14 +83,19 @@ var deleteCmd = &cobra.Command{
 tree. Only archived items (with their original parent recorded) that are still
 marked delete are touched, and a confirmation with counts is asked first.
 
-Items owned by the running account are deleted directly. Items owned by other
+Items owned by the running account are deleted directly. FILES owned by other
 internal accounts (config internal-domains) are moved into a "Deletion pending"
 folder inside the dropoff shared drive — the move flips their ownership to the
 org — and deleted there; this requires the Google Workspace privilege "Move any
-file or folder into shared drives" (see the README). Externally-owned items are
+file or folder into shared drives" (see the README). FOLDERS owned by other
+internal accounts cannot take that route, since Drive moves a file into a shared
+drive but never a folder: an emptied one is renamed "(deleteme) <name>" and
+removed from the archive tree instead, which leaves it in its owner's My Drive
+for them to find by that prefix and delete in bulk. Externally-owned items are
 skipped and counted unless --remove-unowned is given, which removes them from
 their archive folder (Drive relocates them to their owner's My Drive, sharing
-intact) and then drops every direct permission, the running account's own last.
+intact; a folder is renamed "(deleteme) <name>" first) and then drops every
+direct permission, the running account's own last.
 
 An archived folder is deleted once a live listing shows nothing inside it but
 items this run already removed, and the "ARCH " replica folders that mirror the
@@ -138,6 +167,44 @@ func liveOwnerClass(f *drive.File, me *drive.User, internalDomains []string) own
 		return ownerInternal
 	}
 	return ownerExternal
+}
+
+// liveOwnerName names the owner Drive reports for an item, for a log line. An
+// item living in a shared drive has no owner at all.
+func liveOwnerName(f *drive.File) string {
+	if len(f.Owners) == 0 || f.Owners[0].EmailAddress == "" {
+		return "(nobody this account can see)"
+	}
+	return f.Owners[0].EmailAddress
+}
+
+// deleteRoute is what delete can actually do with one item, once its owner and
+// its type are both known.
+type deleteRoute int
+
+const (
+	routeDelete   deleteRoute = iota // delete it directly
+	routeDropoff                     // via "Deletion pending" in the dropoff shared drive
+	routeHandBack                    // rename "(deleteme) " and leave it with its owner
+	routeExternal                    // skip it, or hand it back under --remove-unowned
+)
+
+// routeFor picks an item's route. It exists for its one asymmetry: a FILE owned
+// by another internal account can be deleted after a move into the dropoff
+// shared drive flips its ownership to the org, but a FOLDER cannot — the Drive
+// API moves files into shared drives and folders never — so an internally-owned
+// folder is handed back to its owner instead of being routed at a 403.
+func routeFor(class ownerClass, typ string) deleteRoute {
+	switch class {
+	case ownerMine:
+		return routeDelete
+	case ownerInternal:
+		if typ == typeFolder {
+			return routeHandBack
+		}
+		return routeDropoff
+	}
+	return routeExternal
 }
 
 // itemOutcome is what one item's handler managed to do with it on the Drive
@@ -263,6 +330,7 @@ type deleteStats struct {
 	deleted    int
 	viaDropoff int
 	removed    int // externally-owned items removed from their folders (--remove-unowned)
+	handedBack int // folders renamed "(deleteme) " and left with their internal owner
 	skipped    int // externally-owned items skipped (no --remove-unowned)
 	notEmpty   int
 	pruned     int
@@ -271,6 +339,7 @@ type deleteStats struct {
 func (s *deleteStats) del()          { s.mu.Lock(); s.deleted++; s.mu.Unlock() }
 func (s *deleteStats) dropoff()      { s.mu.Lock(); s.viaDropoff++; s.mu.Unlock() }
 func (s *deleteStats) remove()       { s.mu.Lock(); s.removed++; s.mu.Unlock() }
+func (s *deleteStats) handBack()     { s.mu.Lock(); s.handedBack++; s.mu.Unlock() }
 func (s *deleteStats) skip()         { s.mu.Lock(); s.skipped++; s.mu.Unlock() }
 func (s *deleteStats) skipFull()     { s.mu.Lock(); s.notEmpty++; s.mu.Unlock() }
 func (s *deleteStats) prune()        { s.mu.Lock(); s.pruned++; s.mu.Unlock() }
@@ -290,7 +359,7 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 		return fmt.Errorf("%s: %w", cfgPath, err)
 	}
 	// The dropoff folder is validated eagerly even though it is only used for
-	// internally-owned items, so a broken config fails before anything deletes.
+	// internally-owned files, so a broken config fails before anything deletes.
 	if err := cfg.Migration.DropoffFolder.validate("migration.dropoff-folder"); err != nil {
 		return fmt.Errorf("%s: %w", cfgPath, err)
 	}
@@ -388,7 +457,7 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 		return err
 	}
 	if dropoff.DriveId == "" {
-		return fmt.Errorf("dropoff folder %s is not in a shared drive; moving internally-owned items there would not flip their ownership to the org", dropoff.Id)
+		return fmt.Errorf("dropoff folder %s is not in a shared drive; moving internally-owned files there would not flip their ownership to the org", dropoff.Id)
 	}
 
 	// Split the work by owner class up front, for the confirmation counts and
@@ -404,9 +473,14 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 			externalF = append(externalF, t)
 		}
 	}
-	var externalFolders int
+	var mineFolders, handBackFolders, externalFolders int
 	for _, t := range folders {
-		if classifyOwner(t, me, cfg.InternalDomains) == ownerExternal {
+		switch routeFor(classifyOwner(t, me, cfg.InternalDomains), t.typ) {
+		case routeDelete:
+			mineFolders++
+		case routeHandBack:
+			handBackFolders++
+		default:
 			externalFolders++
 		}
 	}
@@ -421,8 +495,9 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 		externalNote = "removed from their folders and unshared (--remove-unowned)"
 	}
 	summaryLine := fmt.Sprintf(
-		"%d archived file(s) and %d archived folder(s): %d owned by %s, %d owned by internal accounts (via the %q shared drive), %d externally owned (%s).",
-		len(files), len(folders), len(mineF), me.EmailAddress, len(internalF), dropoff.Name, len(externalF)+externalFolders, externalNote)
+		"%d archived file(s) and %d archived folder(s): %d owned by %s, %d file(s) owned by internal accounts (via the %q shared drive), %d folder(s) owned by internal accounts (renamed %q and left in their owner's My Drive), %d externally owned (%s).",
+		len(files), len(folders), len(mineF)+mineFolders, me.EmailAddress, len(internalF), dropoff.Name,
+		handBackFolders, deleteMePrefix+"…", len(externalF)+externalFolders, externalNote)
 	if dryRun {
 		fmt.Fprintf(os.Stderr, "DRY RUN: no changes will be made. Would permanently delete %s\n", summaryLine)
 	} else {
@@ -446,7 +521,7 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 	prog := newProgress()
 
 	// deletionPending lazily finds or creates the working folder in the dropoff
-	// shared drive; created only if an internally-owned item actually needs it.
+	// shared drive; created only if an internally-owned file actually needs it.
 	var deletionPending *drive.File
 	ensureDeletionPending := func(ctx context.Context) (*drive.File, error) {
 		if deletionPending != nil {
@@ -502,10 +577,12 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 		return outcomeFailed
 	}
 
-	// deleteViaDropoff handles an internally-owned item: move it into the
+	// deleteViaDropoff handles an internally-owned FILE: move it into the
 	// Deletion pending folder (the move into the shared drive flips ownership
 	// to the org; requires the Workspace "Move any file or folder into shared
-	// drives" privilege), then delete it there. Runs sequentially.
+	// drives" privilege), then delete it there. Runs sequentially. A folder
+	// cannot come this way — Drive moves no folder into a shared drive — and is
+	// handed back to its owner instead (see handBackFolder).
 	deleteViaDropoff := func(ctx context.Context, t archiveTarget) itemOutcome {
 		if dryRun {
 			log.Printf("WOULD move %s %q (%s), owned by %s, into %q in the dropoff shared drive and delete it there",
@@ -555,7 +632,7 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 		return outcomeGone
 	}
 
-	// queueInternal hands an item to phase 3's dropoff queue. Reached from the
+	// queueInternal hands a FILE to phase 3's dropoff queue. Reached from the
 	// concurrent phases when Drive's live owner contradicts the snapshot's, so
 	// many workers may hit it at once — hence the mutex; phase 3 reads the
 	// queue only after those pools have drained.
@@ -567,72 +644,69 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 		// Re-queued, not dealt with: phase 3 decides its row's fate.
 		return outcomeSkipped
 	}
-	// rerouteInternal is where an item the snapshot called externally owned
-	// goes once Drive says an internal account owns it. Phases 1-2 queue it for
-	// phase 3; phase 4 runs after that queue has drained and is sequential, so
-	// it is re-pointed at deleteViaDropoff before then.
-	rerouteInternal := queueInternal
+	// rerouteInternal is where an item the snapshot called externally owned goes
+	// once Drive says an internal account owns it, handed the live state its
+	// caller already read. Phases 1-2 deal in files and queue it for phase 3;
+	// phase 4 runs after that queue has drained and is sequential, so it is
+	// re-pointed there at the handling a folder needs before then.
+	rerouteInternal := func(t archiveTarget, _ *drive.File) itemOutcome { return queueInternal(t) }
 
-	// handleExternal skips (and flags) an externally-owned item, or with
-	// --remove-unowned removes it from its folder — Drive relocates it to its
-	// owner's My Drive, sharing intact — and then drops every direct
-	// permission it can, the running account's own last.
-	//
-	// The recorded owner only decides which items get here; what actually
-	// happens to one is decided by the owner Drive reports now. A snapshot can
-	// name an owner the item no longer has — or never had: the "(new) <name>"
-	// shortcuts reclaim-folders leaves inside a folder it replaced belong to
-	// the running account, yet have been crawled as owned by the account owning
-	// the folder around them. Removing the only parent of an item we own is not
-	// something Drive allows (it answers 400 badRequest, since that would
-	// orphan it), and it is not what we want either: an item of ours in the
-	// archive is there to be deleted. So a live re-read reroutes it, the mirror
-	// of what phase 1 does when the snapshot claims an item we do not own.
-	handleExternal := func(ctx context.Context, t archiveTarget) itemOutcome {
-		owner := "(unknown)"
+	// ownerOf names an item's recorded owner for a log line.
+	ownerOf := func(t archiveTarget) string {
 		if t.ownerEmail.Valid {
-			owner = t.ownerEmail.String
+			return t.ownerEmail.String
 		}
-		if !removeUnowned {
-			if dryRun {
-				log.Printf("WOULD skip %s %q (%s): externally owned by %s", t.typ, t.name, t.driveID, owner)
-			} else {
-				detailf("SKIP %q (%s): externally owned by %s", t.name, t.driveID, owner)
-				if err := markDeleteSkipped(db, t.driveID); err != nil {
-					log.Printf("WARN flagging skipped %q (%s): %v", t.name, t.driveID, err)
-				}
-			}
-			stats.skip()
-			return outcomeSkipped
+		return "(unknown)"
+	}
+
+	// renameForHandBack prefixes a folder about to leave our tree for its
+	// owner's My Drive with "(deleteme) ", reporting whether it may go.
+	//
+	// The rename is not bookkeeping that can be skipped when it fails: a folder
+	// handed back unmarked is one its owner has no way to pick out of their My
+	// Drive again, and once it is out of our tree we generally cannot rename it
+	// either (the access we had was the archive folder's). So a failed rename
+	// fails the item, leaving it in the archive tree for the next run — where
+	// deleteMeName, being idempotent, will not prefix a rename that did land.
+	renameForHandBack := func(ctx context.Context, t archiveTarget, f *drive.File) bool {
+		name := deleteMeName(f.Name)
+		if name == f.Name {
+			return true
 		}
-		if dryRun {
-			log.Printf("WOULD remove %s %q (%s), externally owned by %s, from its folder (it lands in the owner's My Drive) and drop its direct permissions",
-				t.typ, t.name, t.driveID, owner)
-			stats.remove()
-			return outcomeSkipped
-		}
-		f, err := getFileState(ctx, svc, limiter, t.driveID)
-		if isNotFound(err) {
-			detailf("OK %q (%s): no longer exists", t.name, t.driveID)
-			stats.del()
-			return outcomeGone
-		}
-		if err != nil {
+		if err := rec.renameFile(ctx, svc, limiter, t.driveID, name); err != nil {
 			if ctx.Err() == nil {
-				stats.fail("ERROR fetching external %q (%s): %v", t.name, t.driveID, err)
+				stats.fail("ERROR renaming folder %q (%s) to %q before handing it back to its owner: %v", t.name, t.driveID, name, err)
 			}
-			return outcomeFailed
+			return false
 		}
-		switch liveOwnerClass(f, me, cfg.InternalDomains) {
-		case ownerMine:
-			log.Printf("NOTE %q (%s) is owned by this account, not %s (the snapshot was wrong); deleting it instead of removing it from its folder",
-				t.name, t.driveID, owner)
-			return deleteOwned(ctx, t)
-		case ownerInternal:
-			log.Printf("NOTE %q (%s) is owned by %s, not %s (the snapshot was wrong); routing it via %q instead of removing it from its folder",
-				t.name, t.driveID, f.Owners[0].EmailAddress, owner, deletionPendingFolderName)
-			t.ownerEmail = nullString(f.Owners[0].EmailAddress)
-			return rerouteInternal(t)
+		detailf("OK renamed folder %q (%s) to %q", t.name, t.driveID, name)
+		return true
+	}
+
+	// skipExternal leaves an externally-owned item alone (no --remove-unowned)
+	// and flags the row, so a later run — and the review UI — can see why it is
+	// still there.
+	skipExternal := func(t archiveTarget) itemOutcome {
+		if dryRun {
+			log.Printf("WOULD skip %s %q (%s): externally owned by %s", t.typ, t.name, t.driveID, ownerOf(t))
+		} else {
+			detailf("SKIP %q (%s): externally owned by %s", t.name, t.driveID, ownerOf(t))
+			if err := markDeleteSkipped(db, t.driveID); err != nil {
+				log.Printf("WARN flagging skipped %q (%s): %v", t.name, t.driveID, err)
+			}
+		}
+		stats.skip()
+		return outcomeSkipped
+	}
+
+	// removeExternal hands an externally-owned item back to its owner, from live
+	// state its caller has already read and vetted: a folder renamed first, then
+	// the item removed from its folder — Drive relocates it to its owner's My
+	// Drive, sharing intact — and then every direct permission we can drop
+	// dropped, the running account's own last.
+	removeExternal := func(ctx context.Context, t archiveTarget, f *drive.File) itemOutcome {
+		if t.typ == typeFolder && !renameForHandBack(ctx, t, f) {
+			return outcomeFailed
 		}
 		// Nothing to detach when Drive reports no parent we can see: the item is
 		// already out of our tree, which is the end state either way. Remember
@@ -701,12 +775,134 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 		return outcomeGone
 	}
 
+	// handleExternal skips (and flags) an externally-owned item, or with
+	// --remove-unowned removes it from its folder and unshares it.
+	//
+	// The recorded owner only decides which items get here; what actually
+	// happens to one is decided by the owner Drive reports now. A snapshot can
+	// name an owner the item no longer has — or never had: the "(new) <name>"
+	// shortcuts reclaim-folders leaves inside a folder it replaced belong to
+	// the running account, yet have been crawled as owned by the account owning
+	// the folder around them. Removing the only parent of an item we own is not
+	// something Drive allows (it answers 400 badRequest, since that would
+	// orphan it), and it is not what we want either: an item of ours in the
+	// archive is there to be deleted. So a live re-read reroutes it, the mirror
+	// of what phase 1 does when the snapshot claims an item we do not own.
+	handleExternal := func(ctx context.Context, t archiveTarget) itemOutcome {
+		if !removeUnowned {
+			return skipExternal(t)
+		}
+		if dryRun {
+			renamed := ""
+			if t.typ == typeFolder {
+				renamed = fmt.Sprintf(", renamed %q first", deleteMeName(t.name))
+			}
+			log.Printf("WOULD remove %s %q (%s), externally owned by %s, from its folder%s (it lands in the owner's My Drive) and drop its direct permissions",
+				t.typ, t.name, t.driveID, ownerOf(t), renamed)
+			stats.remove()
+			return outcomeSkipped
+		}
+		f, err := getFileState(ctx, svc, limiter, t.driveID)
+		if isNotFound(err) {
+			detailf("OK %q (%s): no longer exists", t.name, t.driveID)
+			stats.del()
+			return outcomeGone
+		}
+		if err != nil {
+			if ctx.Err() == nil {
+				stats.fail("ERROR fetching external %q (%s): %v", t.name, t.driveID, err)
+			}
+			return outcomeFailed
+		}
+		switch liveOwnerClass(f, me, cfg.InternalDomains) {
+		case ownerMine:
+			log.Printf("NOTE %q (%s) is owned by this account, not %s (the snapshot was wrong); deleting it instead of removing it from its folder",
+				t.name, t.driveID, ownerOf(t))
+			return deleteOwned(ctx, t)
+		case ownerInternal:
+			log.Printf("NOTE %q (%s) is owned by %s, not %s (the snapshot was wrong); handling it as an internally-owned item instead of removing it from its folder",
+				t.name, t.driveID, liveOwnerName(f), ownerOf(t))
+			t.ownerEmail = nullString(f.Owners[0].EmailAddress)
+			return rerouteInternal(t, f)
+		}
+		return removeExternal(ctx, t, f)
+	}
+
+	// handBackFolderNow hands an emptied folder back to the internal account
+	// that owns it, from live state its caller has already read and vetted: only
+	// its owner can delete a folder, and the dropoff route that gets a FILE
+	// deleted does not exist for one, so the best we can do is take it out of
+	// the archive tree — Drive drops it into its owner's My Drive — under a name
+	// telling its owner it is theirs to delete.
+	handBackFolderNow := func(ctx context.Context, t archiveTarget, f *drive.File) itemOutcome {
+		if !renameForHandBack(ctx, t, f) {
+			return outcomeFailed
+		}
+		if len(f.Parents) == 0 {
+			// Already outside every folder we can see: it is in its owner's My
+			// Drive already, which is the end state we were after.
+			detailf("OK folder %q (%s) is already outside every folder we can see, named %q for %s", t.name, t.driveID, deleteMeName(f.Name), ownerOf(t))
+			stats.handBack()
+			return outcomeGone
+		}
+		// A 404 means the folder (or the parent we were detaching it from) went
+		// away between the read and now — the end state we wanted either way.
+		if err := rec.removeFromParent(ctx, svc, limiter, t.driveID, strings.Join(f.Parents, ",")); err != nil && !isNotFound(err) {
+			if ctx.Err() == nil {
+				stats.fail("ERROR removing folder %q (%s) from the archive tree to hand it back to %s: %v", t.name, t.driveID, ownerOf(t), err)
+			}
+			return outcomeFailed
+		}
+		detailf("OK handed folder %q (%s) back to %s as %q", t.name, t.driveID, ownerOf(t), deleteMeName(f.Name))
+		stats.handBack()
+		return outcomeGone
+	}
+
+	// handBackFolder is phase 4's entry into that, and re-reads the owner first
+	// for the same reason handleExternal does: the snapshot only chose the
+	// bucket, and both of the ways it can be wrong need a different route. Ours
+	// after all, and the folder is deletable (Drive would refuse to strip the
+	// only parent off an item we own anyway); external after all, and
+	// --remove-unowned's contract decides, exactly as if the snapshot had said
+	// so from the start.
+	handBackFolder := func(ctx context.Context, t archiveTarget) itemOutcome {
+		f, err := getFileState(ctx, svc, limiter, t.driveID)
+		if isNotFound(err) {
+			detailf("OK %q (%s): no longer exists", t.name, t.driveID)
+			stats.del()
+			return outcomeGone
+		}
+		if err != nil {
+			if ctx.Err() == nil {
+				stats.fail("ERROR fetching folder %q (%s): %v", t.name, t.driveID, err)
+			}
+			return outcomeFailed
+		}
+		switch liveOwnerClass(f, me, cfg.InternalDomains) {
+		case ownerMine:
+			log.Printf("NOTE folder %q (%s) is owned by this account, not %s (the snapshot was wrong); deleting it instead of handing it back",
+				t.name, t.driveID, ownerOf(t))
+			return deleteOwned(ctx, t)
+		case ownerExternal:
+			log.Printf("NOTE folder %q (%s) is owned by %s, not %s (the snapshot was wrong); treating it as externally owned",
+				t.name, t.driveID, liveOwnerName(f), ownerOf(t))
+			if len(f.Owners) > 0 {
+				t.ownerEmail = nullString(f.Owners[0].EmailAddress)
+			}
+			if !removeUnowned {
+				return skipExternal(t)
+			}
+			return removeExternal(ctx, t, f)
+		}
+		return handBackFolderNow(ctx, t, f)
+	}
+
 	interrupted := func() bool {
 		if ctx.Err() == nil {
 			return false
 		}
-		log.Printf("interrupted: %d deleted, %d via %q, %d removed, %d skipped, %d failed",
-			stats.deleted, stats.viaDropoff, deletionPendingFolderName, stats.removed, stats.skipped, stats.failed)
+		log.Printf("interrupted: %d deleted, %d via %q, %d removed, %d folder(s) handed back, %d skipped, %d failed",
+			stats.deleted, stats.viaDropoff, deletionPendingFolderName, stats.removed, stats.handedBack, stats.skipped, stats.failed)
 		return true
 	}
 	checkpoint := func() error {
@@ -787,17 +983,33 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 	// Phase 4: archived folders, sequentially and deepest-first, each gated on
 	// a live check that nothing this run did not already delete is left inside
 	// (its archived contents went in the phases above). The dropoff queue has
-	// drained, so a folder that turns out to be internally owned goes through
-	// Deletion pending here and now rather than onto a queue nobody reads
-	// again.
-	rerouteInternal = func(t archiveTarget) itemOutcome { return deleteViaDropoff(deleteCtx, t) }
+	// drained, so an item that turns out to be internally owned is dealt with
+	// here and now — a file through Deletion pending, a folder handed back to
+	// its owner — rather than put onto a queue nobody reads again.
+	rerouteInternal = func(t archiveTarget, f *drive.File) itemOutcome {
+		if t.typ == typeFolder {
+			return handBackFolderNow(deleteCtx, t, f)
+		}
+		return deleteViaDropoff(deleteCtx, t)
+	}
 	for _, t := range folders {
 		if deleteCtx.Err() != nil {
 			break
 		}
 		if dryRun {
-			log.Printf("WOULD delete archived folder %q (%s) once empty", t.name, t.driveID)
-			stats.del()
+			// The handlers below never run in a dry run, so each route says here
+			// what it would come to.
+			switch routeFor(classifyOwner(t, me, cfg.InternalDomains), t.typ) {
+			case routeDelete:
+				log.Printf("WOULD delete archived folder %q (%s) once empty", t.name, t.driveID)
+				stats.del()
+			case routeHandBack:
+				log.Printf("WOULD rename archived folder %q (%s), owned by %s, to %q once empty and remove it from the archive tree (it lands in its owner's My Drive)",
+					t.name, t.driveID, ownerOf(t), deleteMeName(t.name))
+				stats.handBack()
+			default:
+				handleExternal(deleteCtx, t) // reports and counts its own dry run
+			}
 			continue
 		}
 		// One listing decides both questions: whether anything this run did not
@@ -822,11 +1034,11 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 			continue
 		}
 		var outcome itemOutcome
-		switch classifyOwner(t, me, cfg.InternalDomains) {
-		case ownerMine:
+		switch routeFor(classifyOwner(t, me, cfg.InternalDomains), t.typ) {
+		case routeDelete:
 			outcome = deleteOwned(deleteCtx, t)
-		case ownerInternal:
-			outcome = deleteViaDropoff(deleteCtx, t)
+		case routeHandBack:
+			outcome = handBackFolder(deleteCtx, t)
 		default:
 			outcome = handleExternal(deleteCtx, t)
 		}
@@ -938,8 +1150,8 @@ func runDelete(dbPath, cfgPath, subfolder string, dryRun, removeUnowned bool, ma
 	if dryRun {
 		verb = "would be deleted"
 	}
-	log.Printf("done: %d item(s) %s directly, %d via %q, %d externally-owned removed from their folders, %d folder(s) not yet empty, %d replica folder(s) pruned, %d failed",
-		stats.deleted, verb, stats.viaDropoff, deletionPendingFolderName, stats.removed, stats.notEmpty, stats.pruned, stats.failed)
+	log.Printf("done: %d item(s) %s directly, %d via %q, %d externally-owned removed from their folders, %d folder(s) renamed %q and handed back to their owners, %d folder(s) not yet empty, %d replica folder(s) pruned, %d failed",
+		stats.deleted, verb, stats.viaDropoff, deletionPendingFolderName, stats.removed, stats.handedBack, deleteMePrefix+"…", stats.notEmpty, stats.pruned, stats.failed)
 	if stats.skipped > 0 {
 		fmt.Fprintf(os.Stderr, "%d externally-owned item(s) skipped; re-run with --remove-unowned to remove them from their folders.\n", stats.skipped)
 	}

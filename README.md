@@ -128,8 +128,10 @@ are preparing, though — moving that subtree into a shared drive would take the
 externals tree along with it, and `evict-externals` refuses to run in that case.
 
 `migration.dropoff-folder` is required by `archive` and `delete` as well as by
-`pack`/`unpack`: both route internally-owned items through the shared drive it
-lives in to move their ownership to the org.
+`pack`/`unpack`: both route internally-owned **files** through the shared drive
+it lives in to move their ownership to the org. Folders cannot take that route
+(Drive moves no folder into a shared drive) and are handled another way — see
+`delete` below.
 
 `crawl.root.id` and `crawl.root.name` are both required. Before crawling, the
 tool fetches the folder from Drive and verifies it really is a folder **and**
@@ -602,20 +604,31 @@ only rows whose `original_parent_drive_id` is set are ever touched — after a
 confirmation prompt with counts. Ownership decides the mechanics:
 
 - Items **owned by the running account** are deleted directly.
-- Items owned by **other internal accounts** (`internal-domains` in config)
-  cannot be deleted directly, but moving an item into a shared drive flips its
+- **Files** owned by **other internal accounts** (`internal-domains` in config)
+  cannot be deleted directly, but moving a file into a shared drive flips its
   ownership to the org: they are moved into a `Deletion pending` folder inside
   the dropoff shared drive (`migration.dropoff-folder`), deleted there, and the
-  folder itself is removed once it empties. In practice this path now mostly
-  handles archived **folders**, which keep their owner — `archive` already took
-  ownership of internally-owned files on the way in. **This requires the Google
-  Workspace privilege "Move any file or folder into shared drives"** for the
-  OAuth user (or the admin enabling it for all users); without it these moves
-  fail.
+  folder itself is removed once it empties. `archive` already takes ownership of
+  internally-owned files on the way in, so few files reach this path. **This
+  requires the Google Workspace privilege "Move any file or folder into shared
+  drives"** for the OAuth user (or the admin enabling it for all users); without
+  it these moves fail.
+- **Folders** owned by other internal accounts keep their owner, and have no
+  equivalent route: the Drive API moves *files* into shared drives and folders
+  never (the move above answers 403 for a folder), and only a folder's owner may
+  delete it. Such a folder is **handed back** to its owner instead: once empty
+  it is renamed `(deleteme) <name>` and removed from the archive tree, which
+  leaves it in its owner's My Drive. Its owner can then search their Drive for
+  `(deleteme)` and delete the whole pile in one go. The rename comes first and a
+  failed rename fails the item — the folder stays in the archive tree for the
+  next run — because a folder handed back unmarked is one nobody will find
+  again; the prefix is not applied twice if a later run retries.
 - **Externally-owned** items are skipped and counted (flagged `delete_skipped`)
   unless `--remove-unowned` is passed, which removes the item from its archive
   folder — Drive relocates it to its owner's My Drive with sharing intact —
   and then drops every direct permission the account can revoke, its own last.
+  An externally-owned **folder** is renamed `(deleteme) <name>` first, for the
+  same reason as above.
 
 A really-deleted item's database row is removed. Empty `ARCH ` replica folders
 are pruned afterwards (deepest first) and their originals' caches cleared;
