@@ -659,13 +659,15 @@ func runArchive(dbPath, cfgPath, subfolder string, dryRun bool, maxErrors, concu
 				parents = append(parents, p)
 			}
 		}
-		for _, p := range parents {
+		prog := newProgress()
+		for i, p := range parents {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
 			if _, err := resolver.resolve(ctx, p); err != nil {
 				return fmt.Errorf("preparing the archive replica of folder %s: %w", p, err)
 			}
+			prog.step("progress: %d/%d replica folder(s) prepared", i+1, len(parents))
 		}
 	}
 
@@ -676,7 +678,6 @@ func runArchive(dbPath, cfgPath, subfolder string, dryRun bool, maxErrors, concu
 	if dryRun {
 		workers = 1
 	}
-	prog := newProgress()
 
 	// archivalPending lazily finds or creates the working folder in the dropoff
 	// shared drive, verifying up front that the account can move items back out
@@ -806,8 +807,9 @@ func runArchive(dbPath, cfgPath, subfolder string, dryRun bool, maxErrors, concu
 	// Permission replacement happens per file right after its move, so an
 	// interrupted run leaves no moved-but-shared stragglers beyond the items in
 	// flight.
+	progA := newProgress()
 	forEachConcurrent(moveCtx, workers, directF, func(t archiveTarget) {
-		prog.tick("progress: %d/%d file(s) archived", stats.movedCount(), len(directF))
+		progA.step("progress: %d/%d file(s) archived", stats.movedCount(), len(directF))
 		if dryRun {
 			log.Printf("WOULD move %s %q (%s) into %q", t.typ, t.name, t.driveID, destination(t))
 			if t.canEdit {
@@ -861,8 +863,9 @@ func runArchive(dbPath, cfgPath, subfolder string, dryRun bool, maxErrors, concu
 				stats.hand()
 			}
 			addReady := func(t archiveTarget) { listMu.Lock(); ready = append(ready, t); listMu.Unlock() }
+			progB := newProgress()
 			forEachConcurrent(moveCtx, workers, internalF, func(t archiveTarget) {
-				prog.tick("progress: %d/%d internally-owned file(s) handed to the org", stats.handedCount(), len(internalF))
+				progB.step("progress: %d/%d internally-owned file(s) handed to the org", stats.handedCount(), len(internalF))
 				err := rec.moveFileVerified(moveCtx, svc, limiter, t.driveID, pending.Id, t.parentDriveID.String)
 				if err == nil {
 					detailf("OK %q (%s) -> %q (ownership transferring to the org)", t.name, t.driveID, archivalPendingFolderName)
@@ -991,8 +994,9 @@ func runArchive(dbPath, cfgPath, subfolder string, dryRun bool, maxErrors, concu
 			// unshare it. The snapshot's owner columns follow the transfer; the
 			// original_owner_* columns stay frozen at what the crawl discovered.
 			base := stats.movedCount()
+			progB3 := newProgress()
 			forEachConcurrent(moveCtx, workers, ready, func(t archiveTarget) {
-				prog.tick("progress: %d/%d transferred file(s) archived", stats.movedCount()-base, len(ready))
+				progB3.step("progress: %d/%d transferred file(s) archived", stats.movedCount()-base, len(ready))
 				if !archiveOne(t, pending.Id, true) {
 					return
 				}
@@ -1027,7 +1031,8 @@ func runArchive(dbPath, cfgPath, subfolder string, dryRun bool, maxErrors, concu
 	// Folders this run reported as permanently blocked, so an ancestor whose
 	// only blocker is one of them is told the same rather than to re-run.
 	stuckFolders := map[string]bool{}
-	for _, t := range folders {
+	progC := newProgress()
+	for i, t := range folders {
 		if moveCtx.Err() != nil {
 			break
 		}
@@ -1070,6 +1075,7 @@ func runArchive(dbPath, cfgPath, subfolder string, dryRun bool, maxErrors, concu
 			continue
 		}
 		archiveOne(t, t.parentDriveID.String, false)
+		progC.step("progress: %d/%d folder(s) processed", i+1, len(folders))
 	}
 	if ctx.Err() != nil {
 		interrupted()
