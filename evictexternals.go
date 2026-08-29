@@ -106,7 +106,7 @@ The run refuses to start, changing nothing, if either of these is outstanding:
     those unwanted (and possibly unowned) items are out of the way instead of
     being evicted as if they were worth keeping;
   * an externally-owned folder in the subtree still holds content — run
-    reclaim-folders <owner> first, or pass --allow-unowned-folders. Moving such
+    reclaim-folders --email <owner> first, or pass --allow-unowned-folders. Moving such
     a folder out would take its contents with it. A folder that is empty, or
     that holds nothing but a single shortcut (the "(new) <name>" link
     reclaim-folders leaves pointing at the replacement), carries nothing but
@@ -366,7 +366,7 @@ func planEviction(nodes []evictNode, me *drive.User, internalDomains []string, s
 			return plan, fmt.Errorf("the snapshot records no owner email for %q (%s), so there is no telling whether it can go into a shared drive at all; re-crawl, and if the owner is still unknown check the folder by hand",
 				root.name, root.driveID)
 		}
-		return plan, fmt.Errorf("%q (%s) is itself owned by %s, so it cannot be moved into a shared drive at all; run `drive-cleanup reclaim-folders %s --folder %s` first to replace it with a folder you own, then prepare that replacement instead",
+		return plan, fmt.Errorf("%q (%s) is itself owned by %s, so it cannot be moved into a shared drive at all; run `drive-cleanup reclaim-folders --email %s --folder %s` first to replace it with a folder you own, then prepare that replacement instead",
 			root.name, root.driveID, root.ownerEmail.String, root.ownerEmail.String, root.driveID)
 	}
 

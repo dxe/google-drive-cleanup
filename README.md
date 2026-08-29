@@ -209,9 +209,10 @@ drive-cleanup restore 1AbCdEfGh...
 
 # Replace every folder owned by someone else with an identically-named folder
 # owned by you, moving the contents and the sharing across
-drive-cleanup reclaim-folders alice@example.com
-drive-cleanup reclaim-folders alice@example.com --subtree 1AbCdEfGh... # only that subtree
-drive-cleanup reclaim-folders alice@example.com --folder 1AbCdEfGh...  # only that one folder
+drive-cleanup reclaim-folders                                          # every external owner
+drive-cleanup reclaim-folders --email alice@example.com                # only that account
+drive-cleanup reclaim-folders --email alice@example.com --subtree 1AbCdEfGh... # only that subtree
+drive-cleanup reclaim-folders --email alice@example.com --folder 1AbCdEfGh...  # only that one folder
 
 # Clear a folder of externally-owned items so it can be moved to a shared
 # drive: they go to the externals folder, each leaving a shortcut behind
@@ -260,23 +261,41 @@ Drive lets you move a file into a folder you own, but it never lets you take a
 identically-named folder that you own, and moves the contents across.
 
 ```bash
-drive-cleanup reclaim-folders alice@example.com --dry-run
-drive-cleanup reclaim-folders alice@example.com
-drive-cleanup reclaim-folders alice@example.com --subtree 1AbCdEfGh...
-drive-cleanup reclaim-folders alice@example.com --folder 1AbCdEfGh...
+drive-cleanup reclaim-folders --dry-run                                 # every external owner
+drive-cleanup reclaim-folders
+drive-cleanup reclaim-folders --email alice@example.com --dry-run
+drive-cleanup reclaim-folders --email alice@example.com
+drive-cleanup reclaim-folders --subtree 1AbCdEfGh...
+drive-cleanup reclaim-folders --email alice@example.com --subtree 1AbCdEfGh...
+drive-cleanup reclaim-folders --folder 1AbCdEfGh...
 ```
 
-The email is matched against `owner_email` (case-insensitively) or `owner_id`.
-Unscoped, every folder they own under the crawl root is replaced (the crawl root
-itself never is, even if they own it). `--subtree` narrows that to one crawled
-folder's subtree, the folder itself included when they own it; if an earlier run
-already replaced that folder, the run follows the `(new) <name>` shortcut into
-the replacement too, since the emptied folder no longer holds what is left to
-reclaim. `--folder`
-narrows it further, to that one crawled folder and nothing below it; the folder
-must be one the snapshot says they own, and unlike the other two forms an id
-that names no target of theirs is an error rather than an empty run. The two
-flags cannot be combined. For each of their folders, shallowest first:
+`--email` names a single account to reclaim from, matched against `owner_email`
+(case-insensitively) or `owner_id`. Without it every folder owned *from outside
+the org* is replaced — owned neither by the account running the tool nor by an
+address on one of the config's `internal-domains`, the same rule
+`evict-externals` and the owners report use — and each replacement in the
+summary names the owner it came from. A folder the crawl recorded no owner email
+for is left alone in that mode: there is no telling whose it is, and guessing
+would rename and empty a colleague's folder or one of your own. An `--email`
+naming an internal account still works; the domain rule only decides what an
+unscoped run picks out for itself.
+
+Unscoped, every folder in scope under the crawl root is replaced (the crawl root
+itself never is, even if somebody else owns it). `--subtree` narrows that to one
+crawled folder's subtree, the folder itself included when it is a target; if an
+earlier run already replaced that folder, the run follows the `(new) <name>`
+shortcut into the replacement too, since the emptied folder no longer holds what
+is left to reclaim. `--folder`
+narrows it further, to that one crawled folder and nothing below it; with
+`--email` the snapshot must say that account owns it, without `--email` it must
+say the folder is externally owned (a folder of yours, a colleague's, or one of
+unrecorded ownership is refused, naming `--email` as the way to reclaim it
+anyway), and unlike the other two forms an id that names no target is an error
+rather than an empty run. `--subtree` and `--folder` cannot be combined. Drive
+gets the last word on ownership in either case: a folder that turns out to be
+yours, internally owned, or of unreadable ownership when the run reaches it is
+skipped rather than replaced. For each folder in scope, shallowest first:
 
 1. it is renamed `(old) <name>` — skipped if it already carries the prefix, so
    a re-run is a no-op rather than `(old) (old) <name>`;
@@ -353,7 +372,7 @@ nothing) until they are:
    honest one — evicting an unwanted file and leaving a shortcut to it would
    dress it up as something worth keeping.
 2. **No externally-owned folder in the subtree may still hold content.** Run
-   `reclaim-folders <owner>` first (the refusal names the owners). Moving such a
+   `reclaim-folders --email <owner>` first (the refusal names the owners). Moving such a
    folder out would take everything inside it — owned material included — along
    with it. After `reclaim-folders` each of their folders is empty except for
    the `(new) <name>` shortcut pointing at the replacement, and a folder like

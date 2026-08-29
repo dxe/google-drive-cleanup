@@ -66,13 +66,19 @@ func reclaimNames(current string) (origName, oldName string) {
 }
 
 var reclaimFoldersCmd = &cobra.Command{
-	Use:   "reclaim-folders <email>",
-	Short: "Replace folders owned by another account with folders owned by you",
-	Long: `Replace every folder owned by <email> with an identically-named folder
+	Use:   "reclaim-folders",
+	Short: "Replace folders owned by other accounts with folders owned by you",
+	Long: `Replace folders owned by somebody else with identically-named folders
 owned by the account running the tool, moving the contents across.
 
+With --email only that account's folders are replaced; without it every folder
+owned from outside the org is, whoever the owner turns out to be — that is,
+every folder owned neither by you nor by an address on one of the config's
+internal-domains. A folder the crawl recorded no owner email for is left alone
+in that mode, since there is no telling whose it is.
+
 Drive has no way to take a folder's ownership away from its owner, so each of
-their folders is superseded rather than transferred. For every folder they own,
+their folders is superseded rather than transferred. For every folder in scope,
 in the crawled tree (or, with --subtree, in that subtree, which includes the
 subtree folder itself; or, with --folder, that one folder alone):
 
@@ -116,24 +122,29 @@ re-crawl is still worth running afterwards to pick up anything created since
 the last one.
 
 At the end every replacement is printed as a pair of Drive links labelled
-"theirs" and "ours".
+"theirs" and "ours"; without --email each pair also names the owner of theirs.
+
+An --email naming an internal account still works: the domain rule only decides
+which folders an unscoped run picks out for itself.
 
 This command requires the full Drive scope. If the cached token.json only has
 read-only access, the tool re-runs consent automatically to obtain it.`,
-	Args: cobra.ExactArgs(1),
+	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dbPath, _ := cmd.Flags().GetString("db")
 		cfgPath, _ := cmd.Flags().GetString("config")
+		email, _ := cmd.Flags().GetString("email")
 		subtree, _ := cmd.Flags().GetString("subtree")
 		folder, _ := cmd.Flags().GetString("folder")
 		dryRun, _ := cmd.Flags().GetBool("dry-run")
 		maxErrors, _ := cmd.Flags().GetInt("max-errors")
 		concurrency, _ := cmd.Flags().GetInt("concurrency")
-		return runReclaimFolders(dbPath, cfgPath, args[0], subtree, folder, dryRun, maxErrors, concurrency)
+		return runReclaimFolders(dbPath, cfgPath, email, subtree, folder, dryRun, maxErrors, concurrency)
 	},
 }
 
 func init() {
+	reclaimFoldersCmd.Flags().String("email", "", "replace only the folders owned by this account; by default every folder owned from outside the org (neither yours nor on an internal domain) is replaced")
 	reclaimFoldersCmd.Flags().String("subtree", "", "Google Drive folder ID (crawled, under the crawl root) to scope the run to; the folder itself and everything below it is included. Defaults to the whole crawl root")
 	reclaimFoldersCmd.Flags().String("folder", "", "Google Drive folder ID (crawled, under the crawl root) to replace on its own; nothing below it is touched")
 	reclaimFoldersCmd.MarkFlagsMutuallyExclusive("subtree", "folder")
@@ -171,6 +182,7 @@ func (e skipErr) Error() string { return e.reason }
 type reclaimResult struct {
 	path     string // the folder's path in the crawled tree, for the heading
 	name     string // the name without the "(old) " prefix, i.e. what ours is called
+	owner    string // who Drive says owns theirs, named in the summary of a run covering every external account
 	theirsID string
 	oursID   string // empty only in a dry run, when the replacement does not exist yet
 	moved    int
@@ -222,6 +234,32 @@ func runReclaimFolders(dbPath, cfgPath, email, subtree, folder string, dryRun bo
 		scope = reclaimScope{driveID: named, path: path, recursive: subtree != ""}
 	}
 
+	ctx, cancel := cancelOnSignal()
+	defer cancel()
+
+	// Who we are is settled before the targets are picked: a run given no
+	// --email replaces everything owned by anybody but us, so it needs our own
+	// identity to know what to leave alone.
+	//
+	// A dry run only reads, so request the narrower scope — previewing never
+	// forces a write-scope re-consent.
+	driveScope := drive.DriveScope
+	if dryRun {
+		driveScope = drive.DriveReadonlyScope
+	}
+	svc, err := newDriveService(ctx, driveScope)
+	if err != nil {
+		return err
+	}
+	about, err := svc.About.Get().Fields("user").Context(ctx).Do()
+	if err != nil {
+		return fmt.Errorf("fetching current user info: %w", err)
+	}
+	me := about.User
+	if email != "" && strings.EqualFold(me.EmailAddress, email) {
+		return fmt.Errorf("%s is the account you are signed in as; reclaim-folders replaces somebody else's folders with yours", email)
+	}
+
 	var targets []reclaimTarget
 	if scope.recursive {
 		// A folder an earlier run already replaced is an emptied husk: what used to
@@ -250,10 +288,10 @@ func runReclaimFolders(dbPath, cfgPath, email, subtree, folder string, dryRun bo
 		}
 
 		// The crawl root is the boundary of the snapshot and is never renamed or
-		// replaced, even when the account being reclaimed owns it.
+		// replaced, even when it is somebody else's.
 		seen := make(map[string]bool)
 		for _, root := range roots {
-			found, err := foldersOwnedBy(db, root, email)
+			found, err := reclaimTargetsIn(db, root, email, me, cfg.InternalDomains)
 			if err != nil {
 				return err
 			}
@@ -271,48 +309,42 @@ func runReclaimFolders(dbPath, cfgPath, email, subtree, folder string, dryRun bo
 		if scope.driveID == crawlRoot {
 			return fmt.Errorf("folder %s is the crawl root; reclaim-folders never replaces the root of the crawled tree", scope.driveID)
 		}
-		t, owned, err := folderOwnedByAccount(db, scope.driveID, email)
-		if err != nil {
-			return err
+		if email != "" {
+			t, owned, err := folderOwnedByAccount(db, scope.driveID, email)
+			if err != nil {
+				return err
+			}
+			if !owned {
+				return fmt.Errorf("folder %s (%q) is not owned by %s according to the snapshot; re-run `drive-cleanup crawl` if its ownership changed since the last crawl", scope.driveID, t.name, email)
+			}
+			targets = []reclaimTarget{t}
+		} else {
+			t, mine, err := folderOwnedByAccount(db, scope.driveID, me.EmailAddress, me.PermissionId)
+			if err != nil {
+				return err
+			}
+			switch {
+			case mine:
+				return fmt.Errorf("folder %s (%q) is already owned by you according to the snapshot, so there is nothing to reclaim; re-run `drive-cleanup crawl` if its ownership changed since the last crawl", scope.driveID, t.name)
+			case t.ownerEmail == "":
+				return fmt.Errorf("the snapshot records no owner email for folder %s (%q), so there is no telling whether it is externally owned; re-crawl, or pass --email to name the account it belongs to", scope.driveID, t.name)
+			case isInternalDomain(t.ownerEmail, cfg.InternalDomains):
+				return fmt.Errorf("folder %s (%q) is owned by %s, an internal account; without --email reclaim-folders only replaces folders owned from outside the org, so pass `--email %s` to reclaim this one anyway", scope.driveID, t.name, t.ownerEmail, t.ownerEmail)
+			}
+			targets = []reclaimTarget{t}
 		}
-		if !owned {
-			return fmt.Errorf("folder %s (%q) is not owned by %s according to the snapshot; re-run `drive-cleanup crawl` if its ownership changed since the last crawl", scope.driveID, t.name, email)
-		}
-		targets = []reclaimTarget{t}
 	}
 	if len(targets) == 0 {
-		fmt.Fprintf(os.Stderr, "No folders owned by %s%s; nothing to do.\n", email, scope.note())
+		fmt.Fprintf(os.Stderr, "No folders owned by %s%s; nothing to do.\n", reclaimOwnerNote(email), scope.note())
 		return nil
-	}
-
-	ctx, cancel := cancelOnSignal()
-	defer cancel()
-
-	// A dry run only reads, so request the narrower scope — previewing never
-	// forces a write-scope re-consent.
-	driveScope := drive.DriveScope
-	if dryRun {
-		driveScope = drive.DriveReadonlyScope
-	}
-	svc, err := newDriveService(ctx, driveScope)
-	if err != nil {
-		return err
-	}
-	about, err := svc.About.Get().Fields("user").Context(ctx).Do()
-	if err != nil {
-		return fmt.Errorf("fetching current user info: %w", err)
-	}
-	me := about.User
-	if strings.EqualFold(me.EmailAddress, email) {
-		return fmt.Errorf("%s is the account you are signed in as; reclaim-folders replaces somebody else's folders with yours", email)
 	}
 
 	if dryRun {
 		fmt.Fprintf(os.Stderr, "DRY RUN: no changes will be made. Would replace %d folder(s) owned by %s%s with folders owned by %s.\n",
-			len(targets), email, scope.note(), me.EmailAddress)
+			len(targets), reclaimOwnerNote(email), scope.note(), me.EmailAddress)
 	} else {
 		fmt.Fprintf(os.Stderr, "About to replace %d folder(s) owned by %s%s with folders owned by %s: each is renamed %q, a folder of the same name is created beside it, and its contents are moved across.\n",
-			len(targets), email, scope.note(), me.EmailAddress, oldFolderPrefix+"<name>")
+			len(targets), reclaimOwnerNote(email), scope.note(), me.EmailAddress, oldFolderPrefix+"<name>")
 		if !promptYesNo("Continue? [y/N] ") {
 			fmt.Fprintln(os.Stderr, "Aborted.")
 			return nil
@@ -322,15 +354,16 @@ func runReclaimFolders(dbPath, cfgPath, email, subtree, folder string, dryRun bo
 	moveCtx, moveCancel := context.WithCancel(ctx)
 	defer moveCancel()
 	r := &reclaimer{
-		db:      db,
-		svc:     svc,
-		limiter: rate.NewLimiter(rate.Limit(20), 20),
-		rec:     &opLog{db: db, account: me.EmailAddress, command: "reclaim-folders"},
-		me:      me,
-		account: email,
-		dryRun:  dryRun,
-		workers: concurrency,
-		stats:   &reclaimStats{errorBudget: &errorBudget{cmd: "reclaim-folders", maxErrors: maxErrors, cancel: moveCancel}},
+		db:              db,
+		svc:             svc,
+		limiter:         rate.NewLimiter(rate.Limit(20), 20),
+		rec:             &opLog{db: db, account: me.EmailAddress, command: "reclaim-folders"},
+		me:              me,
+		account:         email,
+		internalDomains: cfg.InternalDomains,
+		dryRun:          dryRun,
+		workers:         concurrency,
+		stats:           &reclaimStats{errorBudget: &errorBudget{cmd: "reclaim-folders", maxErrors: maxErrors, cancel: moveCancel}},
 	}
 
 	var results []reclaimResult
@@ -369,6 +402,26 @@ func runReclaimFolders(dbPath, cfgPath, email, subtree, folder string, dryRun bo
 			r.stats.replaced, r.stats.moved, r.stats.left, r.stats.skipped, r.stats.failedCount())
 	}
 	return r.stats.err
+}
+
+// reclaimTargetsIn returns the folders to replace inside the subtree rooted at
+// root: those owned by the account --email named, or, when it named none, every
+// folder owned from outside the org.
+func reclaimTargetsIn(db *sql.DB, root, email string, me *drive.User, internalDomains []string) ([]reclaimTarget, error) {
+	if email != "" {
+		return foldersOwnedBy(db, root, email)
+	}
+	return foldersOwnedExternally(db, root, me.EmailAddress, me.PermissionId, internalDomains)
+}
+
+// reclaimOwnerNote names whose folders a run covers, for the messages that
+// report what it is about to do: the account --email named, or everybody
+// outside the org when it named none.
+func reclaimOwnerNote(email string) string {
+	if email == "" {
+		return "external accounts"
+	}
+	return email
 }
 
 // reclaimScope is the part of the tree a run covers: the whole crawl root by
@@ -449,10 +502,13 @@ type reclaimer struct {
 	limiter *rate.Limiter
 	rec     *opLog
 	me      *drive.User
-	account string // the email whose folders are being replaced
-	dryRun  bool
-	workers int
-	stats   *reclaimStats
+	account string // the email whose folders are being replaced; empty for everybody outside the org
+	// internalDomains is the org's own email domains, which is what "outside the
+	// org" means when no account was named.
+	internalDomains []string
+	dryRun          bool
+	workers         int
+	stats           *reclaimStats
 }
 
 // replace supersedes one of their folders with one of ours: rename, create,
@@ -471,18 +527,29 @@ func (r *reclaimer) replace(ctx context.Context, t reclaimTarget, path string) (
 		}
 		return res, fmt.Errorf("fetching folder: %w", err)
 	}
+	// A run given no --email chose its targets out of the snapshot, so Drive
+	// gets the last word on whether each one is still a folder owned from
+	// outside the org. Non-empty is the reason it is not.
+	notExternal := ""
+	if r.account == "" {
+		notExternal = r.whyNotExternal(f)
+	}
 	switch {
 	case f.Trashed:
 		return res, skipErr{"in the trash"}
 	case f.MimeType != folderMimeType:
 		return res, skipErr{fmt.Sprintf("no longer a folder (mimeType %q)", f.MimeType)}
-	case !ownedByAccount(f, r.account):
+	case r.account != "" && !ownedByAccount(f, r.account):
 		return res, skipErr{fmt.Sprintf("no longer owned by %s", r.account)}
+	case notExternal != "":
+		return res, skipErr{notExternal}
 	case len(f.Parents) == 0:
 		return res, skipErr{"has no parent to create the replacement under"}
 	case f.Capabilities != nil && (!f.Capabilities.CanRename || !f.Capabilities.CanAddChildren):
 		return res, skipErr{fmt.Sprintf("%s cannot rename it or add items to it", r.me.EmailAddress)}
 	}
+	res.owner = folderOwner(f)
+
 	// Legacy multi-parenting: the replacement can only sit in one place, so it
 	// goes beside the first parent and the rest are called out for manual review.
 	parent := f.Parents[0]
@@ -610,6 +677,59 @@ func (r *reclaimer) getFolder(ctx context.Context, driveID string) (*drive.File,
 		Context(ctx).Do()
 }
 
+// folderOwner names the account Drive reports as owning f, empty when it
+// reports none. A run given no --email replaces folders belonging to several
+// people, so its summary says whose each one was.
+func folderOwner(f *drive.File) string {
+	for _, o := range f.Owners {
+		if o.EmailAddress != "" {
+			return o.EmailAddress
+		}
+		if o.PermissionId != "" {
+			return o.PermissionId
+		}
+	}
+	return ""
+}
+
+// folderOwnerEmail is folderOwner restricted to an actual address — the only
+// form the internal-domain rule can be applied to. Empty when Drive named the
+// owner by permission id alone.
+func folderOwnerEmail(f *drive.File) string {
+	for _, o := range f.Owners {
+		if o.EmailAddress != "" {
+			return o.EmailAddress
+		}
+	}
+	return ""
+}
+
+// whyNotExternal says why f is not a folder owned from outside the org, for the
+// skip line; empty means it is one. The snapshot the targets came from can be
+// stale or incomplete, so this is the same rule applied to what Drive says now:
+// ours, internally owned, or of an ownership we cannot judge, is left alone.
+func (r *reclaimer) whyNotExternal(f *drive.File) string {
+	if r.ours(f) {
+		return "already owned by you"
+	}
+	email := folderOwnerEmail(f)
+	switch {
+	case email == "":
+		return fmt.Sprintf("Drive reports no owner email for it (owner %q), so there is no telling whether it is externally owned; pass --email to reclaim it anyway", folderOwner(f))
+	case isInternalDomain(email, r.internalDomains):
+		return fmt.Sprintf("now owned by %s, an internal account; pass --email to reclaim it anyway", email)
+	}
+	return ""
+}
+
+// ours reports whether the running account owns f, by either of the ways Drive
+// identifies it. A run given no --email replaces whatever it does not own, so
+// this is what tells its targets apart from its own folders.
+func (r *reclaimer) ours(f *drive.File) bool {
+	return ownedByAccount(f, r.me.EmailAddress) ||
+		(r.me.PermissionId != "" && ownedByAccount(f, r.me.PermissionId))
+}
+
 // findOurFolder returns the subfolder of parentID named name that the running
 // account owns, or nil if there is none — the replacement an earlier run left
 // behind.
@@ -620,7 +740,7 @@ func (r *reclaimer) findOurFolder(ctx context.Context, parentID, name string) (*
 		return nil, err
 	}
 	for _, m := range matches {
-		if ownedByAccount(m, r.me.EmailAddress) {
+		if r.ours(m) {
 			return m, nil
 		}
 	}
@@ -792,7 +912,7 @@ func (r *reclaimer) record(t reclaimTarget, theirs, ours *drive.File, origName, 
 
 // printReclaimPairs writes the run's report to stdout: one block per folder
 // with the "theirs" and "ours" Drive links side by side.
-func printReclaimPairs(results []reclaimResult, theirEmail, ourEmail string, dryRun bool) {
+func printReclaimPairs(results []reclaimResult, email, ourEmail string, dryRun bool) {
 	if len(results) == 0 {
 		return
 	}
@@ -800,10 +920,16 @@ func printReclaimPairs(results []reclaimResult, theirEmail, ourEmail string, dry
 	if dryRun {
 		heading = "Folders that would be replaced"
 	}
-	fmt.Printf("%s (theirs = %s, ours = %s):\n", heading, theirEmail, ourEmail)
+	fmt.Printf("%s (theirs = %s, ours = %s):\n", heading, reclaimOwnerNote(email), ourEmail)
 	for _, res := range results {
 		fmt.Printf("\n%s\n", res.path)
-		fmt.Printf("  theirs: %s\n", driveFolderURL(res.theirsID))
+		// Only a run covering every external account needs each pair to name the owner;
+		// one scoped to a single --email already said whose they are.
+		if email == "" && res.owner != "" {
+			fmt.Printf("  theirs: %s  (%s)\n", driveFolderURL(res.theirsID), res.owner)
+		} else {
+			fmt.Printf("  theirs: %s\n", driveFolderURL(res.theirsID))
+		}
 		if res.oursID == "" {
 			fmt.Printf("  ours:   (would be created as %q)\n", res.name)
 		} else {

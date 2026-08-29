@@ -121,6 +121,104 @@ func TestFolderOwnedByAccount(t *testing.T) {
 	}
 }
 
+// TestFoldersOwnedExternally covers what a run given no --email replaces:
+// every folder owned from outside the org, and nothing of ours, of a
+// colleague's, or of unrecorded ownership.
+func TestFoldersOwnedExternally(t *testing.T) {
+	db := testDB(t)
+	rootID, _ := buildReclaimTree(t, db)
+	under := sql.NullInt64{Int64: rootID, Valid: true}
+	folder := func(driveID, name string, owner node) {
+		t.Helper()
+		owner.driveID, owner.name, owner.typ = driveID, name, typeFolder
+		owner.mimeType, owner.parentID = folderMimeType, under
+		mustUpsert(t, db, owner)
+	}
+	// The fixture's owners are all on example.com; these are not.
+	folder("F", "F", node{ownerEmail: nullString("carol@other.com")})
+	folder("I", "I", node{ownerEmail: nullString("dan@OTHER.COM")})
+	// Ours, by the permission id rather than by email.
+	folder("G", "G", node{ownerID: nullString("my-permission-id")})
+	// Nobody's, as far as the snapshot goes.
+	folder("H", "H", node{})
+
+	// The domain is matched case-insensitively, on both sides.
+	got, err := foldersOwnedExternally(db, "root", "me@example.com", "my-permission-id", []string{"Example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].driveID != "F" || got[1].driveID != "I" {
+		t.Fatalf("external folders = %+v, want F then I", got)
+	}
+	if got[0].ownerEmail != "carol@other.com" || got[0].rowID == 0 {
+		t.Errorf("F = %+v, want its owner email and row id carried along", got[0])
+	}
+
+	// Alice is a colleague, so her folders are left alone even though they are
+	// not ours — that is the whole point of the domain rule.
+	if got, err := foldersOwnedExternally(db, "D", "me@example.com", "my-permission-id", []string{"example.com"}); err != nil {
+		t.Fatal(err)
+	} else if len(got) != 0 {
+		t.Errorf("scoped to D = %+v, want none (E is internally owned)", got)
+	}
+
+	// With no internal domains configured, everybody but us is outside the org.
+	// Shallowest first, as with foldersOwnedBy: the root, D and G are ours, and
+	// H has no owner email to judge.
+	got, err = foldersOwnedExternally(db, "root", "me@example.com", "my-permission-id", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"A", "C", "F", "I", "B", "E"}
+	if len(got) != len(want) {
+		t.Fatalf("got %d folders %+v, want %v", len(got), got, want)
+	}
+	for i, w := range want {
+		if got[i].driveID != w {
+			t.Errorf("folder %d = %+v, want drive_id %s", i, got[i], w)
+		}
+	}
+
+	// An account with no permission id to match on still excludes its own.
+	if got, err := foldersOwnedExternally(db, "D", "me@example.com", "", nil); err != nil {
+		t.Fatal(err)
+	} else if len(got) != 1 || got[0].driveID != "E" || got[0].depth != 1 {
+		t.Errorf("scoped to D without a permission id = %+v, want just E at depth 1", got)
+	}
+}
+
+// TestFolderOwnedByAnyAccount covers the --folder check a run given no --email
+// makes: is this folder already one of ours, by either name Drive knows us by?
+func TestFolderOwnedByAnyAccount(t *testing.T) {
+	db := testDB(t)
+	rootID, _ := buildReclaimTree(t, db)
+	mustUpsert(t, db, node{driveID: "G", name: "G", typ: typeFolder, mimeType: folderMimeType,
+		ownerID: nullString("my-permission-id"), parentID: sql.NullInt64{Int64: rootID, Valid: true}})
+
+	if _, owned, err := folderOwnedByAccount(db, "G", "me@example.com", "my-permission-id"); err != nil {
+		t.Fatal(err)
+	} else if !owned {
+		t.Error("G (owned by our permission id) reported as not ours")
+	}
+	if got, owned, err := folderOwnedByAccount(db, "D", "me@example.com", "my-permission-id"); err != nil {
+		t.Fatal(err)
+	} else if !owned || got.ownerEmail != "me@example.com" {
+		t.Errorf("folderOwnedByAccount(D) = %+v, owned %v; want D ours with its owner email", got, owned)
+	}
+	// Somebody else's folder is what such a run goes on to reclaim.
+	if _, owned, err := folderOwnedByAccount(db, "C", "me@example.com", "my-permission-id"); err != nil {
+		t.Fatal(err)
+	} else if owned {
+		t.Error("C (bob's) reported as ours")
+	}
+	// An empty account matches nothing, rather than matching a missing owner.
+	if _, owned, err := folderOwnedByAccount(db, "C", ""); err != nil {
+		t.Fatal(err)
+	} else if owned {
+		t.Error("C reported as owned by the empty account")
+	}
+}
+
 func TestReclaimScopeRootsFollowsReplacements(t *testing.T) {
 	db := testDB(t)
 	rootID, aID := buildReclaimTree(t, db)

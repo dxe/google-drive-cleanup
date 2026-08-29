@@ -1868,31 +1868,37 @@ func deleteNodeRow(db *sql.DB, driveID string) error {
 
 // --- reclaim-folders persistence ---
 
-// reclaimTarget is one folder the reclaim-folders command replaces: a folder owned by
-// the account being reclaimed, somewhere inside the scoped subtree.
+// reclaimTarget is one folder the reclaim-folders command replaces: a folder
+// owned by somebody else — the account --email named, or anybody outside the
+// org — somewhere inside the scoped subtree.
 type reclaimTarget struct {
-	rowID   int64
-	driveID string
-	name    string
-	depth   int // hops below the scope folder; the scope folder itself is 0
+	rowID      int64
+	driveID    string
+	name       string
+	ownerEmail string // the owner the snapshot recorded, empty when the crawl saw none
+	depth      int    // hops below the scope folder; the scope folder itself is 0
 }
 
-// foldersOwnedBy returns every folder in the subtree rooted at scopeDriveID
-// (inclusive) owned by account — owner_email matched case-insensitively, or
-// owner_id matched exactly — shallowest first, so reclaim-folders replaces a folder
-// before the folders nested inside it.
-func foldersOwnedBy(db *sql.DB, scopeDriveID, account string) ([]reclaimTarget, error) {
-	rows, err := db.Query(`
-		WITH RECURSIVE subtree(id, depth) AS (
-			SELECT id, 0 FROM nodes WHERE drive_id = ?
-			UNION ALL
-			SELECT n.id, s.depth + 1 FROM nodes n JOIN subtree s ON n.parent_id = s.id
-		)
-		SELECT n.id, n.drive_id, n.name, s.depth
-		FROM nodes n JOIN subtree s ON s.id = n.id
-		WHERE n.type = ?
-		  AND (n.owner_email = ? COLLATE NOCASE OR n.owner_id = ?)
-		ORDER BY s.depth, n.id`, scopeDriveID, typeFolder, account, account)
+// reclaimTargetsQuery walks the subtree rooted at a folder (inclusive) and
+// returns the folders in it an owner predicate picks out, shallowest first, so
+// reclaim-folders replaces a folder before the folders nested inside it. The
+// predicate is spliced in — it is always a literal from this file, never user
+// input — and its parameters follow the two the walk itself takes.
+const reclaimTargetsQuery = `
+	WITH RECURSIVE subtree(id, depth) AS (
+		SELECT id, 0 FROM nodes WHERE drive_id = ?
+		UNION ALL
+		SELECT n.id, s.depth + 1 FROM nodes n JOIN subtree s ON n.parent_id = s.id
+	)
+	SELECT n.id, n.drive_id, n.name, COALESCE(n.owner_email, ''), s.depth
+	FROM nodes n JOIN subtree s ON s.id = n.id
+	WHERE n.type = ?
+	  AND (%s)
+	ORDER BY s.depth, n.id`
+
+func reclaimTargets(db *sql.DB, scopeDriveID, ownerPredicate string, args ...any) ([]reclaimTarget, error) {
+	rows, err := db.Query(fmt.Sprintf(reclaimTargetsQuery, ownerPredicate),
+		append([]any{scopeDriveID, typeFolder}, args...)...)
 	if err != nil {
 		return nil, err
 	}
@@ -1900,12 +1906,46 @@ func foldersOwnedBy(db *sql.DB, scopeDriveID, account string) ([]reclaimTarget, 
 	var out []reclaimTarget
 	for rows.Next() {
 		var t reclaimTarget
-		if err := rows.Scan(&t.rowID, &t.driveID, &t.name, &t.depth); err != nil {
+		if err := rows.Scan(&t.rowID, &t.driveID, &t.name, &t.ownerEmail, &t.depth); err != nil {
 			return nil, err
 		}
 		out = append(out, t)
 	}
 	return out, rows.Err()
+}
+
+// foldersOwnedBy returns every folder in the subtree rooted at scopeDriveID
+// (inclusive) owned by account — owner_email matched case-insensitively, or
+// owner_id matched exactly.
+func foldersOwnedBy(db *sql.DB, scopeDriveID, account string) ([]reclaimTarget, error) {
+	return reclaimTargets(db, scopeDriveID,
+		`n.owner_email = ? COLLATE NOCASE OR n.owner_id = ?`, account, account)
+}
+
+// foldersOwnedExternally returns every folder in the subtree rooted at
+// scopeDriveID (inclusive) owned from outside the org — not by the account
+// running the tool, and not by an address on one of the internal domains. It is
+// what a reclaim-folders run given no --email replaces. A folder the crawl
+// recorded no owner email for is left out: there is no telling whose it is, and
+// guessing would rename and empty a colleague's folder or one of our own. The
+// domain rule is applied in Go so that it stays the one isInternalEmail
+// applies everywhere else.
+func foldersOwnedExternally(db *sql.DB, scopeDriveID, email, permissionID string, internalDomains []string) ([]reclaimTarget, error) {
+	found, err := reclaimTargets(db, scopeDriveID,
+		`n.owner_email IS NOT NULL
+		   AND n.owner_email <> ? COLLATE NOCASE
+		   AND COALESCE(n.owner_id NOT IN (?, ?), 1)`,
+		email, email, permissionID)
+	if err != nil {
+		return nil, err
+	}
+	var out []reclaimTarget
+	for _, t := range found {
+		if !isInternalDomain(t.ownerEmail, internalDomains) {
+			out = append(out, t)
+		}
+	}
+	return out, nil
 }
 
 // reclaimReplacementOf returns the folder an earlier reclaim-folders run left in
@@ -1934,10 +1974,12 @@ func reclaimReplacementOf(db *sql.DB, driveID string) (string, bool, error) {
 
 // folderOwnedByAccount returns the single folder driveID as a reclaim target —
 // what --folder scopes a run to, with no descendants. owned reports whether the
-// snapshot says account owns it, matched the same way foldersOwnedBy matches:
-// owner_email case-insensitively, or owner_id exactly. sql.ErrNoRows means
-// there is no crawled folder with that id.
-func folderOwnedByAccount(db *sql.DB, driveID, account string) (t reclaimTarget, owned bool, err error) {
+// snapshot says any of accounts owns it, matched the same way foldersOwnedBy
+// matches: owner_email case-insensitively, or owner_id exactly. Passing the
+// running account's own email and permission id is how a run given no --email
+// asks whether the folder is already one of ours. sql.ErrNoRows means there is
+// no crawled folder with that id.
+func folderOwnedByAccount(db *sql.DB, driveID string, accounts ...string) (t reclaimTarget, owned bool, err error) {
 	t.driveID = driveID
 	var ownerEmail, ownerID sql.NullString
 	err = db.QueryRow(`SELECT id, name, owner_email, owner_id FROM nodes WHERE drive_id = ? AND type = ?`,
@@ -1945,9 +1987,17 @@ func folderOwnedByAccount(db *sql.DB, driveID, account string) (t reclaimTarget,
 	if err != nil {
 		return t, false, err
 	}
-	owned = (ownerEmail.Valid && strings.EqualFold(ownerEmail.String, account)) ||
-		(ownerID.Valid && ownerID.String == account)
-	return t, owned, nil
+	t.ownerEmail = ownerEmail.String
+	for _, account := range accounts {
+		if account == "" {
+			continue
+		}
+		if (ownerEmail.Valid && strings.EqualFold(ownerEmail.String, account)) ||
+			(ownerID.Valid && ownerID.String == account) {
+			return t, true, nil
+		}
+	}
+	return t, false, nil
 }
 
 // parentRowOf returns the row id of a node's recorded parent. ok is false when

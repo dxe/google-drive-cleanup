@@ -86,14 +86,18 @@ func runOwners(dbPath, cfgPath, parentID, email string) error {
 // isInternalEmail reports whether email is non-null and ends with "@" followed
 // by one of the internal domains (case-insensitive).
 func isInternalEmail(email sql.NullString, internalDomains []string) bool {
-	if !email.Valid {
-		return false
-	}
-	at := strings.LastIndex(email.String, "@")
+	return email.Valid && isInternalDomain(email.String, internalDomains)
+}
+
+// isInternalDomain is isInternalEmail for a plain address — what the callers
+// holding a live Drive owner rather than a snapshot column use. An address with
+// no domain at all is nobody's internal account.
+func isInternalDomain(email string, internalDomains []string) bool {
+	at := strings.LastIndex(email, "@")
 	if at < 0 {
 		return false
 	}
-	domain := strings.ToLower(email.String[at+1:])
+	domain := strings.ToLower(email[at+1:])
 	for _, d := range internalDomains {
 		if domain == strings.ToLower(d) {
 			return true
