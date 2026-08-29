@@ -380,16 +380,25 @@ func externalsPath(byRowID map[int64]externalsSubtreeNode, n externalsSubtreeNod
 	return strings.Join(segments, "/")
 }
 
-// renderEvictedFilesEmail renders one owner's draft. Each folder is named by its
-// Drive URL alone — the ask is to open it and drag, so the URL is the only part
-// of it the recipient needs — followed by up to maxFiles of their filenames in
-// it, and a count of the rest when there are more.
+// renderEvictedFilesEmail renders one owner's draft. The recipient is a stranger
+// being asked for a favour, so the body opens by saying who is asking and why
+// they and not we have to do the moving. Each folder is named by its Drive URL
+// alone — the ask is to open it and drag, so the URL is the only part of it the
+// recipient needs — followed by up to maxFiles of their filenames in it, and a
+// count of the rest when there are more.
 func renderEvictedFilesEmail(email string, groups []evictedFileGroup, maxFiles int) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "To: %s\n", email)
 	fmt.Fprintf(&b, "Subject: Please move your files to our Shared Drive\n")
 	fmt.Fprintf(&b, "Body:\n\n")
-	fmt.Fprintf(&b, "Please move your files. In each folder below, drag any files you own to the %q shortcut you see in the same folder.\n", extBackLinkPrefix+"...")
+	fmt.Fprintf(&b, "Hi,\n\n")
+	fmt.Fprintf(&b, "I'm Alex from DxE tech team. I'm trying to help migrate DxE's files to Shared Drives.\n\n")
+	fmt.Fprintf(&b, "You own some files that we would like to get moved over, but couldn't because files can only be moved by their owners.\n\n")
+	folders := "the folders"
+	if len(groups) == 1 {
+		folders = "the folder"
+	}
+	fmt.Fprintf(&b, "If you're willing, please take a look at %s listed below, and drag the files you own to the %q shortcut you see in the same folder.\n", folders, extBackLinkPrefix+"...")
 	for _, g := range groups {
 		fmt.Fprintf(&b, "\n~~ %s ~~\n", driveFolderURL(g.folderDriveID))
 		fmt.Fprintf(&b, "files you own in this folder:\n")
@@ -404,5 +413,6 @@ func renderEvictedFilesEmail(email string, groups []evictedFileGroup, maxFiles i
 			fmt.Fprintf(&b, "... and %d more\n", rest)
 		}
 	}
+	fmt.Fprintf(&b, "\nThank you!\nAlex T\n")
 	return b.String()
 }
