@@ -217,6 +217,11 @@ drive-cleanup reclaim-folders alice@example.com --folder 1AbCdEfGh...  # only th
 # drive: they go to the externals folder, each leaving a shortcut behind
 drive-cleanup evict-externals 1AbCdEfGh... --dry-run
 drive-cleanup evict-externals 1AbCdEfGh...
+
+# Draft one email per external owner asking them to move the files
+# evict-externals parked in the externals folder, to
+# out/evicted-files-request-emails/<email>.txt (nothing is sent)
+drive-cleanup gen-evicted-files-request-emails
 ```
 
 The commands that change Drive — `pack`, `unpack`, `archive`, `delete`,
@@ -415,6 +420,66 @@ crawl, and re-run to confirm the subtree is clean before you move it.
 Re-runs are safe: an existing replica folder is adopted rather than duplicated,
 an existing shortcut pointing at the right target is reused, and an item a
 previous run already moved is simply finished off in the database.
+
+### Asking the owners to hand them over (`gen-evicted-files-request-emails`)
+
+Eviction parks an external owner's files somewhere we can see them; it does not
+make them ours. `gen-evicted-files-request-emails` writes the ask, one plain-text
+draft per owner:
+
+```bash
+drive-cleanup gen-evicted-files-request-emails
+drive-cleanup gen-evicted-files-request-emails --max-files 10   # longer samples
+drive-cleanup gen-evicted-files-request-emails --out /tmp/drafts
+```
+
+It reads only the database — no Drive calls — walks every externally-owned file
+sitting in a **replica folder** under `externals.root`, groups them by that
+folder, and writes `out/evicted-files-request-emails/<email>.txt` for each owner.
+A draft looks like this:
+
+```
+To: stranger@example.org
+Subject: Please move your files to our Shared Drive
+Body:
+
+Please move your files. In each folder below, drag any files you own to the "((new)) ..." shortcut you see in the same folder.
+
+~~ https://drive.google.com/drive/folders/1AbCdEfGh... ~~
+files you own in this folder:
+notes.doc
+budget.xlsx
+... and 12 more
+
+~~ https://drive.google.com/drive/folders/1JkLmNoPq... ~~
+files you own in this folder:
+snap.jpg
+```
+
+Each folder is named by its URL alone because that is all the recipient needs:
+the folder is the `(ext) <original>` replica their files were evicted into, and
+the `((new)) <original>` shortcut sitting beside them points at the folder that
+took over — so the whole ask is one drag, in place. At most `--max-files`
+(default 5) names are listed per folder, with the remainder counted, so a draft
+stays readable for an owner with hundreds of files.
+
+**Only replica folders are listed**, and a replica is recognised by *holding* the
+`((new)) <original>` shortcut — the very thing the email says to drag onto — not
+by its `(ext) ` name and not by the `externals_folder_drive_id` cached on the
+original. The externals tree can also hold folders that are not replicas: an
+externally-owned folder that `evict-externals --allow-unowned-folders` moved out
+whole arrives with its contents and no back-link inside it, so there is nowhere
+in it for its owner to drag to and no draft may claim otherwise. Externally-owned
+files in such a folder are counted on stderr instead, with the suggestion to run
+`reclaim-folders` on it and re-evict, or to move them by hand.
+
+Nothing is sent, and nothing is changed: review the drafts and mail them
+yourself. Folders are never listed as items — `evict-externals` only moves an
+externally-owned folder once `reclaim-folders` has emptied it, so there is
+nothing in one worth asking for. The `((new)) ...` and `(external files) ...`
+shortcuts are skipped whoever owns them, being our signposts rather than
+anybody's files, and externally-owned files with no recorded owner email have
+nowhere to be addressed, so they too are counted on stderr.
 
 ### Reviewing what to keep vs delete (`review` / `export-review`)
 
